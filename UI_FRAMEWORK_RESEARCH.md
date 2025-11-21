@@ -281,7 +281,11 @@ npm create tauri-app@latest
 npm install @chatscope/chat-ui-kit-react react-markdown
 
 # Add Rust KiCAD dependencies
-cargo add kicad-ipc  # (hypothetical - would use actual crate)
+# Note: KiCAD provides IPC via NNG protocol. Options:
+# 1. Use official KiCAD Rust bindings when available
+# 2. Use nng-rs crate to implement IPC client directly
+# 3. Shell out to Python IPC implementation as interim solution
+cargo add nng  # For direct NNG protocol implementation
 ```
 
 **Phase 2: KiCAD Integration (1 week)**
@@ -398,9 +402,15 @@ nuitka --onefile --windows-disable-console \
 - KiCAD Python APIs provided in issue
 
 ### KiCAD Integration
-- IPC API: Available in Python and Rust
-- Python libraries: kicad-sch-api, kicad-pcb-api, circuit-synth
-- MCP implementations: kicad-mcp, mcp-kicad-sch-api
+- IPC API: NNG-based protocol, available in Python and Rust
+- Python libraries: 
+  - https://github.com/circuit-synth/kicad-sch-api (Schematic API)
+  - https://github.com/circuit-synth/kicad-pcb-api (PCB API)
+  - https://github.com/circuit-synth/circuit-synth (Circuit synthesis)
+- MCP implementations:
+  - https://github.com/lamaalrajih/kicad-mcp (KiCAD MCP server)
+  - https://github.com/circuit-synth/mcp-kicad-sch-api (Schematic MCP)
+- Official KiCAD IPC docs: https://dev-docs.kicad.org/en/apis-and-binding/pcbnew/
 
 ---
 
