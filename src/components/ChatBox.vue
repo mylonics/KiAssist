@@ -3,7 +3,7 @@ import { ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 
 interface Message {
-  id: number;
+  id: string;
   text: string;
   sender: 'user' | 'assistant';
   timestamp: Date;
@@ -11,14 +11,17 @@ interface Message {
 
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
-let messageIdCounter = 0;
+
+function generateMessageId(): string {
+  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
 
 async function sendMessage() {
   if (!inputMessage.value.trim()) return;
 
   // Add user message
   const userMessage: Message = {
-    id: messageIdCounter++,
+    id: generateMessageId(),
     text: inputMessage.value,
     sender: 'user',
     timestamp: new Date(),
@@ -34,7 +37,7 @@ async function sendMessage() {
     
     // Add assistant response
     const assistantMessage: Message = {
-      id: messageIdCounter++,
+      id: generateMessageId(),
       text: echoResponse,
       sender: 'assistant',
       timestamp: new Date(),
@@ -42,6 +45,14 @@ async function sendMessage() {
     messages.value.push(assistantMessage);
   } catch (error) {
     console.error('Error echoing message:', error);
+    // Add error message to UI
+    const errorMessage: Message = {
+      id: generateMessageId(),
+      text: 'Sorry, I encountered an error processing your message. Please try again.',
+      sender: 'assistant',
+      timestamp: new Date(),
+    };
+    messages.value.push(errorMessage);
   }
 }
 
