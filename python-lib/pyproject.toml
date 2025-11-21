@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "newkiassist-utils"
+version = "0.1.0"
+description = "Utility library for NewKiAssist - KiCAD AI Assistant"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    {name = "NewKiAssist Contributors"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/mylonics/NewKiAssist"
+Repository = "https://github.com/mylonics/NewKiAssist"

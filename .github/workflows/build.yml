@@ -1,0 +1,83 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies (Ubuntu)
+      if: matrix.platform == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libwebkit2gtk-4.1-dev \
+          build-essential \
+          curl \
+          wget \
+          file \
+          libxdo-dev \
+          libssl-dev \
+          libayatana-appindicator3-dev \
+          librsvg2-dev
+
+    - name: Install Python package
+      run: |
+        cd python-lib
+        pip install -e .
+        python -c "import newkiassist_utils; print('Python package version:', newkiassist_utils.__version__)"
+
+    - name: Install frontend dependencies
+      run: npm install
+
+    - name: Build frontend
+      run: npm run build
+
+    - name: Build Tauri app
+      run: npm run tauri build
+
+    - name: Upload build artifacts (Ubuntu)
+      if: matrix.platform == 'ubuntu-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-build
+        path: src-tauri/target/release/bundle/
+
+    - name: Upload build artifacts (macOS)
+      if: matrix.platform == 'macos-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-build
+        path: src-tauri/target/release/bundle/
+
+    - name: Upload build artifacts (Windows)
+      if: matrix.platform == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-build
+        path: src-tauri/target/release/bundle/
