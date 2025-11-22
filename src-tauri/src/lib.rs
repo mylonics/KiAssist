@@ -6,7 +6,7 @@ mod api_key;
 
 use kicad_ipc::KiCadInstance;
 use api_key::{ApiKeyState, ApiKeyStore};
-use tauri::State;
+use tauri::{Manager, State};
 
 #[tauri::command]
 fn echo_message(message: &str) -> String {
@@ -33,8 +33,7 @@ fn get_api_key(state: State<ApiKeyState>) -> Option<String> {
 #[tauri::command]
 fn set_api_key(state: State<ApiKeyState>, api_key: String) -> Result<(), String> {
     let mut store = state.0.lock().unwrap();
-    store.set_api_key(api_key);
-    Ok(())
+    store.set_api_key(api_key)
 }
 
 #[tauri::command]
@@ -64,6 +63,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(ApiKeyState(std::sync::Mutex::new(ApiKeyStore::new())))
+        .setup(|app| {
+            let handle = app.handle().clone();
+            let state = app.state::<ApiKeyState>();
+            let mut store = state.0.lock().unwrap();
+            store.set_app_handle(handle);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             echo_message,
             detect_kicad_instances,
