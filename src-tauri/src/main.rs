@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    newkiassist_app_lib::run()
+    kiassist_app_lib::run()
 }

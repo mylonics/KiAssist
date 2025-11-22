@@ -1,4 +1,4 @@
-"""NewKiAssist Utilities Package
+"""KiAssist Utilities Package
 
 A simple Python package to demonstrate Python packaging with the Tauri application.
 This can be used to interface with KiCAD APIs in the future.

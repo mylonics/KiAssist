@@ -67,13 +67,13 @@ function handleKeyPress(event: KeyboardEvent) {
 <template>
   <div class="chat-container">
     <div class="chat-header">
-      <h2>NewKiAssist Chat</h2>
+      <h2>KiAssist Chat</h2>
       <p class="subtitle">KiCAD AI Assistant</p>
     </div>
     
     <div class="chat-messages">
       <div v-if="messages.length === 0" class="welcome-message">
-        <p>👋 Welcome to NewKiAssist!</p>
+        <p>👋 Welcome to KiAssist!</p>
         <p class="hint">Type a message below to get started. I'll echo your messages back to you.</p>
       </div>
       
