@@ -422,7 +422,7 @@ button:disabled {
   left: 0;
   right: 0;
   bottom: 0;
-  background-color: rgba(0, 0, 0, 0.7);
+  background-color: rgba(0, 0, 0, 0.85);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -436,7 +436,8 @@ button:disabled {
   border-radius: 12px;
   max-width: 500px;
   width: 90%;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--border-color);
 }
 
 .modal-content h3 {
@@ -566,6 +567,17 @@ button:disabled {
   background: #555;
 }
 
+/* Default color variables (light mode) */
+:root {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #e8e8e8;
+  --bg-input: #ffffff;
+  --text-primary: #2d2d2d;
+  --text-secondary: #666666;
+  --border-color: #d0d0d0;
+}
+
 /* Dark mode support */
 @media (prefers-color-scheme: dark) {
   :root {
@@ -576,19 +588,6 @@ button:disabled {
     --text-primary: #e4e4e4;
     --text-secondary: #a0a0a0;
     --border-color: #404040;
-  }
-}
-
-/* Light mode */
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg-primary: #ffffff;
-    --bg-secondary: #f5f5f5;
-    --bg-tertiary: #e8e8e8;
-    --bg-input: #ffffff;
-    --text-primary: #2d2d2d;
-    --text-secondary: #666666;
-    --border-color: #d0d0d0;
   }
 }
 </style>
