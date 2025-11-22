@@ -3,13 +3,13 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "newkiassist-utils"
+name = "kiassist-utils"
 version = "0.1.0"
-description = "Utility library for NewKiAssist - KiCAD AI Assistant"
+description = "Utility library for KiAssist - KiCAD AI Assistant"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [
-    {name = "NewKiAssist Contributors"}
+    {name = "KiAssist Contributors"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",

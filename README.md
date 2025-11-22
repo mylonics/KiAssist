@@ -1,4 +1,4 @@
-# NewKiAssist
+# KiAssist
 
 KiCAD AI Assistance - A cross-platform desktop application for AI-powered KiCAD design assistance.
 
@@ -51,7 +51,7 @@ Build artifacts will be available in `src-tauri/target/release/bundle/`.
 ## Project Structure
 
 ```
-NewKiAssist/
+KiAssist/
 ├── src/                    # Vue frontend source
 │   ├── components/        # Vue components
 │   │   └── ChatBox.vue   # Chat interface component
@@ -61,18 +61,18 @@ NewKiAssist/
 │   └── src/
 │       └── lib.rs        # Rust backend with commands
 ├── python-lib/            # Python utilities package
-│   └── newkiassist_utils/
+│   └── kiassist_utils/
 └── .github/workflows/     # CI/CD pipelines
 ```
 
 ## Python Package
 
-The `newkiassist-utils` package provides utility functions for message processing and KiCAD project validation. It will be extended to integrate with KiCAD IPC APIs.
+The `kiassist-utils` package provides utility functions for message processing and KiCAD project validation. It will be extended to integrate with KiCAD IPC APIs.
 
 ### Usage
 
 ```python
-from newkiassist_utils import process_message, validate_kicad_project
+from kiassist_utils import process_message, validate_kicad_project
 
 # Process messages
 result = process_message("Hello, KiCAD!")

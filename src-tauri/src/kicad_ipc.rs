@@ -1,4 +1,4 @@
-// This program source code file is part of NewKiAssist.
+// This program source code file is part of KiAssist.
 //
 // Module for detecting and managing KiCad IPC instances
 
@@ -65,7 +65,7 @@ fn discover_socket_files() -> Vec<PathBuf> {
 fn probe_kicad_instance(socket_path: &str) -> Result<KiCadInstance, KiCadError> {
     let config = KiCadConnectionConfig {
         socket_path: socket_path.to_string(),
-        client_name: String::from("newkiassist-probe"),
+        client_name: String::from("kiassist-probe"),
         ..Default::default()
     };
 

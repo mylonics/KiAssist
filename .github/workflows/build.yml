@@ -75,7 +75,7 @@ jobs:
       run: |
         cd python-lib
         pip install -e .
-        python -c "import newkiassist_utils; print('Python package version:', newkiassist_utils.__version__)"
+        python -c "import kiassist_utils; print('Python package version:', kiassist_utils.__version__)"
 
     - name: Install frontend dependencies
       run: npm install

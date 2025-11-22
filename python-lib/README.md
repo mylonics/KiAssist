@@ -1,6 +1,6 @@
-# NewKiAssist Python Utilities
+# KiAssist Python Utilities
 
-A Python utility library for the NewKiAssist application. This package provides helper functions for processing messages and working with KiCAD projects.
+A Python utility library for the KiAssist application. This package provides helper functions for processing messages and working with KiCAD projects.
 
 ## Installation
 
@@ -11,7 +11,7 @@ pip install -e .
 ## Usage
 
 ```python
-from newkiassist_utils import process_message, validate_kicad_project
+from kiassist_utils import process_message, validate_kicad_project
 
 # Process a message
 result = process_message("Hello, KiCAD!")
