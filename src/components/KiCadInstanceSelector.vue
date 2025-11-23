@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { invoke } from '@tauri-apps/api/core';
+
+// Define the pywebview API interface
+declare global {
+  interface Window {
+    pywebview?: {
+      api: {
+        detect_kicad_instances: () => Promise<KiCadInstance[]>;
+      };
+    };
+  }
+}
 
 interface KiCadInstance {
   socket_path: string;
@@ -19,14 +29,18 @@ async function detectInstances() {
   error.value = '';
   
   try {
-    const detected = await invoke<KiCadInstance[]>('detect_kicad_instances');
-    instances.value = detected;
-    
-    // Auto-select if only one instance is found
-    if (detected.length === 1) {
-      selectedInstance.value = detected[0];
-    } else if (detected.length === 0) {
-      error.value = 'No KiCAD instances detected. Please make sure KiCAD is running.';
+    if (window.pywebview?.api) {
+      const detected = await window.pywebview.api.detect_kicad_instances();
+      instances.value = detected;
+      
+      // Auto-select if only one instance is found
+      if (detected.length === 1) {
+        selectedInstance.value = detected[0];
+      } else if (detected.length === 0) {
+        error.value = 'No KiCAD instances detected. Please make sure KiCAD is running.';
+      }
+    } else {
+      error.value = 'pywebview API not available';
     }
   } catch (err) {
     error.value = `Error detecting KiCAD instances: ${err}`;
