@@ -1,21 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-
-// Define the pywebview API interface
-declare global {
-  interface Window {
-    pywebview?: {
-      api: {
-        echo_message: (message: string) => Promise<string>;
-        detect_kicad_instances: () => Promise<any[]>;
-        check_api_key: () => Promise<boolean>;
-        get_api_key: () => Promise<string | null>;
-        set_api_key: (apiKey: string) => Promise<{success: boolean; error?: string}>;
-        send_message: (message: string, model: string) => Promise<{success: boolean; response?: string; error?: string}>;
-      };
-    };
-  }
-}
+import '../types/pywebview';
 
 interface Message {
   id: string;

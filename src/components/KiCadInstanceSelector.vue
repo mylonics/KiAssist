@@ -1,23 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-
-// Define the pywebview API interface
-declare global {
-  interface Window {
-    pywebview?: {
-      api: {
-        detect_kicad_instances: () => Promise<KiCadInstance[]>;
-      };
-    };
-  }
-}
-
-interface KiCadInstance {
-  socket_path: string;
-  project_name: string;
-  display_name: string;
-  version: string;
-}
+import type { KiCadInstance } from '../types/pywebview';
 
 const instances = ref<KiCadInstance[]>([]);
 const selectedInstance = ref<KiCadInstance | null>(null);

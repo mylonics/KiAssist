@@ -102,8 +102,12 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
         KiCadInstance if successful, None otherwise
     """
     try:
-        # Try to import kicad-api-python
-        from kicad import KiCad, KiCadConnectionConfig, DocumentType
+        # Try to import kicad API - this is optional
+        try:
+            from kicad import KiCad, KiCadConnectionConfig, DocumentType
+        except ImportError:
+            print("Warning: kicad Python package not available. KiCad detection disabled.")
+            return None
         
         config = KiCadConnectionConfig(
             socket_path=socket_path,
