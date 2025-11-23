@@ -12,7 +12,11 @@ if not exist "dist\" (
 REM Install Python dependencies if needed
 echo Checking Python dependencies...
 cd python-lib
-pip install -e . >nul 2>&1 || echo Python dependencies already installed
+pip install -e . >nul 2>&1
+if errorlevel 1 (
+    echo Warning: Failed to install Python dependencies. Trying without --editable...
+    pip install .
+)
 cd ..
 
 REM Run the Python application

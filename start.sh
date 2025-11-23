@@ -14,7 +14,10 @@ fi
 # Install Python dependencies if needed
 echo "Checking Python dependencies..."
 cd python-lib
-pip install -e . > /dev/null 2>&1 || echo "Python dependencies already installed"
+if ! pip install -e . > /dev/null 2>&1; then
+    echo "Warning: Failed to install Python dependencies. Trying without --editable..."
+    pip install .
+fi
 cd ..
 
 # Run the Python application

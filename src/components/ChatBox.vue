@@ -43,8 +43,12 @@ async function checkApiKey() {
   }
 }
 
+const apiKeyError = ref<string>('');
+
 async function saveApiKey() {
   if (!apiKeyInput.value.trim()) return;
+  
+  apiKeyError.value = ''; // Clear previous errors
   
   try {
     if (window.pywebview?.api) {
@@ -54,14 +58,14 @@ async function saveApiKey() {
         showApiKeyPrompt.value = false;
         apiKeyInput.value = '';
       } else {
-        alert(`Failed to save API key: ${result.error || 'Unknown error'}`);
+        apiKeyError.value = result.error || 'Unknown error occurred';
       }
     } else {
-      alert('pywebview API not available');
+      apiKeyError.value = 'Application backend not available. Please restart the application.';
     }
   } catch (error) {
     console.error('Error saving API key:', error);
-    alert('Failed to save API key. Please try again.');
+    apiKeyError.value = 'Failed to save API key. Please try again.';
   }
 }
 
@@ -164,6 +168,10 @@ onMounted(() => {
           class="api-key-input"
           @keypress.enter="saveApiKey"
         />
+        <div v-if="apiKeyError" class="error-banner">
+          <span class="error-icon">⚠️</span>
+          <span>{{ apiKeyError }}</span>
+        </div>
         <div class="modal-actions">
           <button @click="saveApiKey" class="btn-primary" :disabled="!apiKeyInput.trim()">
             Save API Key
@@ -499,12 +507,30 @@ button:disabled {
   font-size: 1rem;
   background-color: var(--bg-input);
   color: var(--text-primary);
-  margin-bottom: 1.5rem;
+  margin-bottom: 1rem;
 }
 
 .api-key-input:focus {
   outline: none;
   border-color: #667eea;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  margin-bottom: 1rem;
+  background-color: #fee;
+  border: 1px solid #fcc;
+  border-radius: 6px;
+  color: #c33;
+  font-size: 0.9rem;
+}
+
+.error-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
 }
 
 .modal-actions {
