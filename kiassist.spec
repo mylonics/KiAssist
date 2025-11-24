@@ -49,9 +49,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,  # Enable one-folder mode
     name="KiAssist",
     debug=False,
     bootloader_ignore_signals=False,
@@ -68,15 +67,29 @@ exe = EXE(
     icon=None,  # No icon file currently
 )
 
+# Collect all files into a directory (one-folder mode)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='KiAssist',
+)
+
 # macOS specific: create an app bundle
 if sys.platform == "darwin":
     app = BUNDLE(
-        exe,
+        coll,  # Use COLLECT output instead of EXE
         name="KiAssist.app",
         icon=None,  # No icon file currently
         bundle_identifier="com.kiassist.app",
         info_plist={
             "NSPrincipalClass": "NSApplication",
             "NSHighResolutionCapable": "True",
+            "CFBundleVersion": "0.1.0",
+            "CFBundleShortVersionString": "0.1.0",
         },
     )

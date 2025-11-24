@@ -1,4 +1,5 @@
 name: Build and Test
+# NOTE: Version numbers in installer filenames (lines 77, 88, 119) should be kept in sync with python-lib/pyproject.toml
 
 on:
   push:
@@ -61,12 +62,78 @@ jobs:
       run: |
         pyinstaller kiassist.spec --clean
 
+    - name: Install Inno Setup (Windows)
+      if: matrix.platform == 'windows-latest'
+      run: choco install innosetup -y
+
+    - name: Create Windows Installer
+      if: matrix.platform == 'windows-latest'
+      run: |
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+    - name: Install create-dmg (macOS)
+      if: matrix.platform == 'macos-latest'
+      run: brew install create-dmg
+
+    - name: Create macOS DMG
+      if: matrix.platform == 'macos-latest'
+      run: |
+        # create-dmg may fail if KiAssist.app is already signed or in certain edge cases
+        # Using || true allows the workflow to continue and upload the app bundle as a fallback
+        create-dmg \
+          --volname "KiAssist" \
+          --window-pos 200 120 \
+          --window-size 600 400 \
+          --icon-size 100 \
+          --icon "KiAssist.app" 175 190 \
+          --hide-extension "KiAssist.app" \
+          --app-drop-link 425 190 \
+          "KiAssist-0.1.0.dmg" \
+          "dist/KiAssist.app" || echo "Warning: DMG creation failed, app bundle will still be available"
+
+    - name: Install AppImage dependencies (Ubuntu)
+      if: matrix.platform == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y librsvg2-bin
+
+    - name: Create Linux AppImage
+      if: matrix.platform == 'ubuntu-latest'
+      run: |
+        # Download appimagetool
+        wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+        chmod +x appimagetool-x86_64.AppImage
+        
+        # Create AppDir structure
+        mkdir -p KiAssist.AppDir/usr/bin
+        cp -r dist/KiAssist KiAssist.AppDir/usr/bin/kiassist
+        
+        # Convert SVG icon to PNG
+        rsvg-convert -w 256 -h 256 kiassist.svg -o kiassist.png
+        
+        # Create desktop file and icon
+        cp kiassist.desktop KiAssist.AppDir/
+        cp kiassist.png KiAssist.AppDir/
+        
+        # Create AppRun symlink
+        ln -s usr/bin/kiassist/KiAssist KiAssist.AppDir/AppRun
+        
+        # Build AppImage
+        ARCH=x86_64 ./appimagetool-x86_64.AppImage KiAssist.AppDir KiAssist-0.1.0-x86_64.AppImage
+
     - name: Upload build artifacts (Ubuntu)
       if: matrix.platform == 'ubuntu-latest'
       uses: actions/upload-artifact@v4
       with:
         name: linux-build
         path: dist/KiAssist
+
+    - name: Upload Linux AppImage
+      if: matrix.platform == 'ubuntu-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-appimage
+        path: KiAssist-*-x86_64.AppImage
 
     - name: Upload build artifacts (macOS)
       if: matrix.platform == 'macos-latest'
@@ -75,9 +142,23 @@ jobs:
         name: macos-build
         path: dist/KiAssist.app
 
+    - name: Upload macOS DMG
+      if: matrix.platform == 'macos-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-installer
+        path: KiAssist-*.dmg
+
     - name: Upload build artifacts (Windows)
       if: matrix.platform == 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
         name: windows-build
-        path: dist/KiAssist.exe
+        path: dist/KiAssist
+
+    - name: Upload Windows Installer
+      if: matrix.platform == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-installer
+        path: installer-output/KiAssist-Setup-*.exe

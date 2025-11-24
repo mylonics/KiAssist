@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=KiAssist
+Comment=KiCAD AI Assistant - AI-powered assistance for KiCAD PCB design
+Exec=kiassist
+Icon=kiassist
+Categories=Development;Electronics;Engineering;
+Terminal=false
+StartupWMClass=KiAssist
