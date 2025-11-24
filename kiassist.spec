@@ -65,7 +65,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=str(repo_root / "src-tauri" / "icons" / "icon.ico") if platform_name == "windows" else None,
+    icon=None,  # No icon file currently
 )
 
 # macOS specific: create an app bundle
@@ -73,7 +73,7 @@ if sys.platform == "darwin":
     app = BUNDLE(
         exe,
         name="KiAssist.app",
-        icon=str(repo_root / "src-tauri" / "icons" / "icon.icns"),
+        icon=None,  # No icon file currently
         bundle_identifier="com.kiassist.app",
         info_plist={
             "NSPrincipalClass": "NSApplication",
