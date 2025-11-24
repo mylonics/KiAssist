@@ -20,7 +20,7 @@ else:
     platform_name = "linux"
 
 a = Analysis(
-    [str(python_lib_dir / "kiassist_utils" / "main.py")],
+    [str(repo_root / "run_kiassist.py")],
     pathex=[str(python_lib_dir)],
     binaries=[],
     datas=[
