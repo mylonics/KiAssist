@@ -102,19 +102,22 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
         KiCadInstance if successful, None otherwise
     """
     try:
-        # Try to import kicad API - this is optional
+        # Try to import kicad-python API - this is optional
         try:
-            from kicad import KiCad, KiCadConnectionConfig, DocumentType
+            from kipy import KiCad
+            from kipy.proto.common.types import base_types_pb2
         except ImportError:
-            print("Warning: kicad Python package not available. KiCad detection disabled.")
+            print("Warning: kicad-python package not available. KiCad detection disabled.")
             return None
         
-        config = KiCadConnectionConfig(
+        # Create KiCad connection with required parameters
+        # socket_path, client_name, kicad_token=None, timeout_ms=5000
+        kicad = KiCad(
             socket_path=socket_path,
-            client_name="kiassist-probe"
+            client_name="kiassist-probe",
+            kicad_token=None,
+            timeout_ms=5000
         )
-        
-        kicad = KiCad(config)
         
         # Get version
         try:
@@ -126,7 +129,7 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
         # Try to get open documents to determine project name
         project_name = "No Project Open"
         try:
-            docs = kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
+            docs = kicad.get_open_documents(base_types_pb2.DocumentType.DOCTYPE_PCB)
             if docs and len(docs) > 0:
                 doc = docs[0]
                 project_path = doc.project.path

@@ -12,6 +12,7 @@ dependencies = [
     "pywebview>=5.0",
     "requests>=2.31.0",
     "keyring>=24.0.0",
+    "kicad-python>=0.5.0",
 ]
 authors = [
     {name = "KiAssist Contributors"}
