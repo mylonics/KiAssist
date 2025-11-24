@@ -88,12 +88,49 @@ jobs:
           "KiAssist-0.1.0.dmg" \
           "dist/KiAssist.app" || true
 
+    - name: Install AppImage dependencies (Ubuntu)
+      if: matrix.platform == 'ubuntu-latest'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y librsvg2-bin
+
+    - name: Create Linux AppImage
+      if: matrix.platform == 'ubuntu-latest'
+      run: |
+        # Download appimagetool
+        wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+        chmod +x appimagetool-x86_64.AppImage
+        
+        # Create AppDir structure
+        mkdir -p KiAssist.AppDir/usr/bin
+        cp -r dist/KiAssist KiAssist.AppDir/usr/bin/kiassist
+        
+        # Convert SVG icon to PNG
+        rsvg-convert -w 256 -h 256 kiassist.svg -o kiassist.png
+        
+        # Create desktop file and icon
+        cp kiassist.desktop KiAssist.AppDir/
+        cp kiassist.png KiAssist.AppDir/
+        
+        # Create AppRun symlink
+        ln -s usr/bin/kiassist/KiAssist KiAssist.AppDir/AppRun
+        
+        # Build AppImage
+        ARCH=x86_64 ./appimagetool-x86_64.AppImage KiAssist.AppDir KiAssist-0.1.0-x86_64.AppImage
+
     - name: Upload build artifacts (Ubuntu)
       if: matrix.platform == 'ubuntu-latest'
       uses: actions/upload-artifact@v4
       with:
         name: linux-build
         path: dist/KiAssist
+
+    - name: Upload Linux AppImage
+      if: matrix.platform == 'ubuntu-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-appimage
+        path: KiAssist-*-x86_64.AppImage
 
     - name: Upload build artifacts (macOS)
       if: matrix.platform == 'macos-latest'
