@@ -111,11 +111,10 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
             return None
         
         # Create KiCad connection with required parameters
-        # socket_path, client_name, kicad_token=None, timeout_ms=5000
+        # socket_path, client_name, timeout_ms
         kicad = KiCad(
             socket_path=socket_path,
             client_name="kiassist-probe",
-            kicad_token=None,
             timeout_ms=5000
         )
         
