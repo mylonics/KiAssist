@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 # Get the repository root directory
-repo_root = Path(SPECPATH).parent
+# SPECPATH is the directory where the spec file is located (repository root)
+repo_root = Path(SPECPATH)
 dist_dir = repo_root / "dist"
 python_lib_dir = repo_root / "python-lib"
 
