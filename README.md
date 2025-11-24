@@ -17,7 +17,24 @@ KiCAD AI Assistance - A cross-platform desktop application for AI-powered KiCAD 
 
 ## Getting Started
 
-### Prerequisites
+### Installation
+
+**Windows:**
+1. Download `KiAssist-Setup-0.1.0.exe` from the [latest release](https://github.com/mylonics/NewKiAssist/releases)
+2. Run the installer (no admin rights required)
+3. Launch KiAssist from the Start Menu
+
+**macOS:**
+1. Download `KiAssist-0.1.0.dmg` from the [latest release](https://github.com/mylonics/NewKiAssist/releases)
+2. Open the DMG and drag KiAssist.app to Applications
+3. Launch KiAssist from Applications
+
+**Linux:**
+1. Download `KiAssist-0.1.0-x86_64.AppImage` from the [latest release](https://github.com/mylonics/NewKiAssist/releases)
+2. Make it executable: `chmod +x KiAssist-0.1.0-x86_64.AppImage`
+3. Run: `./KiAssist-0.1.0-x86_64.AppImage`
+
+### Prerequisites for Development
 
 - Node.js 20+
 - Python 3.8+
@@ -75,6 +92,8 @@ python -m kiassist_utils.main
 
 ### Building for Production
 
+The build process creates installers for all platforms:
+
 ```bash
 # Use the build script
 ./build.sh  # On Linux/macOS
@@ -84,9 +103,58 @@ build.bat   # On Windows
 This will:
 1. Install all dependencies
 2. Build the Vue.js frontend
-3. Package the application with PyInstaller
+3. Package the application with PyInstaller into a directory bundle
 
-Build artifacts will be available in the `dist/` directory.
+**Output:**
+- **Windows**: `dist/KiAssist/` directory (can be packaged with Inno Setup)
+- **macOS**: `dist/KiAssist.app` bundle (can be packaged into DMG)
+- **Linux**: `dist/KiAssist/` directory (can be packaged as AppImage)
+
+**Creating Installers:**
+
+The CI/CD pipeline automatically builds installers for all platforms. To build installers locally:
+
+**Windows (requires Inno Setup):**
+```bash
+# After building with PyInstaller
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+# Output: installer-output/KiAssist-Setup-0.1.0.exe
+```
+
+**macOS (requires create-dmg):**
+```bash
+# After building with PyInstaller
+brew install create-dmg
+create-dmg \
+  --volname "KiAssist" \
+  --window-pos 200 120 \
+  --window-size 600 400 \
+  --icon-size 100 \
+  --icon "KiAssist.app" 175 190 \
+  --hide-extension "KiAssist.app" \
+  --app-drop-link 425 190 \
+  "KiAssist-0.1.0.dmg" \
+  "dist/KiAssist.app"
+# Output: KiAssist-0.1.0.dmg
+```
+
+**Linux (requires appimagetool):**
+```bash
+# After building with PyInstaller
+wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+chmod +x appimagetool-x86_64.AppImage
+
+mkdir -p KiAssist.AppDir/usr/bin
+cp -r dist/KiAssist KiAssist.AppDir/usr/bin/kiassist
+cp kiassist.desktop KiAssist.AppDir/
+cp kiassist.png KiAssist.AppDir/
+ln -s usr/bin/kiassist/KiAssist KiAssist.AppDir/AppRun
+
+ARCH=x86_64 ./appimagetool-x86_64.AppImage KiAssist.AppDir KiAssist-0.1.0-x86_64.AppImage
+# Output: KiAssist-0.1.0-x86_64.AppImage
+```
+
+Build artifacts will be available in the `dist/` directory and installer output directories.
 
 ## Project Structure
 
@@ -104,9 +172,14 @@ KiAssist/
 │       ├── api_key.py    # API key management and persistence
 │       ├── gemini.py     # Gemini API integration
 │       └── kicad_ipc.py  # KiCAD IPC communication
-├── dist/                  # Built frontend (generated)
+├── dist/                  # Built frontend and PyInstaller output (generated)
 ├── .github/workflows/     # CI/CD pipelines
-├── start.sh / start.bat   # Startup scripts
+├── installer.iss          # Inno Setup script for Windows installer
+├── kiassist.desktop       # Linux desktop entry file
+├── kiassist.svg           # Application icon (SVG)
+├── kiassist.png           # Application icon (PNG, 256x256)
+├── kiassist.spec          # PyInstaller specification file
+├── start.sh / start.bat   # Development startup scripts
 └── build.sh / build.bat   # Build scripts
 ```
 
@@ -146,10 +219,34 @@ response = api.send_message("Hello, KiCAD!", "2.5-flash")
 
 ## CI/CD
 
-GitHub Actions workflows automatically build the application for:
-- Ubuntu Linux (standalone executable)
-- macOS (app bundle)
-- Windows (standalone executable)
+GitHub Actions workflows automatically build installers for all platforms:
+
+**Windows:**
+- Directory bundle: `dist/KiAssist/`
+- Installer: `KiAssist-Setup-0.1.0.exe` (Inno Setup)
+- Installation path: `%LOCALAPPDATA%\Programs\KiAssist\`
+
+**macOS:**
+- App bundle: `dist/KiAssist.app`
+- DMG installer: `KiAssist-0.1.0.dmg` (create-dmg)
+- Installation path: `/Applications/KiAssist.app`
+
+**Linux:**
+- Directory bundle: `dist/KiAssist/`
+- AppImage: `KiAssist-0.1.0-x86_64.AppImage`
+- Portable - runs from any location
+
+All build artifacts are available in GitHub Actions artifacts after each workflow run.
+
+### Installer Benefits
+
+- **No Decompression Overhead**: One-folder mode eliminates 2-5 second startup delay
+- **Standard Installation**: Native installer experience on each platform
+- **User Data Persistence**: API keys stored in OS credential stores persist across updates automatically
+  - Windows: Windows Credential Manager
+  - macOS: Keychain
+  - Linux: Secret Service
+- **No Admin Required**: All installers support per-user installation
 
 ## Technology Stack
 
