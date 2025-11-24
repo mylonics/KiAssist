@@ -8,6 +8,11 @@ version = "0.1.0"
 description = "Utility library for KiAssist - KiCAD AI Assistant"
 readme = "README.md"
 requires-python = ">=3.8"
+dependencies = [
+    "pywebview>=5.0",
+    "requests>=2.31.0",
+    "keyring>=24.0.0",
+]
 authors = [
     {name = "KiAssist Contributors"}
 ]
@@ -25,3 +30,12 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/mylonics/NewKiAssist"
 Repository = "https://github.com/mylonics/NewKiAssist"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pyinstaller>=6.0.0",
+]
+
+[project.scripts]
+kiassist = "kiassist_utils.main:main"

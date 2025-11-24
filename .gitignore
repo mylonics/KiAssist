@@ -34,7 +34,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -48,5 +47,11 @@ wheels/
 .installed.cfg
 *.egg
 
+# PyInstaller
+*.spec.bak
+dist/KiAssist*
+build/KiAssist/
+
 # Research and temporary files
-research/
+# research/ - Removed to allow structured research documentation
+test_backend.py

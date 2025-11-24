@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { invoke } from '@tauri-apps/api/core';
+import '../types/pywebview';
 
 interface Message {
   id: string;
@@ -30,26 +30,42 @@ function generateMessageId(): string {
 
 async function checkApiKey() {
   try {
-    hasApiKey.value = await invoke<boolean>('check_api_key');
-    if (!hasApiKey.value) {
-      showApiKeyPrompt.value = true;
+    if (window.pywebview?.api) {
+      hasApiKey.value = await window.pywebview.api.check_api_key();
+      if (!hasApiKey.value) {
+        showApiKeyPrompt.value = true;
+      }
+    } else {
+      console.error('pywebview API not available');
     }
   } catch (error) {
     console.error('Error checking API key:', error);
   }
 }
 
+const apiKeyError = ref<string>('');
+
 async function saveApiKey() {
   if (!apiKeyInput.value.trim()) return;
   
+  apiKeyError.value = ''; // Clear previous errors
+  
   try {
-    await invoke('set_api_key', { apiKey: apiKeyInput.value.trim() });
-    hasApiKey.value = true;
-    showApiKeyPrompt.value = false;
-    apiKeyInput.value = '';
+    if (window.pywebview?.api) {
+      const result = await window.pywebview.api.set_api_key(apiKeyInput.value.trim());
+      if (result.success) {
+        hasApiKey.value = true;
+        showApiKeyPrompt.value = false;
+        apiKeyInput.value = '';
+      } else {
+        apiKeyError.value = result.error || 'Unknown error occurred';
+      }
+    } else {
+      apiKeyError.value = 'Application backend not available. Please restart the application.';
+    }
   } catch (error) {
     console.error('Error saving API key:', error);
-    alert('Failed to save API key. Please try again.');
+    apiKeyError.value = 'Failed to save API key. Please try again.';
   }
 }
 
@@ -76,19 +92,37 @@ async function sendMessage() {
 
   // Call backend to send message to Gemini
   try {
-    const response = await invoke<string>('send_message', { 
-      message: messageText,
-      model: selectedModel.value
-    });
-    
-    // Add assistant response
-    const assistantMessage: Message = {
-      id: generateMessageId(),
-      text: response,
-      sender: 'assistant',
-      timestamp: new Date(),
-    };
-    messages.value.push(assistantMessage);
+    if (window.pywebview?.api) {
+      const result = await window.pywebview.api.send_message(messageText, selectedModel.value);
+      
+      if (result.success && result.response) {
+        // Add assistant response
+        const assistantMessage: Message = {
+          id: generateMessageId(),
+          text: result.response,
+          sender: 'assistant',
+          timestamp: new Date(),
+        };
+        messages.value.push(assistantMessage);
+      } else {
+        // Add error message to UI
+        const errorMessage: Message = {
+          id: generateMessageId(),
+          text: `Sorry, I encountered an error: ${result.error || 'Unknown error'}. Please check your API key and try again.`,
+          sender: 'assistant',
+          timestamp: new Date(),
+        };
+        messages.value.push(errorMessage);
+      }
+    } else {
+      const errorMessage: Message = {
+        id: generateMessageId(),
+        text: 'pywebview API not available',
+        sender: 'assistant',
+        timestamp: new Date(),
+      };
+      messages.value.push(errorMessage);
+    }
   } catch (error) {
     console.error('Error sending message:', error);
     // Add error message to UI
@@ -134,6 +168,10 @@ onMounted(() => {
           class="api-key-input"
           @keypress.enter="saveApiKey"
         />
+        <div v-if="apiKeyError" class="error-banner">
+          <span class="error-icon">⚠️</span>
+          <span>{{ apiKeyError }}</span>
+        </div>
         <div class="modal-actions">
           <button @click="saveApiKey" class="btn-primary" :disabled="!apiKeyInput.trim()">
             Save API Key
@@ -469,12 +507,30 @@ button:disabled {
   font-size: 1rem;
   background-color: var(--bg-input);
   color: var(--text-primary);
-  margin-bottom: 1.5rem;
+  margin-bottom: 1rem;
 }
 
 .api-key-input:focus {
   outline: none;
   border-color: #667eea;
+}
+
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  margin-bottom: 1rem;
+  background-color: #fee;
+  border: 1px solid #fcc;
+  border-radius: 6px;
+  color: #c33;
+  font-size: 0.9rem;
+}
+
+.error-icon {
+  font-size: 1.1rem;
+  flex-shrink: 0;
 }
 
 .modal-actions {
