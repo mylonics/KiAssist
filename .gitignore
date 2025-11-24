@@ -52,6 +52,9 @@ wheels/
 dist/KiAssist*
 build/KiAssist/
 
+# Installer output directories
+installer-output/
+
 # Research and temporary files
 # research/ - Removed to allow structured research documentation
 test_backend.py

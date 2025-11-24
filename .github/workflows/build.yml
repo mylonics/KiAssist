@@ -61,6 +61,15 @@ jobs:
       run: |
         pyinstaller kiassist.spec --clean
 
+    - name: Install Inno Setup (Windows)
+      if: matrix.platform == 'windows-latest'
+      run: choco install innosetup -y
+
+    - name: Create Windows Installer
+      if: matrix.platform == 'windows-latest'
+      run: |
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
     - name: Upload build artifacts (Ubuntu)
       if: matrix.platform == 'ubuntu-latest'
       uses: actions/upload-artifact@v4
@@ -81,3 +90,10 @@ jobs:
       with:
         name: windows-build
         path: dist/KiAssist
+
+    - name: Upload Windows Installer
+      if: matrix.platform == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-installer
+        path: installer-output/KiAssist-Setup-*.exe
