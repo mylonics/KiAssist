@@ -7,10 +7,6 @@ from tempfile import gettempdir
 from typing import List, Dict, Any, Optional
 
 
-# Maximum number of KiCad instances to probe on Windows
-# (since we can't enumerate named pipes easily)
-MAX_WINDOWS_INSTANCES = 10
-
 # Cache the current OS platform
 _CURRENT_PLATFORM = platform.system()
 
@@ -69,36 +65,34 @@ def get_ipc_socket_dir() -> Path:
 def discover_socket_files() -> List[Path]:
     """Discover all KiCad IPC socket files.
     
-    On Linux/macOS, this scans the socket directory for .sock files.
-    On Windows, named pipes don't exist as filesystem entries, so we
-    generate potential socket paths to probe.
+    Scans the socket directory for socket files matching the pattern:
+    - api.sock (main instance)
+    - api-<PID>.sock (additional instances with process ID)
     
     Returns:
-        List of paths to socket files (or potential socket paths on Windows)
+        List of paths to socket files
     """
     socket_dir = get_ipc_socket_dir()
     sockets = []
     
-    if _CURRENT_PLATFORM == "Windows":
-        # On Windows, named pipes are not visible as files.
-        # Generate potential socket paths for KiCad instances.
-        # KiCad creates: api.sock, api-1.sock, api-2.sock, etc.
-        sockets.append(socket_dir / "api.sock")
-        for i in range(1, MAX_WINDOWS_INSTANCES):
-            sockets.append(socket_dir / f"api-{i}.sock")
-        return sockets
-    
-    # On Linux/macOS, scan the directory for actual socket files
+    # Check if socket directory exists
     if not socket_dir.exists():
         return sockets
     
     # Look for files matching api*.sock pattern
+    # This works on all platforms including Windows where KiCad creates actual files
     try:
         for entry in socket_dir.iterdir():
             if entry.is_file() or entry.is_socket():
                 filename = entry.name
+                # Match api.sock or api-<PID>.sock pattern
                 if filename.startswith("api") and filename.endswith(".sock"):
-                    sockets.append(entry)
+                    # Additional validation: check for api.sock or api-<digits>.sock
+                    if filename == "api.sock" or (
+                        filename.startswith("api-") and 
+                        filename[4:-5].isdigit()  # Check that middle part is a number (PID)
+                    ):
+                        sockets.append(entry)
     except Exception as e:
         print(f"Warning: Could not scan socket directory: {e}")
     
