@@ -148,6 +148,7 @@ onMounted(() => {
 .kicad-selector {
   padding: 0.75rem;
   height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -360,6 +361,7 @@ onMounted(() => {
   border-radius: 3px;
   border: 1px solid var(--border-color);
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }
 

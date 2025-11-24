@@ -434,7 +434,7 @@ onMounted(() => {
 }
 
 .message-content {
-  max-width: 75%;
+  max-width: min(75%, 700px);
   padding: 0.5rem 0.75rem;
   border-radius: 3px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
