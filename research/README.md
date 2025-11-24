@@ -69,6 +69,77 @@ Researched installer solutions for PyInstaller-based cross-platform distribution
 
 ---
 
+## 3. NNG IPC Windows Path Handling
+
+**Date**: 2025-11-24  
+**Status**: Complete  
+**Recommendation**: No changes needed (current implementation is correct)
+
+### Quick Summary
+
+Researched how NNG (nanomsg-next-gen) handles IPC paths on Windows:
+
+| Question | Answer |
+|----------|--------|
+| Manual `\\.\pipe\` prefix required? | **No** - NNG adds it internally |
+| Correct URL format | `ipc://{path}` (same as UNIX) |
+| Current KiAssist code correct? | **Yes** - matches official kipy |
+
+### Key Findings
+
+1. **NNG Internal Behavior**: NNG automatically prepends `\\.\pipe\` to paths on Windows
+2. **Source Code Verified**: `win_ipcdial.c` uses `IPC_PIPE_PREFIX "%s"` pattern
+3. **kipy Compatibility**: Official kicad-python uses same format as KiAssist
+4. **No Manual Prefix**: Adding `\\.\pipe\` manually would create double prefix
+
+### Read More
+
+- **[REPORT.md](nng-ipc-windows/REPORT.md)**: Complete findings and recommendations
+- **[ANALYSIS.md](nng-ipc-windows/ANALYSIS.md)**: Source code evidence and comparison table
+- **[GAPS.md](nng-ipc-windows/GAPS.md)**: Knowledge gaps (Windows socket discovery)
+- **[PROPOSAL.md](nng-ipc-windows/PROPOSAL.md)**: Verification checklist and future improvements
+- **[SCOPE.md](nng-ipc-windows/SCOPE.md)**: Research objectives and constraints
+- **[REFERENCES.md](nng-ipc-windows/REFERENCES.md)**: 6 technical references
+- **[CHANGELOG.md](nng-ipc-windows/CHANGELOG.md)**: Research activity log
+
+---
+
+## 4. KiCad IPC API on Windows
+
+**Date**: 2025-11-24  
+**Status**: Complete  
+**Recommendation**: Use default path directly; file-based discovery not viable on Windows
+
+### Quick Summary
+
+Researched how KiCad creates its IPC API endpoint on Windows:
+
+| Question | Answer |
+|----------|--------|
+| Does KiCad create `.sock` file on Windows? | **No** - named pipes don't create files |
+| Socket path format | `ipc://{TEMP}\kicad\api.sock` |
+| Actual named pipe | `\\.\pipe\{TEMP}\kicad\api.sock` |
+| File-based discovery viable? | **No** - must use default path directly |
+
+### Key Findings
+
+1. **No File Created**: Windows named pipes exist only in kernel namespace
+2. **Same Path Construction**: KiCad uses identical path logic on Windows and Linux
+3. **NNG Transforms Path**: `ipc://` URL becomes `\\.\pipe\` named pipe automatically
+4. **Discovery Limitation**: Cannot use `glob()` or file listing on Windows
+
+### Read More
+
+- **[REPORT.md](kicad-ipc-windows/REPORT.md)**: Complete findings and recommendations
+- **[ANALYSIS.md](kicad-ipc-windows/ANALYSIS.md)**: KiCad source code analysis
+- **[GAPS.md](kicad-ipc-windows/GAPS.md)**: Knowledge gaps and validation needs
+- **[PROPOSAL.md](kicad-ipc-windows/PROPOSAL.md)**: Implementation recommendations
+- **[SCOPE.md](kicad-ipc-windows/SCOPE.md)**: Research objectives and constraints
+- **[REFERENCES.md](kicad-ipc-windows/REFERENCES.md)**: 7 technical references
+- **[CHANGELOG.md](kicad-ipc-windows/CHANGELOG.md)**: Research activity log
+
+---
+
 ## Research Template
 
 Each research topic follows the same structure:
