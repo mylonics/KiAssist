@@ -89,16 +89,18 @@ The UI component provides instance selection with the following features:
 ### Windows
 
 - **Socket Directory**: `%TEMP%\kicad\` (typically `C:\Users\<user>\AppData\Local\Temp\kicad\`)
-- **Socket Files**: `api.sock`, `api-1.sock`, etc.
+- **Socket Files**: Named pipes (`api.sock`, `api-1.sock`, etc.) - these do NOT exist as files in the filesystem
 - **IPC URI Format**: `ipc://C:\Users\<user>\AppData\Local\Temp\kicad\api.sock`
-- **Named Pipe Conversion**: Handled internally by NNG library
+- **Named Pipe Conversion**: NNG automatically prepends `\\.\pipe\` to the path
+- **Discovery Method**: Since named pipes don't appear as files, the implementation generates potential socket paths and probes each one
 
 ### Linux/macOS
 
-- **Socket Directory**: `/tmp/kicad/`
-- **Socket Files**: `api.sock`, `api-1.sock`, etc.
+- **Socket Directory**: `/tmp/kicad/` (or `~/.var/app/org.kicad.KiCad/cache/tmp/kicad/` for Flatpak)
+- **Socket Files**: `api.sock`, `api-1.sock`, etc. - these exist as actual files
 - **IPC URI Format**: `ipc:///tmp/kicad/api.sock`
 - **Unix Domain Sockets**: Used directly by NNG
+- **Discovery Method**: Scans the socket directory for `.sock` files
 
 ## Usage Example
 
@@ -164,6 +166,7 @@ Potential improvements for future versions:
 1. **No Hot-Reload Detection**: Requires manual refresh if KiCAD starts after the app
 2. **First Instance Only**: Currently only uses the first open PCB for project name
 3. **No Connection Pooling**: Each detection creates new connections
+4. **Windows Instance Limit**: On Windows, only the first 10 potential KiCad instances are probed (configurable via `MAX_WINDOWS_INSTANCES`)
 
 ## References
 

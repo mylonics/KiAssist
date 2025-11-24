@@ -3,7 +3,16 @@
 import os
 import platform
 from pathlib import Path
+from tempfile import gettempdir
 from typing import List, Dict, Any, Optional
+
+
+# Maximum number of KiCad instances to probe on Windows
+# (since we can't enumerate named pipes easily)
+MAX_WINDOWS_INSTANCES = 10
+
+# Cache the current OS platform
+_CURRENT_PLATFORM = platform.system()
 
 
 class KiCadInstance:
@@ -44,31 +53,49 @@ def get_ipc_socket_dir() -> Path:
     Returns:
         Path to the socket directory
     """
-    system = platform.system()
-    
-    if system == "Windows":
-        temp = os.environ.get("TEMP", "C:\\Temp")
+    if _CURRENT_PLATFORM == "Windows":
+        temp = gettempdir()
         return Path(temp) / "kicad"
     else:
+        # Check for flatpak socket path first
+        home = os.environ.get('HOME')
+        if home is not None:
+            flatpak_socket_path = Path(home) / '.var/app/org.kicad.KiCad/cache/tmp/kicad'
+            if flatpak_socket_path.exists():
+                return flatpak_socket_path
         return Path("/tmp/kicad")
 
 
 def discover_socket_files() -> List[Path]:
     """Discover all KiCad IPC socket files.
     
+    On Linux/macOS, this scans the socket directory for .sock files.
+    On Windows, named pipes don't exist as filesystem entries, so we
+    generate potential socket paths to probe.
+    
     Returns:
-        List of paths to socket files
+        List of paths to socket files (or potential socket paths on Windows)
     """
     socket_dir = get_ipc_socket_dir()
     sockets = []
     
+    if _CURRENT_PLATFORM == "Windows":
+        # On Windows, named pipes are not visible as files.
+        # Generate potential socket paths for KiCad instances.
+        # KiCad creates: api.sock, api-1.sock, api-2.sock, etc.
+        sockets.append(socket_dir / "api.sock")
+        for i in range(1, MAX_WINDOWS_INSTANCES):
+            sockets.append(socket_dir / f"api-{i}.sock")
+        return sockets
+    
+    # On Linux/macOS, scan the directory for actual socket files
     if not socket_dir.exists():
         return sockets
     
     # Look for files matching api*.sock pattern
     try:
         for entry in socket_dir.iterdir():
-            if entry.is_file():
+            if entry.is_file() or entry.is_socket():
                 filename = entry.name
                 if filename.startswith("api") and filename.endswith(".sock"):
                     sockets.append(entry)

@@ -46,6 +46,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
 
 # PyInstaller
 *.spec.bak
