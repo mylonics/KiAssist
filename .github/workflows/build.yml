@@ -70,6 +70,24 @@ jobs:
       run: |
         & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
+    - name: Install create-dmg (macOS)
+      if: matrix.platform == 'macos-latest'
+      run: brew install create-dmg
+
+    - name: Create macOS DMG
+      if: matrix.platform == 'macos-latest'
+      run: |
+        create-dmg \
+          --volname "KiAssist" \
+          --window-pos 200 120 \
+          --window-size 600 400 \
+          --icon-size 100 \
+          --icon "KiAssist.app" 175 190 \
+          --hide-extension "KiAssist.app" \
+          --app-drop-link 425 190 \
+          "KiAssist-0.1.0.dmg" \
+          "dist/KiAssist.app" || true
+
     - name: Upload build artifacts (Ubuntu)
       if: matrix.platform == 'ubuntu-latest'
       uses: actions/upload-artifact@v4
@@ -83,6 +101,13 @@ jobs:
       with:
         name: macos-build
         path: dist/KiAssist.app
+
+    - name: Upload macOS DMG
+      if: matrix.platform == 'macos-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: macos-installer
+        path: KiAssist-*.dmg
 
     - name: Upload build artifacts (Windows)
       if: matrix.platform == 'windows-latest'
