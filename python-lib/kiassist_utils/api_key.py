@@ -52,27 +52,24 @@ class ApiKeyStore:
         if self._keyring_available is not None:
             return self._keyring_available
         
+        # The most reliable way to check keyring availability is to try it
+        # This avoids fragile string matching on backend names
+        test_key = "__kiassist_test__"
         try:
-            # Try to access the keyring to see if it works
-            # Some backends (like null backend) won't raise errors but won't persist
-            backend = keyring.get_keyring()
-            backend_name = type(backend).__name__.lower()
-            
-            # Check if we have a "real" backend, not a fail-safe or null one
-            if 'fail' in backend_name or 'null' in backend_name or 'chainer' in backend_name:
-                self._keyring_available = False
-            else:
-                # Try a test write/read cycle to verify it works
-                test_key = "__kiassist_test__"
-                try:
-                    keyring.set_password(self.SERVICE_NAME, test_key, "test")
-                    result = keyring.get_password(self.SERVICE_NAME, test_key)
-                    keyring.delete_password(self.SERVICE_NAME, test_key)
-                    self._keyring_available = (result == "test")
-                except Exception:
-                    self._keyring_available = False
-                    
+            keyring.set_password(self.SERVICE_NAME, test_key, "test")
+            result = keyring.get_password(self.SERVICE_NAME, test_key)
+            try:
+                keyring.delete_password(self.SERVICE_NAME, test_key)
+            except keyring.errors.PasswordDeleteError:
+                pass  # Ignore delete errors, test is complete
+            self._keyring_available = (result == "test")
+        except (keyring.errors.KeyringError, keyring.errors.PasswordSetError):
+            self._keyring_available = False
+        except OSError:
+            # Handle OS-level errors like dbus connection issues
+            self._keyring_available = False
         except Exception:
+            # Catch any other unexpected errors to avoid crashing
             self._keyring_available = False
         
         return self._keyring_available
@@ -86,11 +83,18 @@ class ApiKeyStore:
         try:
             config_path = self._get_config_path()
             if config_path.exists():
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     return config.get('api_key')
-        except Exception as e:
-            print(f"Warning: Could not load from config file: {e}")
+        except (OSError, IOError) as e:
+            # File system errors
+            pass
+        except json.JSONDecodeError:
+            # Invalid JSON in config file
+            pass
+        except (TypeError, KeyError):
+            # Unexpected config structure
+            pass
         return None
     
     def _save_to_file(self, api_key: str) -> bool:
@@ -109,25 +113,26 @@ class ApiKeyStore:
             # Load existing config if present
             if config_path.exists():
                 try:
-                    with open(config_path, 'r') as f:
+                    with open(config_path, 'r', encoding='utf-8') as f:
                         config = json.load(f)
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, OSError, IOError):
+                    # Start fresh if existing config is invalid
+                    config = {}
             
             config['api_key'] = api_key
             
-            with open(config_path, 'w') as f:
+            with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2)
             
             # Set restrictive permissions on the file (owner read/write only)
             try:
                 os.chmod(config_path, 0o600)
-            except Exception:
+            except OSError:
                 pass  # Ignore permission errors on Windows
             
             return True
-        except Exception as e:
-            print(f"Warning: Could not save to config file: {e}")
+        except (OSError, IOError):
+            # File system errors (permissions, disk full, etc.)
             return False
     
     def _delete_from_file(self) -> None:
@@ -135,15 +140,15 @@ class ApiKeyStore:
         try:
             config_path = self._get_config_path()
             if config_path.exists():
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 
                 if 'api_key' in config:
                     del config['api_key']
                 
-                with open(config_path, 'w') as f:
+                with open(config_path, 'w', encoding='utf-8') as f:
                     json.dump(config, f, indent=2)
-        except Exception:
+        except (OSError, IOError, json.JSONDecodeError):
             pass  # Ignore errors when deleting
     
     def has_api_key(self) -> bool:
@@ -182,8 +187,9 @@ class ApiKeyStore:
                 if stored_key:
                     self._memory_key = stored_key
                     return stored_key
-            except Exception as e:
-                print(f"Warning: Could not access keyring: {e}")
+            except (keyring.errors.KeyringError, OSError):
+                # Keyring access failed, will fall back to file
+                pass
         
         # Fallback to file-based storage
         file_key = self._load_from_file()
@@ -224,8 +230,9 @@ class ApiKeyStore:
             try:
                 keyring.set_password(self.SERVICE_NAME, self.KEY_NAME, api_key)
                 persisted = True
-            except Exception as e:
-                print(f"Warning: Could not save to keyring: {e}")
+            except (keyring.errors.KeyringError, keyring.errors.PasswordSetError, OSError):
+                # Keyring save failed, will fall back to file
+                pass
         
         # If keyring failed or unavailable, try file-based storage
         if not persisted:
@@ -244,7 +251,7 @@ class ApiKeyStore:
         if self._is_keyring_available():
             try:
                 keyring.delete_password(self.SERVICE_NAME, self.KEY_NAME)
-            except Exception:
+            except (keyring.errors.KeyringError, keyring.errors.PasswordDeleteError, OSError):
                 pass  # Ignore errors when clearing
         
         # Clear from file
