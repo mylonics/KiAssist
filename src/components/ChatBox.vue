@@ -242,7 +242,7 @@ onMounted(() => {
           @keypress.enter="saveApiKey"
         />
         <div v-if="apiKeyError" class="error-banner">
-          <span class="error-icon">⚠️</span>
+          <span class="material-icons error-icon">warning</span>
           <span>{{ apiKeyError }}</span>
         </div>
         <div class="modal-actions">
@@ -265,14 +265,14 @@ onMounted(() => {
           </option>
         </select>
         <button @click="showApiKeyPrompt = true" class="settings-btn" title="Configure API Key">
-          ⚙️
+          <span class="material-icons">settings</span>
         </button>
       </div>
     </div>
     
     <div class="chat-messages">
       <div v-if="messages.length === 0" class="welcome-message">
-        <p>👋 Welcome to KiAssist!</p>
+        <p>Welcome to KiAssist!</p>
         <p class="hint">Ask me anything about KiCAD or PCB design. Powered by Google Gemini.</p>
       </div>
       
@@ -288,7 +288,7 @@ onMounted(() => {
               class="copy-btn"
               :title="copiedMessageId === message.id ? 'Copied!' : 'Copy message'"
             >
-              {{ copiedMessageId === message.id ? 'Copied' : 'Copy' }}
+              <span class="material-icons">{{ copiedMessageId === message.id ? 'check' : 'content_copy' }}</span>
             </button>
           </div>
           <div class="message-text">{{ message.text }}</div>
@@ -329,7 +329,7 @@ onMounted(() => {
   height: 100%;
   max-height: 100%;
   overflow: hidden;
-  background-color: var(--bg-secondary);
+  background-color: var(--bg-primary);
 }
 
 .chat-header {
@@ -374,13 +374,20 @@ onMounted(() => {
 }
 
 .settings-btn {
-  padding: 0.375rem 0.5rem;
+  padding: 0.375rem;
   background-color: var(--bg-input);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 1rem;
   transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.settings-btn .material-icons {
+  font-size: 1.25rem;
+  color: var(--text-secondary);
 }
 
 .settings-btn:hover {
@@ -388,12 +395,16 @@ onMounted(() => {
   border-color: var(--accent-color);
 }
 
+.settings-btn:hover .material-icons {
+  color: var(--accent-color);
+}
+
 .chat-messages {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
   padding: 1.25rem;
-  background-color: var(--bg-secondary);
+  background-color: var(--bg-primary);
   min-height: 0;
 }
 
@@ -454,18 +465,20 @@ onMounted(() => {
 }
 
 .copy-btn {
-  padding: 0.2rem 0.5rem;
+  padding: 0.25rem;
   background: rgba(0, 0, 0, 0.06);
   border: none;
   border-radius: var(--radius-sm);
-  font-size: 0.6875rem;
   cursor: pointer;
   transition: background 0.15s ease;
-  min-width: 2.5rem;
-  height: 1.375rem;
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.copy-btn .material-icons {
+  font-size: 1rem;
+  color: var(--text-secondary);
 }
 
 .copy-btn:hover {
@@ -474,6 +487,10 @@ onMounted(() => {
 
 .message.user .copy-btn {
   background: rgba(255, 255, 255, 0.15);
+}
+
+.message.user .copy-btn .material-icons {
+  color: rgba(255, 255, 255, 0.9);
 }
 
 .message.user .copy-btn:hover {
@@ -652,8 +669,9 @@ button:disabled {
 }
 
 .error-icon {
-  font-size: 1.125rem;
+  font-size: 1.25rem;
   flex-shrink: 0;
+  color: #dc2626;
 }
 
 .modal-actions {

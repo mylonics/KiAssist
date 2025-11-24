@@ -64,14 +64,17 @@ onMounted(() => {
     <div class="selector-header">
       <h3>KiCAD Connection</h3>
       <button @click="detectInstances" :disabled="loading" class="refresh-btn">
-        {{ loading ? 'Detecting...' : '🔄 Refresh' }}
+        <span class="material-icons">refresh</span>
+        {{ loading ? 'Detecting...' : 'Refresh' }}
       </button>
     </div>
 
     <div v-if="error" class="error-message">
-      <span class="error-icon">⚠️</span>
+      <span class="material-icons error-icon">warning</span>
       <span class="error-text">{{ error }}</span>
-      <button @click="copyError" class="copy-btn" title="Copy error message">Copy</button>
+      <button @click="copyError" class="copy-btn" title="Copy error message">
+        <span class="material-icons">content_copy</span>
+      </button>
     </div>
 
     <div v-else-if="loading" class="loading-message">
@@ -86,7 +89,9 @@ onMounted(() => {
 
     <div v-else-if="instances.length === 1" class="single-instance">
       <div class="instance-card selected">
-        <div class="instance-icon">✓</div>
+        <div class="instance-icon">
+          <span class="material-icons">check</span>
+        </div>
         <div class="instance-info">
           <div class="instance-name">{{ instances[0].display_name }}</div>
           <div class="instance-project">{{ instances[0].project_name }}</div>
@@ -178,6 +183,13 @@ onMounted(() => {
   font-size: 0.8125rem;
   color: var(--text-primary);
   transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.refresh-btn .material-icons {
+  font-size: 1.125rem;
 }
 
 .refresh-btn:hover:not(:disabled) {
@@ -203,8 +215,9 @@ onMounted(() => {
 }
 
 .error-icon {
-  font-size: 1rem;
+  font-size: 1.25rem;
   flex-shrink: 0;
+  color: #dc2626;
 }
 
 .error-text {
@@ -213,15 +226,21 @@ onMounted(() => {
 }
 
 .copy-btn {
-  padding: 0.25rem 0.5rem;
+  padding: 0.25rem;
   background-color: rgba(220, 38, 38, 0.1);
   border: 1px solid rgba(220, 38, 38, 0.2);
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 0.6875rem;
   flex-shrink: 0;
   color: #dc2626;
   transition: background 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.copy-btn .material-icons {
+  font-size: 1rem;
 }
 
 .copy-btn:hover {
@@ -301,9 +320,12 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 1.125rem;
   flex-shrink: 0;
   box-shadow: var(--shadow-sm);
+}
+
+.instance-icon .material-icons {
+  font-size: 1.25rem;
 }
 
 .instance-info {
