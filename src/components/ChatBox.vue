@@ -469,7 +469,7 @@ button:disabled {
 }
 
 .modal-content {
-  background-color: var(--bg-primary);
+  background-color: var(--bg-primary, #ffffff);
   padding: 2rem;
   border-radius: 12px;
   max-width: 500px;
@@ -644,6 +644,10 @@ button:disabled {
     --text-primary: #e4e4e4;
     --text-secondary: #a0a0a0;
     --border-color: #404040;
+  }
+  
+  .modal-content {
+    background-color: var(--bg-primary, #1a1a1a);
   }
 }
 </style>
