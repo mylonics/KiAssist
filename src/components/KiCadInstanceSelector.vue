@@ -63,9 +63,8 @@ onMounted(() => {
   <div class="kicad-selector">
     <div class="selector-header">
       <h3>KiCAD Connection</h3>
-      <button @click="detectInstances" :disabled="loading" class="refresh-btn">
-        <span class="material-icons">refresh</span>
-        {{ loading ? 'Detecting...' : 'Refresh' }}
+      <button @click="detectInstances" :disabled="loading" class="refresh-btn" :title="loading ? 'Detecting KiCAD instances...' : 'Refresh KiCAD instances'">
+        <span class="material-icons">{{ loading ? 'hourglass_empty' : 'refresh' }}</span>
       </button>
     </div>
 
@@ -175,26 +174,25 @@ onMounted(() => {
 }
 
 .refresh-btn {
-  padding: 0.375rem 0.75rem;
-  background-color: var(--bg-input);
-  border: 1px solid var(--border-color);
+  padding: 0.375rem;
+  background: transparent;
+  border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 0.8125rem;
-  color: var(--text-primary);
+  color: var(--text-secondary);
   transition: all 0.15s ease;
   display: flex;
   align-items: center;
-  gap: 0.375rem;
+  justify-content: center;
 }
 
 .refresh-btn .material-icons {
-  font-size: 1.125rem;
+  font-size: 1.375rem;
 }
 
 .refresh-btn:hover:not(:disabled) {
   background-color: var(--bg-tertiary);
-  border-color: var(--accent-color);
+  color: var(--accent-color);
 }
 
 .refresh-btn:disabled {

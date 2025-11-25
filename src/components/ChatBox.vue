@@ -264,7 +264,7 @@ onMounted(() => {
             {{ model.label }}
           </option>
         </select>
-        <button @click="showApiKeyPrompt = true" class="settings-btn" title="Configure API Key">
+        <button @click="showApiKeyPrompt = true" class="icon-btn" title="Configure API Key">
           <span class="material-icons">settings</span>
         </button>
       </div>
@@ -315,8 +315,8 @@ onMounted(() => {
         rows="2"
         :disabled="isLoading"
       />
-      <button @click="sendMessage" :disabled="!inputMessage.trim() || isLoading">
-        {{ isLoading ? 'Sending...' : 'Send' }}
+      <button @click="sendMessage" :disabled="!inputMessage.trim() || isLoading" class="send-btn" :title="isLoading ? 'Sending...' : 'Send message'">
+        <span class="material-icons">{{ isLoading ? 'hourglass_empty' : 'send' }}</span>
       </button>
     </div>
   </div>
@@ -373,10 +373,10 @@ onMounted(() => {
   box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.2);
 }
 
-.settings-btn {
+.icon-btn {
   padding: 0.375rem;
-  background-color: var(--bg-input);
-  border: 1px solid var(--border-color);
+  background: transparent;
+  border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.15s ease;
@@ -385,17 +385,16 @@ onMounted(() => {
   justify-content: center;
 }
 
-.settings-btn .material-icons {
-  font-size: 1.25rem;
+.icon-btn .material-icons {
+  font-size: 1.375rem;
   color: var(--text-secondary);
 }
 
-.settings-btn:hover {
+.icon-btn:hover {
   background-color: var(--bg-tertiary);
-  border-color: var(--accent-color);
 }
 
-.settings-btn:hover .material-icons {
+.icon-btn:hover .material-icons {
   color: var(--accent-color);
 }
 
@@ -585,6 +584,17 @@ button:active:not(:disabled) {
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.send-btn {
+  padding: 0.625rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.send-btn .material-icons {
+  font-size: 1.375rem;
 }
 
 /* Modal styles */
