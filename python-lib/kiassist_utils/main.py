@@ -10,6 +10,16 @@ from .api_key import ApiKeyStore
 from .gemini import GeminiAPI
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path
+from .requirements_wizard import (
+    get_default_questions,
+    check_requirements_file,
+    get_requirements_content,
+    save_requirements_file,
+    build_refine_prompt,
+    build_synthesize_prompt,
+    parse_refined_questions,
+    parse_synthesized_docs,
+)
 
 
 class KiAssistAPI:
@@ -252,6 +262,146 @@ class KiAssistAPI:
             
         except Exception as e:
             return {"success": False, "error": str(e), "open_projects": [], "recent_projects": []}
+    
+    # Requirements Wizard API methods
+    
+    def get_wizard_questions(self) -> Dict[str, Any]:
+        """Get the default wizard questions.
+        
+        Returns:
+            Dictionary with questions list
+        """
+        try:
+            questions = get_default_questions()
+            return {
+                "success": True,
+                "questions": questions
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def check_requirements_file(self, project_dir: str) -> Dict[str, Any]:
+        """Check if requirements.md exists in project directory.
+        
+        Args:
+            project_dir: Path to the project directory
+            
+        Returns:
+            Dictionary with exists status and paths
+        """
+        return check_requirements_file(project_dir)
+    
+    def get_requirements_content(self, project_dir: str) -> Dict[str, Any]:
+        """Read requirements.md content from project directory.
+        
+        Args:
+            project_dir: Path to the project directory
+            
+        Returns:
+            Dictionary with file content or error
+        """
+        return get_requirements_content(project_dir)
+    
+    def save_requirements(self, project_dir: str, requirements_content: str, 
+                         todo_content: Optional[str] = None) -> Dict[str, Any]:
+        """Save requirements.md and todo.md to project directory.
+        
+        Args:
+            project_dir: Path to the project directory
+            requirements_content: Content for requirements.md
+            todo_content: Optional content for todo.md
+            
+        Returns:
+            Dictionary with success status and saved paths
+        """
+        return save_requirements_file(project_dir, requirements_content, todo_content)
+    
+    def refine_wizard_questions(self, initial_answers: Dict[str, str], 
+                               model: str = "2.5-flash") -> Dict[str, Any]:
+        """Send initial answers to LLM to refine remaining questions.
+        
+        Args:
+            initial_answers: Dictionary of question_id to answer text
+            model: The model to use
+            
+        Returns:
+            Dictionary with refined questions or error
+        """
+        try:
+            # Get API key
+            api_key = self.api_key_store.get_api_key()
+            if not api_key:
+                return {"success": False, "error": "API key not configured"}
+            
+            # Create or update Gemini API instance
+            if not self.gemini_api:
+                self.gemini_api = GeminiAPI(api_key)
+            
+            # Build the prompt
+            prompt = build_refine_prompt(initial_answers)
+            
+            # Send to LLM
+            response = self.gemini_api.send_message(prompt, model)
+            
+            # Parse the response
+            refined_questions = parse_refined_questions(response)
+            
+            return {
+                "success": True,
+                "questions": refined_questions
+            }
+            
+        except Exception as e:
+            return {"success": False, "error": f"Error refining questions: {str(e)}"}
+    
+    def synthesize_requirements(self, questions: List[Dict[str, Any]], 
+                               answers: Dict[str, str],
+                               project_name: str = "PCB Project",
+                               model: str = "2.5-flash") -> Dict[str, Any]:
+        """Send all Q&A to LLM to synthesize requirements documents.
+        
+        Args:
+            questions: List of question dictionaries
+            answers: Dictionary of question_id to answer text
+            project_name: Name of the project
+            model: The model to use
+            
+        Returns:
+            Dictionary with requirements and todo content or error
+        """
+        try:
+            # Get API key
+            api_key = self.api_key_store.get_api_key()
+            if not api_key:
+                return {"success": False, "error": "API key not configured"}
+            
+            # Create or update Gemini API instance
+            if not self.gemini_api:
+                self.gemini_api = GeminiAPI(api_key)
+            
+            # Build the prompt
+            prompt = build_synthesize_prompt(questions, answers, project_name)
+            
+            # Send to LLM
+            response = self.gemini_api.send_message(prompt, model)
+            
+            # Parse the response
+            docs = parse_synthesized_docs(response)
+            
+            if docs['requirements'] or docs['todo']:
+                return {
+                    "success": True,
+                    "requirements": docs['requirements'],
+                    "todo": docs['todo']
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": "Failed to parse LLM response into documents"
+                }
+            
+        except Exception as e:
+            return {"success": False, "error": f"Error synthesizing requirements: {str(e)}"}
 
 
 def get_frontend_path() -> Path:

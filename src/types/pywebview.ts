@@ -45,6 +45,39 @@ export interface ProjectsListResult extends ApiResult {
   recent_projects: RecentProject[];
 }
 
+// Requirements Wizard types
+export interface WizardQuestion {
+  id: string;
+  category: string;
+  question: string;
+  placeholder?: string;
+  multiline?: boolean;
+}
+
+export interface WizardQuestionsResult extends ApiResult {
+  questions?: WizardQuestion[];
+}
+
+export interface RequirementsFileResult extends ApiResult {
+  requirements_exists?: boolean;
+  requirements_path?: string;
+  todo_exists?: boolean;
+  todo_path?: string;
+}
+
+export interface RequirementsContentResult extends ApiResult {
+  content?: string;
+}
+
+export interface SaveRequirementsResult extends ApiResult {
+  saved_files?: string[];
+}
+
+export interface SynthesizeResult extends ApiResult {
+  requirements?: string;
+  todo?: string;
+}
+
 export interface PyWebViewAPI {
   echo_message: (message: string) => Promise<string>;
   detect_kicad_instances: () => Promise<KiCadInstance[]>;
@@ -59,6 +92,13 @@ export interface PyWebViewAPI {
   browse_for_project: () => Promise<BrowseProjectResult>;
   get_open_project_paths: () => Promise<string[]>;
   get_projects_list: () => Promise<ProjectsListResult>;
+  // Requirements Wizard API
+  get_wizard_questions: () => Promise<WizardQuestionsResult>;
+  check_requirements_file: (projectDir: string) => Promise<RequirementsFileResult>;
+  get_requirements_content: (projectDir: string) => Promise<RequirementsContentResult>;
+  save_requirements: (projectDir: string, requirementsContent: string, todoContent?: string) => Promise<SaveRequirementsResult>;
+  refine_wizard_questions: (initialAnswers: Record<string, string>, model?: string) => Promise<WizardQuestionsResult>;
+  synthesize_requirements: (questions: WizardQuestion[], answers: Record<string, string>, projectName?: string, model?: string) => Promise<SynthesizeResult>;
 }
 
 declare global {
