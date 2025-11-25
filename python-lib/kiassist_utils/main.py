@@ -3,12 +3,13 @@
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import webview
 
 from .api_key import ApiKeyStore
 from .gemini import GeminiAPI
-from .kicad_ipc import detect_kicad_instances
+from .kicad_ipc import detect_kicad_instances, get_open_project_paths
+from .recent_projects import RecentProjectsStore, validate_kicad_project_path
 
 
 class KiAssistAPI:
@@ -18,6 +19,7 @@ class KiAssistAPI:
         """Initialize the backend API."""
         self.api_key_store = ApiKeyStore()
         self.gemini_api: Optional[GeminiAPI] = None
+        self.recent_projects_store = RecentProjectsStore()
     
     def echo_message(self, message: str) -> str:
         """Echo a message (for testing).
@@ -116,6 +118,140 @@ class KiAssistAPI:
             
         except Exception as e:
             return {"success": False, "error": f"Gemini API error: {str(e)}"}
+    
+    def get_recent_projects(self) -> List[Dict[str, Any]]:
+        """Get list of recently opened projects.
+        
+        Returns:
+            List of recent project dictionaries
+        """
+        return self.recent_projects_store.get_recent_projects()
+    
+    def add_recent_project(self, project_path: str) -> dict:
+        """Add a project to the recent projects list.
+        
+        Args:
+            project_path: Path to the KiCad project file
+            
+        Returns:
+            Result dictionary with success status
+        """
+        try:
+            self.recent_projects_store.add_project(project_path)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def remove_recent_project(self, project_path: str) -> dict:
+        """Remove a project from the recent projects list.
+        
+        Args:
+            project_path: Path to the KiCad project file
+            
+        Returns:
+            Result dictionary with success status
+        """
+        try:
+            self.recent_projects_store.remove_project(project_path)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def validate_project_path(self, path: str) -> Dict[str, Any]:
+        """Validate and get info about a KiCad project path.
+        
+        Args:
+            path: Path to validate
+            
+        Returns:
+            Dictionary with validation result and project info
+        """
+        return validate_kicad_project_path(path)
+    
+    def browse_for_project(self) -> Dict[str, Any]:
+        """Open a file dialog to browse for a KiCad project.
+        
+        Returns:
+            Dictionary with selected path and project info, or error
+        """
+        try:
+            # Get all windows
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No window available"}
+            
+            window = windows[0]
+            
+            # Open file dialog for .kicad_pro files
+            result = window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=('KiCad Project Files (*.kicad_pro)', 'All Files (*.*)')
+            )
+            
+            if result and len(result) > 0:
+                selected_path = result[0]
+                validation = validate_kicad_project_path(selected_path)
+                if validation.get('valid'):
+                    return {
+                        "success": True,
+                        "path": selected_path,
+                        **validation
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": validation.get('error', 'Invalid project')
+                    }
+            else:
+                return {"success": False, "cancelled": True}
+                
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def get_open_project_paths(self) -> List[str]:
+        """Get list of project paths from currently open KiCad instances.
+        
+        Returns:
+            List of project paths that are currently open in KiCad
+        """
+        return get_open_project_paths()
+    
+    def get_projects_list(self) -> Dict[str, Any]:
+        """Get combined list of open and recent projects.
+        
+        Returns:
+            Dictionary containing open_projects and recent_projects lists
+        """
+        try:
+            # Get open KiCad instances
+            open_instances = detect_kicad_instances()
+            
+            # Get open project paths for comparison
+            open_paths = set()
+            for instance in open_instances:
+                project_path = instance.get('project_path', '')
+                if project_path:
+                    open_paths.add(os.path.normpath(os.path.abspath(project_path)))
+            
+            # Get recent projects (excluding currently open ones)
+            all_recent = self.recent_projects_store.get_recent_projects()
+            recent_projects = []
+            for project in all_recent:
+                project_path = project.get('path', '')
+                if project_path:
+                    normalized = os.path.normpath(os.path.abspath(project_path))
+                    if normalized not in open_paths:
+                        recent_projects.append(project)
+            
+            return {
+                "success": True,
+                "open_projects": open_instances,
+                "recent_projects": recent_projects
+            }
+            
+        except Exception as e:
+            return {"success": False, "error": str(e), "open_projects": [], "recent_projects": []}
 
 
 def get_frontend_path() -> Path:

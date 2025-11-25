@@ -12,7 +12,8 @@ from kiassist_utils.kicad_ipc import (
     get_ipc_socket_dir,
     discover_socket_files,
     socket_path_to_uri,
-    MAX_WINDOWS_INSTANCES,
+    get_open_project_paths,
+    is_project_open,
 )
 
 
@@ -47,25 +48,6 @@ class TestGetIpcSocketDir:
 
 class TestDiscoverSocketFiles:
     """Tests for discover_socket_files function."""
-
-    def test_windows_generates_potential_paths(self):
-        """Test that Windows returns generated potential socket paths."""
-        with mock.patch('kiassist_utils.kicad_ipc._CURRENT_PLATFORM', 'Windows'):
-            with mock.patch('kiassist_utils.kicad_ipc.gettempdir', return_value=r'C:\Temp'):
-                result = discover_socket_files()
-                
-                # Should have MAX_WINDOWS_INSTANCES paths
-                assert len(result) == MAX_WINDOWS_INSTANCES
-                
-                # First should be api.sock
-                result_str = str(result[0])
-                assert 'api.sock' in result_str
-                assert 'kicad' in result_str
-                
-                # Rest should be api-N.sock
-                for i in range(1, MAX_WINDOWS_INSTANCES):
-                    result_str = str(result[i])
-                    assert f'api-{i}.sock' in result_str
 
     def test_linux_returns_empty_when_dir_not_exists(self):
         """Test that Linux returns empty list when socket dir doesn't exist."""
@@ -112,3 +94,50 @@ class TestSocketPathToUri:
         assert result.startswith("ipc://")
         assert "kicad" in result
         assert "api.sock" in result
+
+
+class TestGetOpenProjectPaths:
+    """Tests for get_open_project_paths function."""
+
+    def test_returns_empty_when_no_instances(self):
+        """Test that empty list is returned when no instances are detected."""
+        with mock.patch('kiassist_utils.kicad_ipc.detect_kicad_instances', return_value=[]):
+            result = get_open_project_paths()
+            assert result == []
+
+    def test_returns_project_paths(self):
+        """Test that project paths are extracted from instances."""
+        mock_instances = [
+            {'project_path': '/path/to/project1', 'socket_path': 'socket1'},
+            {'project_path': '/path/to/project2', 'socket_path': 'socket2'},
+            {'project_path': '', 'socket_path': 'socket3'},  # Empty path should be excluded
+        ]
+        with mock.patch('kiassist_utils.kicad_ipc.detect_kicad_instances', return_value=mock_instances):
+            result = get_open_project_paths()
+            assert len(result) == 2
+            assert '/path/to/project1' in result
+            assert '/path/to/project2' in result
+
+
+class TestIsProjectOpen:
+    """Tests for is_project_open function."""
+
+    def test_returns_true_when_project_is_open(self):
+        """Test that True is returned when project is in open list."""
+        with mock.patch('kiassist_utils.kicad_ipc.get_open_project_paths', return_value=['/path/to/project']):
+            result = is_project_open('/path/to/project')
+            assert result is True
+
+    def test_returns_false_when_project_is_not_open(self):
+        """Test that False is returned when project is not in open list."""
+        with mock.patch('kiassist_utils.kicad_ipc.get_open_project_paths', return_value=['/path/to/other']):
+            result = is_project_open('/path/to/project')
+            assert result is False
+
+    def test_handles_path_normalization(self):
+        """Test that paths are normalized for comparison."""
+        with mock.patch('kiassist_utils.kicad_ipc.get_open_project_paths', return_value=['/path/to/project']):
+            # Test with trailing slash
+            result = is_project_open('/path/to/project/')
+            # Should still match after normalization
+            assert result is True

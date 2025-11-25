@@ -73,7 +73,7 @@ def get_ipc_socket_dir() -> Path:
 
 
 def discover_socket_files() -> List[Path]:
-    """Discover all KiCad IPC socket files.
+    r"""Discover all KiCad IPC socket files.
     
     On Windows: Enumerates named pipes in \\.\pipe\ to find KiCad sockets.
     On Linux/macOS: Scans the socket directory for socket files matching the pattern.
@@ -300,3 +300,37 @@ def detect_kicad_instances() -> List[Dict[str, str]]:
             instances.append(instance.to_dict())
     
     return instances
+
+
+def get_open_project_paths() -> List[str]:
+    """Get list of project paths from currently open KiCad instances.
+    
+    Returns:
+        List of project paths that are currently open in KiCad
+    """
+    instances = detect_kicad_instances()
+    paths = []
+    for instance in instances:
+        project_path = instance.get('project_path', '')
+        if project_path:
+            paths.append(project_path)
+    return paths
+
+
+def is_project_open(project_path: str) -> bool:
+    """Check if a specific project is currently open in KiCad.
+    
+    Args:
+        project_path: Path to the KiCad project to check
+        
+    Returns:
+        True if the project is currently open, False otherwise
+    """
+    import os
+    normalized_path = os.path.normpath(os.path.abspath(project_path))
+    open_paths = get_open_project_paths()
+    
+    for open_path in open_paths:
+        if os.path.normpath(os.path.abspath(open_path)) == normalized_path:
+            return True
+    return False

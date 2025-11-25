@@ -1,11 +1,18 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
-import type { KiCadInstance } from '../types/pywebview';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import type { KiCadInstance, RecentProject } from '../types/pywebview';
 
-const instances = ref<KiCadInstance[]>([]);
-const selectedInstance = ref<KiCadInstance | null>(null);
+// Configuration
+const MAX_VISIBLE_RECENT = 5;
+const REFRESH_INTERVAL_MS = 10000; // 10 seconds
+
+const openProjects = ref<KiCadInstance[]>([]);
+const recentProjects = ref<RecentProject[]>([]);
+const selectedProject = ref<KiCadInstance | RecentProject | null>(null);
 const loading = ref(false);
 const error = ref<string>('');
+const showAllRecent = ref(false);
+let refreshTimer: number | null = null;
 
 async function waitForAPI(maxAttempts = 20, delayMs = 100): Promise<boolean> {
   for (let i = 0; i < maxAttempts; i++) {
@@ -17,12 +24,11 @@ async function waitForAPI(maxAttempts = 20, delayMs = 100): Promise<boolean> {
   return false;
 }
 
-async function detectInstances() {
+async function refreshProjectsList() {
   loading.value = true;
   error.value = '';
   
   try {
-    // Wait for API to be available (up to 2 seconds)
     const apiAvailable = await waitForAPI();
     
     if (!apiAvailable) {
@@ -30,21 +36,86 @@ async function detectInstances() {
       return;
     }
     
-    const detected = await window.pywebview!.api.detect_kicad_instances();
-    instances.value = detected;
+    const result = await window.pywebview!.api.get_projects_list();
     
-    // Auto-select if only one instance is found
-    if (detected.length === 1) {
-      selectedInstance.value = detected[0];
-    } else if (detected.length === 0) {
-      error.value = 'No KiCAD instances detected. Please make sure KiCAD is running.';
+    if (result.success) {
+      openProjects.value = result.open_projects;
+      recentProjects.value = result.recent_projects;
+      
+      // Auto-select if only one open project
+      if (result.open_projects.length === 1 && !selectedProject.value) {
+        selectedProject.value = result.open_projects[0];
+      }
+    } else {
+      error.value = result.error || 'Failed to get projects list';
     }
   } catch (err) {
-    error.value = `Error detecting KiCAD instances: ${err}`;
-    console.error('Error detecting KiCAD instances:', err);
+    error.value = `Error getting projects: ${err}`;
+    console.error('Error getting projects:', err);
   } finally {
     loading.value = false;
   }
+}
+
+async function browseForProject() {
+  try {
+    const apiAvailable = await waitForAPI();
+    if (!apiAvailable) {
+      error.value = 'pywebview API not available';
+      return;
+    }
+    
+    const result = await window.pywebview!.api.browse_for_project();
+    
+    if (result.success && result.path) {
+      // Add to recent projects
+      await window.pywebview!.api.add_recent_project(result.path);
+      
+      // Refresh the list
+      await refreshProjectsList();
+      
+      // Select the newly added project
+      const newProject = recentProjects.value.find(p => p.path === result.path);
+      if (newProject) {
+        selectProject(newProject, false);
+      }
+    } else if (!result.cancelled && result.error) {
+      error.value = result.error;
+    }
+  } catch (err) {
+    error.value = `Error browsing for project: ${err}`;
+    console.error('Error browsing for project:', err);
+  }
+}
+
+function selectProject(project: KiCadInstance | RecentProject, isOpen: boolean) {
+  selectedProject.value = project;
+  
+  // Add to recent projects if selecting from recent list
+  if (!isOpen && 'path' in project) {
+    window.pywebview?.api.add_recent_project(project.path);
+  }
+}
+
+function isProjectOpen(project: RecentProject): boolean {
+  const normalizedPath = project.path.toLowerCase();
+  return openProjects.value.some(
+    op => op.project_path.toLowerCase() === normalizedPath
+  );
+}
+
+function getProjectName(project: KiCadInstance | RecentProject): string {
+  if ('display_name' in project) {
+    return project.display_name || project.project_name;
+  }
+  return project.name;
+}
+
+function getProjectPath(project: KiCadInstance | RecentProject): string {
+  if ('project_path' in project) {
+    return project.project_path;
+  }
+  return project.path;
 }
 
 function copyError() {
@@ -53,9 +124,65 @@ function copyError() {
   }
 }
 
-// Auto-detect on component mount
+function startRefreshTimer() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+  }
+  refreshTimer = window.setInterval(() => {
+    refreshProjectsList();
+  }, REFRESH_INTERVAL_MS);
+}
+
+function stopRefreshTimer() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
+}
+
+// Computed properties
+const visibleRecentProjects = computed(() => {
+  if (showAllRecent.value) {
+    return recentProjects.value;
+  }
+  return recentProjects.value.slice(0, MAX_VISIBLE_RECENT);
+});
+
+const hasMoreRecentProjects = computed(() => {
+  return recentProjects.value.length > MAX_VISIBLE_RECENT;
+});
+
+const selectedProjectInfo = computed(() => {
+  if (!selectedProject.value) return null;
+  
+  // Check if it's a KiCadInstance (has socket_path)
+  if ('socket_path' in selectedProject.value) {
+    return {
+      name: selectedProject.value.display_name || selectedProject.value.project_name,
+      projectPath: selectedProject.value.project_path,
+      pcbPath: selectedProject.value.pcb_path,
+      schematicPath: selectedProject.value.schematic_path,
+      isOpen: true
+    };
+  }
+  
+  // It's a RecentProject
+  return {
+    name: selectedProject.value.name,
+    projectPath: selectedProject.value.path,
+    pcbPath: '',
+    schematicPath: '',
+    isOpen: isProjectOpen(selectedProject.value)
+  };
+});
+
 onMounted(() => {
-  detectInstances();
+  refreshProjectsList();
+  startRefreshTimer();
+});
+
+onUnmounted(() => {
+  stopRefreshTimer();
 });
 </script>
 
@@ -63,8 +190,8 @@ onMounted(() => {
   <div class="kicad-selector">
     <div class="selector-header">
       <h3>KiCAD Connection</h3>
-      <button @click="detectInstances" :disabled="loading" class="refresh-btn" :title="loading ? 'Detecting KiCAD instances...' : 'Refresh KiCAD instances'">
-        <span class="material-icons">{{ loading ? 'hourglass_empty' : 'refresh' }}</span>
+      <button @click="refreshProjectsList" :disabled="loading" class="refresh-btn" :title="loading ? 'Refreshing...' : 'Refresh'">
+        <span class="material-icons" :class="{ spinning: loading }">{{ loading ? 'sync' : 'refresh' }}</span>
       </button>
     </div>
 
@@ -76,73 +203,96 @@ onMounted(() => {
       </button>
     </div>
 
-    <div v-else-if="loading" class="loading-message">
-      <div class="spinner"></div>
-      <span>Detecting KiCAD instances...</span>
-    </div>
-
-    <div v-else-if="instances.length === 0" class="no-instances">
-      <p>No KiCAD instances found.</p>
-      <p class="hint">Please start KiCAD and click Refresh.</p>
-    </div>
-
-    <div v-else-if="instances.length === 1" class="single-instance">
-      <div class="instance-card selected">
-        <div class="instance-icon">
-          <span class="material-icons">check</span>
+    <div v-else class="projects-container">
+      <!-- Open Projects Section -->
+      <div v-if="openProjects.length > 0" class="section">
+        <div class="section-header">
+          <span class="material-icons section-icon">desktop_windows</span>
+          <span class="section-title">Open in KiCAD</span>
         </div>
-        <div class="instance-info">
-          <div class="instance-name">{{ instances[0].display_name }}</div>
-          <div class="instance-project">{{ instances[0].project_name }}</div>
-        </div>
-      </div>
-      <div class="selected-info">
-        <div class="info-row" v-if="instances[0].project_path">
-          <span class="label">Project:</span>
-          <span class="value" :title="instances[0].project_path">{{ instances[0].project_path }}</span>
-        </div>
-        <div class="info-row" v-if="instances[0].pcb_path">
-          <span class="label">PCB:</span>
-          <span class="value" :title="instances[0].pcb_path">{{ instances[0].pcb_path }}</span>
-        </div>
-        <div class="info-row" v-if="instances[0].schematic_path">
-          <span class="label">Schematic:</span>
-          <span class="value" :title="instances[0].schematic_path">{{ instances[0].schematic_path }}</span>
+        <div class="project-list">
+          <button
+            v-for="project in openProjects"
+            :key="project.socket_path"
+            class="project-item"
+            :class="{ selected: selectedProject === project }"
+            @click="selectProject(project, true)"
+          >
+            <span class="material-icons status-icon open">check_circle</span>
+            <div class="project-info">
+              <div class="project-name">{{ getProjectName(project) }}</div>
+              <div class="project-path" :title="getProjectPath(project)">{{ getProjectPath(project) }}</div>
+            </div>
+          </button>
         </div>
       </div>
-      <p class="connection-status">Connected to KiCAD</p>
-    </div>
 
-    <div v-else class="multiple-instances">
-      <label for="instance-select">Select KiCAD Instance:</label>
-      <select 
-        id="instance-select" 
-        v-model="selectedInstance" 
-        class="instance-dropdown"
-      >
-        <option :value="null" disabled>-- Choose an instance --</option>
-        <option 
-          v-for="instance in instances" 
-          :key="instance.socket_path" 
-          :value="instance"
+      <!-- Recent Projects Section -->
+      <div v-if="recentProjects.length > 0" class="section">
+        <div class="section-header">
+          <span class="material-icons section-icon">history</span>
+          <span class="section-title">Recent Projects</span>
+        </div>
+        <div class="project-list">
+          <button
+            v-for="project in visibleRecentProjects"
+            :key="project.path"
+            class="project-item"
+            :class="{ selected: selectedProject === project }"
+            @click="selectProject(project, false)"
+          >
+            <span class="material-icons status-icon" :class="{ open: isProjectOpen(project) }">
+              {{ isProjectOpen(project) ? 'check_circle' : 'folder' }}
+            </span>
+            <div class="project-info">
+              <div class="project-name">{{ project.name }}</div>
+              <div class="project-path" :title="project.path">{{ project.path }}</div>
+            </div>
+          </button>
+        </div>
+        <button
+          v-if="hasMoreRecentProjects"
+          class="show-more-btn"
+          @click="showAllRecent = !showAllRecent"
         >
-          {{ instance.display_name }}
-        </option>
-      </select>
+          <span class="material-icons">{{ showAllRecent ? 'expand_less' : 'expand_more' }}</span>
+          {{ showAllRecent ? 'Show less' : `Show ${recentProjects.length - MAX_VISIBLE_RECENT} more` }}
+        </button>
+      </div>
 
-      <div v-if="selectedInstance" class="selected-info">
-        <div class="info-row" v-if="selectedInstance.project_path">
-          <span class="label">Project:</span>
-          <span class="value" :title="selectedInstance.project_path">{{ selectedInstance.project_path }}</span>
-        </div>
-        <div class="info-row" v-if="selectedInstance.pcb_path">
-          <span class="label">PCB:</span>
-          <span class="value" :title="selectedInstance.pcb_path">{{ selectedInstance.pcb_path }}</span>
-        </div>
-        <div class="info-row" v-if="selectedInstance.schematic_path">
-          <span class="label">Schematic:</span>
-          <span class="value" :title="selectedInstance.schematic_path">{{ selectedInstance.schematic_path }}</span>
-        </div>
+      <!-- No projects message -->
+      <div v-if="openProjects.length === 0 && recentProjects.length === 0 && !loading" class="no-projects">
+        <span class="material-icons">folder_off</span>
+        <p>No projects found</p>
+        <p class="hint">Open KiCAD or browse for a project</p>
+      </div>
+
+      <!-- Browse Button - Always visible -->
+      <div class="browse-section">
+        <button class="browse-btn" @click="browseForProject">
+          <span class="material-icons">folder_open</span>
+          Browse for Project...
+        </button>
+      </div>
+    </div>
+
+    <!-- Selected Project Info -->
+    <div v-if="selectedProjectInfo" class="selected-info">
+      <div class="connection-status" :class="{ connected: selectedProjectInfo.isOpen }">
+        <span class="status-dot"></span>
+        {{ selectedProjectInfo.isOpen ? 'Connected to KiCAD' : 'Project Selected' }}
+      </div>
+      <div class="info-row" v-if="selectedProjectInfo.projectPath">
+        <span class="label">Project:</span>
+        <span class="value" :title="selectedProjectInfo.projectPath">{{ selectedProjectInfo.projectPath }}</span>
+      </div>
+      <div class="info-row" v-if="selectedProjectInfo.pcbPath">
+        <span class="label">PCB:</span>
+        <span class="value" :title="selectedProjectInfo.pcbPath">{{ selectedProjectInfo.pcbPath }}</span>
+      </div>
+      <div class="info-row" v-if="selectedProjectInfo.schematicPath">
+        <span class="label">Schematic:</span>
+        <span class="value" :title="selectedProjectInfo.schematicPath">{{ selectedProjectInfo.schematicPath }}</span>
       </div>
     </div>
   </div>
@@ -188,6 +338,15 @@ onMounted(() => {
 
 .refresh-btn .material-icons {
   font-size: 1.375rem;
+}
+
+.refresh-btn .material-icons.spinning {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .refresh-btn:hover:not(:disabled) {
@@ -245,103 +404,92 @@ onMounted(() => {
   background-color: rgba(220, 38, 38, 0.15);
 }
 
-.loading-message {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  padding: 1rem;
-  justify-content: center;
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-}
-
-.spinner {
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(--border-color);
-  border-top-color: var(--accent-color);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-.no-instances {
-  text-align: center;
-  padding: 1.5rem 1rem;
-  color: var(--text-secondary);
-}
-
-.no-instances p:first-child {
-  font-weight: 500;
-  margin-bottom: 0.375rem;
-  font-size: 0.9375rem;
-}
-
-.hint {
-  font-size: 0.8125rem;
-  opacity: 0.85;
-}
-
-.single-instance {
+.projects-container {
   flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.section {
   display: flex;
   flex-direction: column;
 }
 
-.instance-card {
+.section-header {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  padding: 0.75rem;
-  background-color: var(--bg-secondary);
-  border: 1px solid var(--border-color);
+  gap: 0.5rem;
+  padding: 0.375rem 0;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.section-icon {
+  font-size: 1rem;
+}
+
+.project-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.project-item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.5rem 0.625rem;
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
-  margin-bottom: 0.75rem;
+  cursor: pointer;
+  text-align: left;
   transition: all 0.15s ease;
+  width: 100%;
 }
 
-.instance-card.selected {
-  border-color: var(--accent-color);
+.project-item:hover {
+  background-color: var(--bg-tertiary);
+  border-color: var(--border-color);
+}
+
+.project-item.selected {
   background: linear-gradient(135deg, rgba(88, 101, 242, 0.08) 0%, rgba(71, 82, 196, 0.08) 100%);
-  box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.1);
+  border-color: var(--accent-color);
 }
 
-.instance-icon {
-  width: 32px;
-  height: 32px;
-  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
-  color: white;
-  border-radius: var(--radius-sm);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+.status-icon {
+  font-size: 1.125rem;
+  color: var(--text-secondary);
   flex-shrink: 0;
-  box-shadow: var(--shadow-sm);
 }
 
-.instance-icon .material-icons {
-  font-size: 1.25rem;
+.status-icon.open {
+  color: #22c55e;
 }
 
-.instance-info {
+.project-info {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
 }
 
-.instance-name {
+.project-name {
   font-weight: 500;
+  font-size: 0.8125rem;
   color: var(--text-primary);
-  font-size: 0.875rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.instance-project {
-  font-size: 0.75rem;
+.project-path {
+  font-size: 0.6875rem;
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
@@ -349,60 +497,88 @@ onMounted(() => {
   margin-top: 0.125rem;
 }
 
-.connection-status {
-  color: #22c55e;
-  font-weight: 500;
-  font-size: 0.8125rem;
-  margin-top: 0.5rem;
-  text-align: center;
+.show-more-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.375rem;
-}
-
-.connection-status::before {
-  content: '';
-  width: 6px;
-  height: 6px;
-  background-color: #22c55e;
-  border-radius: 50%;
-  animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-.multiple-instances label {
-  display: block;
-  margin-bottom: 0.5rem;
-  font-weight: 500;
-  color: var(--text-primary);
-  font-size: 0.875rem;
-}
-
-.instance-dropdown {
-  width: 100%;
-  padding: 0.5rem 0.75rem;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  background-color: var(--bg-input);
-  color: var(--text-primary);
-  font-size: 0.875rem;
+  gap: 0.25rem;
+  padding: 0.375rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
   cursor: pointer;
+  color: var(--accent-color);
+  font-size: 0.75rem;
+  font-weight: 500;
+  transition: background 0.15s ease;
+}
+
+.show-more-btn:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.show-more-btn .material-icons {
+  font-size: 1.125rem;
+}
+
+.no-projects {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.no-projects .material-icons {
+  font-size: 2.5rem;
+  margin-bottom: 0.75rem;
+  opacity: 0.5;
+}
+
+.no-projects p {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.no-projects .hint {
+  font-size: 0.75rem;
+  margin-top: 0.25rem;
+  opacity: 0.8;
+}
+
+.browse-section {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.browse-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.625rem;
+  background-color: var(--bg-secondary);
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  font-weight: 500;
   transition: all 0.15s ease;
 }
 
-.instance-dropdown:hover {
+.browse-btn:hover {
+  background-color: var(--bg-tertiary);
   border-color: var(--accent-color);
+  color: var(--accent-color);
 }
 
-.instance-dropdown:focus {
-  outline: none;
-  border-color: var(--accent-color);
-  box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.15);
+.browse-btn .material-icons {
+  font-size: 1.125rem;
 }
 
 .selected-info {
@@ -411,15 +587,45 @@ onMounted(() => {
   background-color: var(--bg-secondary);
   border-radius: var(--radius-md);
   border: 1px solid var(--border-color);
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 0.625rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.connection-status.connected {
+  color: #22c55e;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--text-secondary);
+}
+
+.connection-status.connected .status-dot {
+  background-color: #22c55e;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
 }
 
 .info-row {
   display: flex;
   flex-direction: column;
-  padding: 0.5rem 0;
+  padding: 0.375rem 0;
 }
 
 .info-row:not(:last-child) {
@@ -429,8 +635,8 @@ onMounted(() => {
 .info-row .label {
   font-weight: 500;
   color: var(--text-secondary);
-  font-size: 0.75rem;
-  margin-bottom: 0.25rem;
+  font-size: 0.6875rem;
+  margin-bottom: 0.125rem;
   text-transform: uppercase;
   letter-spacing: 0.025em;
 }
@@ -439,7 +645,7 @@ onMounted(() => {
   color: var(--text-primary);
   font-weight: 400;
   word-break: break-all;
-  font-size: 0.8125rem;
+  font-size: 0.75rem;
   font-family: 'SF Mono', 'Consolas', 'Monaco', 'Courier New', monospace;
   line-height: 1.4;
 }

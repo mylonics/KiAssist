@@ -8,7 +8,8 @@ __version__ = "0.1.0"
 
 from .api_key import ApiKeyStore
 from .gemini import GeminiAPI
-from .kicad_ipc import detect_kicad_instances, KiCadInstance
+from .kicad_ipc import detect_kicad_instances, KiCadInstance, get_open_project_paths, is_project_open
+from .recent_projects import RecentProjectsStore, validate_kicad_project_path
 from .main import KiAssistAPI, main
 
 __all__ = [
@@ -16,6 +17,10 @@ __all__ = [
     "GeminiAPI",
     "detect_kicad_instances",
     "KiCadInstance",
+    "get_open_project_paths",
+    "is_project_open",
+    "RecentProjectsStore",
+    "validate_kicad_project_path",
     "KiAssistAPI",
     "main",
 ]
