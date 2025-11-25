@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import type { KiCadInstance, RecentProject } from '../types/pywebview';
+import RequirementsWizard from './RequirementsWizard.vue';
 
 // Configuration
 const MAX_VISIBLE_RECENT = 5;
@@ -13,6 +14,11 @@ const loading = ref(false);
 const error = ref<string>('');
 const showAllRecent = ref(false);
 let refreshTimer: number | null = null;
+
+// Requirements wizard state
+const showRequirementsWizard = ref(false);
+const requirementsExists = ref(false);
+const todoExists = ref(false);
 
 async function waitForAPI(maxAttempts = 20, delayMs = 100): Promise<boolean> {
   for (let i = 0; i < maxAttempts; i++) {
@@ -176,6 +182,59 @@ const selectedProjectInfo = computed(() => {
   };
 });
 
+// Get project directory from project path
+const selectedProjectDir = computed(() => {
+  if (!selectedProjectInfo.value) return '';
+  const path = selectedProjectInfo.value.projectPath;
+  // Remove filename to get directory
+  const lastSep = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+  return lastSep > 0 ? path.substring(0, lastSep) : path;
+});
+
+const selectedProjectName = computed(() => {
+  return selectedProjectInfo.value?.name || 'Project';
+});
+
+// Check requirements file when project changes
+async function checkRequirementsFile() {
+  if (!selectedProjectDir.value) {
+    requirementsExists.value = false;
+    todoExists.value = false;
+    return;
+  }
+  
+  try {
+    if (window.pywebview?.api) {
+      const result = await window.pywebview.api.check_requirements_file(selectedProjectDir.value);
+      if (result.success) {
+        requirementsExists.value = result.requirements_exists || false;
+        todoExists.value = result.todo_exists || false;
+      }
+    }
+  } catch (err) {
+    console.error('Error checking requirements file:', err);
+  }
+}
+
+function openRequirementsWizard() {
+  showRequirementsWizard.value = true;
+}
+
+function closeRequirementsWizard() {
+  showRequirementsWizard.value = false;
+}
+
+function onRequirementsSaved(files: string[]) {
+  console.log('Requirements saved:', files);
+  showRequirementsWizard.value = false;
+  checkRequirementsFile();
+}
+
+// Watch for project changes to update requirements status
+watch(selectedProject, () => {
+  checkRequirementsFile();
+}, { immediate: true });
+
 onMounted(() => {
   refreshProjectsList();
   startRefreshTimer();
@@ -294,7 +353,32 @@ onUnmounted(() => {
         <span class="label">Schematic:</span>
         <span class="value" :title="selectedProjectInfo.schematicPath">{{ selectedProjectInfo.schematicPath }}</span>
       </div>
+      
+      <!-- Requirements Status -->
+      <div class="requirements-section">
+        <div class="requirements-status" :class="{ exists: requirementsExists }">
+          <span class="material-icons status-icon">{{ requirementsExists ? 'check_circle' : 'error_outline' }}</span>
+          <span class="status-text">{{ requirementsExists ? 'requirements.md exists' : 'No requirements.md' }}</span>
+        </div>
+        <button 
+          @click="openRequirementsWizard" 
+          class="requirements-btn"
+          :title="requirementsExists ? 'Update requirements' : 'Create requirements'"
+        >
+          <span class="material-icons">{{ requirementsExists ? 'edit' : 'add' }}</span>
+          {{ requirementsExists ? 'Edit' : 'Create' }}
+        </button>
+      </div>
     </div>
+    
+    <!-- Requirements Wizard Modal -->
+    <RequirementsWizard
+      :project-dir="selectedProjectDir"
+      :project-name="selectedProjectName"
+      :visible="showRequirementsWizard"
+      @close="closeRequirementsWizard"
+      @saved="onRequirementsSaved"
+    />
   </div>
 </template>
 
@@ -648,5 +732,60 @@ onUnmounted(() => {
   font-size: 0.75rem;
   font-family: 'SF Mono', 'Consolas', 'Monaco', 'Courier New', monospace;
   line-height: 1.4;
+}
+
+/* Requirements Section */
+.requirements-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.requirements-status {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.requirements-status .status-icon {
+  font-size: 1rem;
+  color: #f59e0b;
+}
+
+.requirements-status.exists .status-icon {
+  color: #22c55e;
+}
+
+.requirements-status .status-text {
+  font-weight: 500;
+}
+
+.requirements-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.375rem 0.625rem;
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
+  color: white;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.requirements-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+
+.requirements-btn .material-icons {
+  font-size: 0.875rem;
 }
 </style>
