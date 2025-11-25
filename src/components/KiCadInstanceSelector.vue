@@ -6,6 +6,7 @@ import RequirementsWizard from './RequirementsWizard.vue';
 // Configuration
 const MAX_VISIBLE_RECENT = 5;
 const REFRESH_INTERVAL_MS = 10000; // 10 seconds
+const MESSAGE_DISPLAY_DURATION_MS = 5000; // 5 seconds for success messages
 
 const openProjects = ref<KiCadInstance[]>([]);
 const recentProjects = ref<RecentProject[]>([]);
@@ -258,10 +259,10 @@ async function injectTestNote() {
     
     if (result.success) {
       injectTestMessage.value = result.message || 'Test note injected successfully!';
-      // Clear message after 5 seconds
+      // Clear message after the configured duration
       setTimeout(() => {
         injectTestMessage.value = '';
-      }, 5000);
+      }, MESSAGE_DISPLAY_DURATION_MS);
     } else {
       error.value = result.error || 'Failed to inject test note';
     }

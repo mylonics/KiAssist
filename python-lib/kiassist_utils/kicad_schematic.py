@@ -14,8 +14,13 @@ except ImportError:
 
 
 # Default position for test note (top right area of A4 schematic in mm)
+# KiCAD uses a coordinate system where the origin (0,0) is at the top-left corner
+# X increases to the right, Y increases downward
 # A4 paper is 297mm x 210mm, so we place it near the top-right
 DEFAULT_NOTE_POSITION = (250.0, 20.0)
+
+# Default text size in mm (standard KiCAD text size)
+DEFAULT_TEXT_SIZE = 2.54
 
 
 def is_schematic_api_available() -> bool:
@@ -164,7 +169,7 @@ def inject_test_note(project_path: str, note_text: str = "KiAssist Test Note") -
         schematic.add_text(
             text=note_text,
             position=DEFAULT_NOTE_POSITION,
-            size=2.54,  # Standard text size
+            size=DEFAULT_TEXT_SIZE,
             bold=True
         )
         
