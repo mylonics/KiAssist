@@ -326,7 +326,6 @@ def is_project_open(project_path: str) -> bool:
     Returns:
         True if the project is currently open, False otherwise
     """
-    import os
     normalized_path = os.path.normpath(os.path.abspath(project_path))
     open_paths = get_open_project_paths()
     
