@@ -96,11 +96,19 @@ def discover_socket_files() -> List[Path]:
             
             # PowerShell command to find pipes matching the kicad socket pattern
             cmd = f'Get-ChildItem \\\\.\\pipe\\ | Where-Object {{ $_.Name -like "{temp_dir}\\api*.sock" }} | Select-Object -ExpandProperty Name'
+            
+            # Use CREATE_NO_WINDOW to prevent command prompt from appearing
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            
             result = subprocess.run(
                 ['powershell', '-Command', cmd],
                 capture_output=True,
                 text=True,
-                timeout=5
+                timeout=5,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
             
             if result.returncode == 0 and result.stdout.strip():
@@ -266,7 +274,7 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
             except Exception as e:
                 print(f"Could not search project directory: {e}")
         
-        display_name = project_name if project_name != "No Project Open" else f"KiCad {version_str}"
+        display_name = project_name if project_name != "No Project Open" else "KiCad (No Project)"
         
         return KiCadInstance(
             socket_path=socket_path,
