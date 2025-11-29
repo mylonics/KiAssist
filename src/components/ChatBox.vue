@@ -258,12 +258,14 @@ onMounted(() => {
 
     <div class="chat-header">
       <div class="header-controls">
-        <label for="model-select" class="model-label">Model:</label>
-        <select id="model-select" v-model="selectedModel" class="model-select">
-          <option v-for="model in availableModels" :key="model.value" :value="model.value">
-            {{ model.label }}
-          </option>
-        </select>
+        <template v-if="hasApiKey">
+          <label for="model-select" class="model-label">Model:</label>
+          <select id="model-select" v-model="selectedModel" class="model-select">
+            <option v-for="model in availableModels" :key="model.value" :value="model.value">
+              {{ model.label }}
+            </option>
+          </select>
+        </template>
         <button @click="showApiKeyPrompt = true" class="icon-btn" title="Configure API Key">
           <span class="material-icons">settings</span>
         </button>
