@@ -11,10 +11,9 @@ class GeminiAPI:
     # Model mapping from UI selection to actual Gemini model IDs
     # These are the model IDs used by the google-genai library
     MODEL_MAP = {
-        "2.5-flash": "gemini-2.5-flash",      # Use Gemini 2.5 Flash (latest stable)
-        "2.5-pro": "gemini-2.5-pro",          # Gemini 2.5 Pro
-        "3-flash": "gemini-3.0-flash",        # Use Gemini 3.0 Flash
-        "3-pro": "gemini-3.0-pro",            # Gemini 3.0 Pro
+        "3.1-pro": "gemini-3.1-pro-preview",              # Flagship model for complex agentic workflows & coding
+        "3-flash": "gemini-3-flash-preview",               # Pro-level intelligence at Flash speeds
+        "3.1-flash-lite": "gemini-3.1-flash-lite-preview",  # Ultra-low latency, high-volume workhorse
     }
     
     def __init__(self, api_key: str):
