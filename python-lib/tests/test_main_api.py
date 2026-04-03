@@ -231,6 +231,41 @@ class TestSendMessage:
         assert result["success"] is False
         assert "API timeout" in result["error"]
 
+    def test_send_message_persists_to_session(self, api, tmp_path, monkeypatch):
+        """Messages should be appended to ConversationStore on success."""
+        fake = _FakeProvider("AI response text")
+        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
+        api._current_project_path = str(tmp_path)
+
+        api.send_message("User question")
+
+        assert api.current_session_id is not None
+        store = ConversationStore(tmp_path)
+        msgs = store.load_session(api.current_session_id)
+        roles = [m.role for m in msgs]
+        contents = [m.content for m in msgs]
+        assert roles == ["user", "assistant"]
+        assert "User question" in contents
+        assert "AI response text" in contents
+
+    def test_send_message_reuses_existing_session(self, api, tmp_path, monkeypatch):
+        """Subsequent calls should append to the same session."""
+        fake = _FakeProvider("reply")
+        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
+        api._current_project_path = str(tmp_path)
+
+        api.send_message("first")
+        session_id_1 = api.current_session_id
+        api.send_message("second")
+        session_id_2 = api.current_session_id
+
+        assert session_id_1 == session_id_2
+        store = ConversationStore(tmp_path)
+        msgs = store.load_session(session_id_1)
+        assert len(msgs) == 4  # user+assistant x2
+
 
 # ===========================================================================
 # Tests: start_stream_message / poll_stream
@@ -261,6 +296,44 @@ class TestStreaming:
         result = api.start_stream_message("Hello")
         assert result["success"] is False
         assert "error" in result
+
+    def test_stream_persists_user_message_immediately(self, api, tmp_path, monkeypatch):
+        """User message is persisted before streaming starts."""
+        fake = _FakeProvider("streamed response")
+        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
+        api._current_project_path = str(tmp_path)
+
+        api.start_stream_message("Streaming question")
+        assert api.current_session_id is not None
+
+        # User message is written before streaming begins
+        store = ConversationStore(tmp_path)
+        msgs = store.load_session(api.current_session_id)
+        assert any(m.role == "user" and "Streaming question" in m.content for m in msgs)
+
+    def test_stream_persists_assistant_response_when_done(self, api, tmp_path, monkeypatch):
+        """Assistant response is persisted after streaming completes."""
+        fake = _FakeProvider("final answer here")
+        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
+        api._current_project_path = str(tmp_path)
+
+        api.start_stream_message("Stream me")
+
+        # Wait for streaming to complete
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if api.poll_stream()["done"]:
+                break
+            time.sleep(0.05)
+
+        store = ConversationStore(tmp_path)
+        msgs = store.load_session(api.current_session_id)
+        roles = [m.role for m in msgs]
+        assert "assistant" in roles
+        assistant_content = next(m.content for m in msgs if m.role == "assistant")
+        assert "final answer" in assistant_content
 
 
 # ===========================================================================

@@ -1,6 +1,7 @@
 """Main KiAssist application module using pywebview."""
 
 import asyncio
+import logging
 import os
 import sys
 import threading
@@ -25,6 +26,8 @@ from .requirements_wizard import (
 )
 from .kicad_schematic import inject_test_note, is_schematic_api_available
 from .context.history import ConversationStore
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Provider metadata registry
@@ -240,7 +243,7 @@ class KiAssistAPI:
         """
         target = provider or self.current_provider_name
         has_key = self.api_key_store.has_api_key(target)
-        print(f"[DEBUG] check_api_key({target!r}) -> {has_key}")
+        logger.debug("check_api_key(%r) -> %s", target, has_key)
         return has_key
 
     def get_api_key(self, provider: Optional[str] = None) -> Optional[str]:
@@ -270,11 +273,13 @@ class KiAssistAPI:
         """
         target = provider or self.current_provider_name
         try:
-            print(
-                f"[DEBUG] set_api_key(provider={target!r}, len={len(api_key) if api_key else 0})"
+            logger.debug(
+                "set_api_key(provider=%r, key_len=%d)",
+                target,
+                len(api_key) if api_key else 0,
             )
             success, warning = self.api_key_store.set_api_key(api_key, target)
-            print(f"[DEBUG] set_api_key result - success: {success}, warning: {warning}")
+            logger.debug("set_api_key result: success=%s, warning=%r", success, warning)
 
             # Refresh active provider if this key belongs to the current provider
             if target == self.current_provider_name:
@@ -288,9 +293,7 @@ class KiAssistAPI:
                 result["warning"] = warning
             return result
         except Exception as exc:
-            print(f"[DEBUG] Exception in set_api_key: {exc}")
-            import traceback
-            traceback.print_exc()
+            logger.error("set_api_key failed: %s", exc, exc_info=True)
             return {"success": False, "error": str(exc)}
     
     # ------------------------------------------------------------------
@@ -300,6 +303,9 @@ class KiAssistAPI:
     def send_message(self, message: str, model: Optional[str] = None) -> dict:
         """Send a message to the active AI provider and return a response.
 
+        The user prompt and assistant response are persisted to the active
+        :class:`ConversationStore` so they appear in the sessions list.
+
         Args:
             message: The message to send.
             model: Optional model override (uses current model when omitted).
@@ -308,13 +314,27 @@ class KiAssistAPI:
             Dictionary with ``response`` text or ``error``.
         """
         try:
-            response = self._send_to_ai(message, model)
-            return {"success": True, "response": response}
+            store = self._get_session_store()
+            if not self.current_session_id:
+                self.current_session_id = store.new_session()
+
+            user_msg = AIMessage(role="user", content=message)
+            store.append(self.current_session_id, user_msg)
+
+            response_text = self._send_to_ai(message, model)
+
+            assistant_msg = AIMessage(role="assistant", content=response_text)
+            store.append(self.current_session_id, assistant_msg)
+
+            return {"success": True, "response": response_text}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
     def start_stream_message(self, message: str, model: Optional[str] = None) -> dict:
         """Start streaming a response from the active AI provider in a background thread.
+
+        The user prompt is persisted immediately; the final assembled assistant
+        response is persisted in the background thread once streaming completes.
 
         Args:
             message: The message to send.
@@ -330,6 +350,13 @@ class KiAssistAPI:
                     "success": False,
                     "error": "No AI provider configured. Please add an API key via Settings.",
                 }
+
+            # Persist the user message immediately
+            store = self._get_session_store()
+            if not self.current_session_id:
+                self.current_session_id = store.new_session()
+            session_id = self.current_session_id
+            store.append(session_id, AIMessage(role="user", content=message))
 
             with self._stream_lock:
                 self._stream_buffer = ""
@@ -351,6 +378,20 @@ class KiAssistAPI:
                     finally:
                         with self._stream_lock:
                             self._stream_done = True
+                            final_text = self._stream_buffer
+
+                        # Persist the assembled assistant response
+                        if final_text:
+                            try:
+                                store.append(
+                                    session_id,
+                                    AIMessage(role="assistant", content=final_text),
+                                )
+                            except Exception as persist_exc:
+                                logger.warning(
+                                    "Failed to persist assistant response: %s",
+                                    persist_exc,
+                                )
 
                 asyncio.run(_async_stream())
 
@@ -656,10 +697,10 @@ class KiAssistAPI:
         return inject_test_note(project_path)
     
     def is_schematic_api_available(self) -> bool:
-        """Check if the schematic API (kicad-sch-api) is available.
+        """Check if the KiCad schematic API is available.
 
         Returns:
-            True if the API is available, False otherwise
+            True if the schematic API is available, False otherwise.
         """
         return is_schematic_api_available()
 

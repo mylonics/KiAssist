@@ -49,51 +49,8 @@ const messagesContainer = ref<HTMLElement | null>(null);
 const editingMessageId = ref<string | null>(null);
 const editingText = ref('');
 
-// Provider registry (mirrors _PROVIDER_REGISTRY in main.py)
-const providers = ref<ProviderInfo[]>([
-  {
-    id: 'gemini',
-    name: 'Google Gemini',
-    models: [
-      { id: '3.1-pro', name: 'Gemini 3.1 Pro' },
-      { id: '3-flash', name: 'Gemini 3 Flash' },
-      { id: '3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
-    ],
-    default_model: '3-flash',
-    key_url: 'https://aistudio.google.com/apikey',
-    key_prefix: 'AIza',
-    key_min_length: 30,
-    has_key: false,
-  },
-  {
-    id: 'claude',
-    name: 'Anthropic Claude',
-    models: [
-      { id: 'sonnet', name: 'Claude Sonnet' },
-      { id: 'haiku', name: 'Claude Haiku' },
-      { id: 'opus', name: 'Claude Opus' },
-    ],
-    default_model: 'sonnet',
-    key_url: 'https://console.anthropic.com/',
-    key_prefix: 'sk-ant-',
-    key_min_length: 30,
-    has_key: false,
-  },
-  {
-    id: 'openai',
-    name: 'OpenAI',
-    models: [
-      { id: 'gpt-4o', name: 'GPT-4o' },
-      { id: 'gpt-4o-mini', name: 'GPT-4o Mini' },
-      { id: 'o3', name: 'o3' },
-    ],
-    default_model: 'gpt-4o',
-    key_url: 'https://platform.openai.com/api-keys',
-    key_prefix: 'sk-',
-    key_min_length: 20,
-    has_key: false,
-  },
-]);
+// Provider list is populated from the backend via get_providers()
+const providers = ref<ProviderInfo[]>([]);
 
 const sessions = ref<SessionInfo[]>([]);
 
@@ -161,11 +118,6 @@ function loadMessages() {
         isStreaming: false,
       }));
     }
-    // Restore last used provider/model
-    const storedProvider = localStorage.getItem(PROVIDER_KEY);
-    const storedModel = localStorage.getItem(MODEL_KEY);
-    if (storedProvider) selectedProvider.value = storedProvider;
-    if (storedModel) selectedModel.value = storedModel;
   } catch (e) {
     console.error('Failed to load messages:', e);
   }
@@ -189,8 +141,9 @@ async function onProviderChange() {
 
   if (window.pywebview?.api) {
     await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
-    hasApiKey.value = await window.pywebview.api.check_api_key(selectedProvider.value);
   }
+  // Derive hasApiKey from the in-memory providers list (no extra IPC call)
+  hasApiKey.value = currentProviderInfo.value?.has_key ?? false;
 }
 
 async function onModelChange() {
@@ -200,37 +153,54 @@ async function onModelChange() {
   }
 }
 
-// Load provider state from backend
+// Load provider state from backend; localStorage is the source of truth for
+// provider/model selection — backend defaults are only used when no saved
+// preference exists.
 async function loadProviders() {
   if (!window.pywebview?.api) return;
   try {
     const result = await window.pywebview.api.get_providers();
     if (result.success && result.providers) {
-      // Merge has_key status
-      for (const p of result.providers) {
-        const local = providers.value.find(lp => lp.id === p.id);
-        if (local) local.has_key = p.has_key;
-      }
-      if (result.current_provider) selectedProvider.value = result.current_provider;
-      if (result.current_model) selectedModel.value = result.current_model;
+      // Backend is the single source of truth for provider metadata
+      providers.value = result.providers;
+
+      // Determine which provider/model to use, honouring localStorage first
+      const storedProvider = localStorage.getItem(PROVIDER_KEY);
+      const storedModel = localStorage.getItem(MODEL_KEY);
+
+      const storedProviderInfo = storedProvider
+        ? result.providers.find((p: ProviderInfo) => p.id === storedProvider)
+        : undefined;
+
+      const nextProvider =
+        storedProviderInfo?.id ??
+        result.current_provider ??
+        selectedProvider.value;
+
+      const nextProviderInfo =
+        result.providers.find((p: ProviderInfo) => p.id === nextProvider) ??
+        storedProviderInfo;
+
+      const nextModel =
+        (storedProviderInfo ? storedModel : null) ??
+        result.current_model ??
+        nextProviderInfo?.default_model ??
+        selectedModel.value;
+
+      selectedProvider.value = nextProvider;
+      selectedModel.value = nextModel ?? selectedModel.value;
+
+      // Persist the resolved selection and sync the backend
+      localStorage.setItem(PROVIDER_KEY, selectedProvider.value);
+      localStorage.setItem(MODEL_KEY, selectedModel.value);
+      await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+
+      // Derive hasApiKey from the providers list — no extra round-trips needed
+      const active = result.providers.find((p: ProviderInfo) => p.id === selectedProvider.value);
+      hasApiKey.value = active?.has_key ?? false;
     }
   } catch (e) {
     console.error('[UI] Failed to load providers:', e);
-  }
-}
-
-// API Key
-async function checkApiKey() {
-  try {
-    if (window.pywebview?.api) {
-      hasApiKey.value = await window.pywebview.api.check_api_key(selectedProvider.value);
-      // Update has_key status for all providers
-      for (const p of providers.value) {
-        p.has_key = await window.pywebview.api.check_api_key(p.id);
-      }
-    }
-  } catch (error) {
-    console.error('[UI] Error checking API key:', error);
   }
 }
 
@@ -247,14 +217,14 @@ async function waitForPywebviewAndCheckApiKey() {
     });
   }
   try {
+    // loadProviders handles provider/model sync and derives hasApiKey
     await loadProviders();
-    await checkApiKey();
   } catch (err) {
     // Ignore stale callback errors from pywebview (e.g. during HMR reload)
     if (String(err).includes('_returnValuesCallbacks')) {
       console.warn('[ChatBox] Stale pywebview callback (likely HMR reload), ignoring.');
     } else {
-      console.error('[UI] Error during initial API key check:', err);
+      console.error('[UI] Error during initial provider load:', err);
     }
   }
 }
@@ -652,8 +622,8 @@ onMounted(() => {
 
     <div class="chat-header">
       <div class="header-controls">
-        <template v-if="hasApiKey">
-          <!-- Provider selector -->
+        <!-- Provider selector — always visible so users can switch/configure providers -->
+        <template v-if="providers.length > 0">
           <label for="provider-select" class="model-label">Provider:</label>
           <select
             id="provider-select"
@@ -662,7 +632,7 @@ onMounted(() => {
             @change="onProviderChange"
           >
             <option v-for="p in providers" :key="p.id" :value="p.id">
-              {{ p.name }}
+              {{ p.name }}{{ p.has_key ? '' : ' ⚠' }}
             </option>
           </select>
 
