@@ -5,7 +5,7 @@ Covers:
 * 5.5 — Concurrency safety (advisory file lock, rollback_from_backup)
 * 5.3 — File edit pipeline (SchematicEditPipeline, run_edit_pipeline)
 * New MCP tools: kicad_check_file_status, kicad_edit_file_pipeline
-* Bug fix: kicad_reload_schematic uses subprocess.run (not os.system) on Linux
+* IPC-based schematic save/reload workflow coverage
 """
 
 from __future__ import annotations
@@ -288,6 +288,34 @@ class TestSchematicEditPipeline:
         assert result["pipeline"]["reload_triggered"] is False
         assert "kicad_reload_schematic" not in calls
 
+    def test_no_reload_when_file_closes_between_edit_and_reload(self, tmp_sch: Path):
+        """Reload must be skipped if the file is no longer open in KiCad after the edit."""
+        calls: list = []
+
+        async def fake_ipc(tool_name: str, args: dict) -> Any:
+            calls.append(tool_name)
+            return {"status": "ok", "data": {}}
+
+        # is_file_open_in_kicad returns True on the first call (before save),
+        # then False on the second call (before reload — file was closed during edit).
+        open_values = iter([True, False])
+
+        async def _run():
+            pipeline = SchematicEditPipeline(
+                str(tmp_sch),
+                save_before_edit=True,
+                reload_after_edit=True,
+                save_wait=0,
+                reload_wait=0,
+            )
+            with mock.patch.object(wf, "is_file_open_in_kicad", side_effect=open_values):
+                with mock.patch.object(wf, "in_process_call", fake_ipc):
+                    return await pipeline.run("my_edit_tool", {})
+
+        result = asyncio.run(_run())
+        assert result["pipeline"]["reload_triggered"] is False
+        assert "kicad_reload_schematic" not in calls
+
     def test_save_triggered_false_when_save_returns_error(self, tmp_sch: Path):
         """save_triggered must be False when kicad_save_schematic returns status=error."""
         calls: list = []
@@ -452,6 +480,34 @@ class TestRunEditPipeline:
         assert called[-1] == "kicad_reload_schematic"
         assert called.count("kicad_save_schematic") == 1
         assert called.count("kicad_reload_schematic") == 1
+
+    def test_no_reload_when_file_closes_mid_batch(self, tmp_sch: Path):
+        """Reload must be skipped if the file is no longer open after the batch completes."""
+        called: list = []
+
+        async def fake_ipc(tool_name: str, args: dict) -> Any:
+            called.append(tool_name)
+            return {"status": "ok", "data": {}}
+
+        # First call (before save) returns True; second call (before reload) returns False.
+        open_values = iter([True, False])
+
+        async def _run():
+            with mock.patch.object(wf, "is_file_open_in_kicad", side_effect=open_values):
+                with mock.patch.object(wf, "in_process_call", fake_ipc):
+                    return await run_edit_pipeline(
+                        str(tmp_sch),
+                        [{"tool": "edit_a", "args": {}}],
+                        save_before_first=True,
+                        reload_after_last=True,
+                        save_wait=0,
+                        reload_wait=0,
+                    )
+
+        results = asyncio.run(_run())
+        assert len(results) == 1
+        assert results[0]["pipeline"]["reload_triggered"] is False
+        assert "kicad_reload_schematic" not in called
 
 
 # ===========================================================================

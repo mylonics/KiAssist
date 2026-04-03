@@ -22,12 +22,15 @@ Typical usage::
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import logging
 import os
 import platform
 import shutil
+import sys
 import time
+
+if sys.platform != "win32":
+    import fcntl
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
@@ -247,11 +250,11 @@ def rollback_from_backup(path: str | os.PathLike) -> bool:
 # 5.3 — File Edit Pipeline
 # ---------------------------------------------------------------------------
 
-# Delay (seconds) between triggering Ctrl+S and starting the file edit.
-# Gives KiCad a moment to flush the file to disk.
+# Delay (seconds) between issuing the IPC save request and starting the file edit.
+# Gives KiCad a moment to flush the current document state to disk.
 _SAVE_WAIT_SECONDS = 1.0
 
-# Delay (seconds) between completing the file write and triggering Ctrl+Shift+R.
+# Delay (seconds) between completing the file write and issuing the IPC reload request.
 # Gives the OS a moment to flush the file so KiCad re-reads the new content.
 _RELOAD_WAIT_SECONDS = 0.5
 
@@ -389,17 +392,21 @@ class SchematicEditPipeline:
 
         # Step 6 — reload KiCad after editing
         reload_result: Optional[Dict[str, Any]] = None
-        if self.reload_after_edit and file_open and edit_ok:
-            if self.reload_wait > 0:
-                await asyncio.sleep(self.reload_wait)
-            logger.info("Triggering KiCad reload after editing %s.", path.name)
-            try:
-                reload_result = await ipc(
-                    "kicad_reload_schematic",
-                    {"file_path": self.file_path},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("kicad_reload_schematic failed: %s", exc)
+        if self.reload_after_edit and edit_ok:
+            # Re-check whether the file is still open; KiCad may have been
+            # closed or the document closed during the edit.
+            file_still_open = is_file_open_in_kicad(self.file_path)
+            if file_still_open:
+                if self.reload_wait > 0:
+                    await asyncio.sleep(self.reload_wait)
+                logger.info("Triggering KiCad reload after editing %s.", path.name)
+                try:
+                    reload_result = await ipc(
+                        "kicad_reload_schematic",
+                        {"file_path": self.file_path},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("kicad_reload_schematic failed: %s", exc)
 
         # Annotate the result with pipeline metadata.
         # save_triggered / reload_triggered are True only when the respective
@@ -525,19 +532,23 @@ async def run_edit_pipeline(
 
     # Reload after the batch; capture result to accurately report success.
     reload_triggered = False
-    if reload_after_last and file_open and all_ok:
-        if reload_wait > 0:
-            await asyncio.sleep(reload_wait)
-        try:
-            reload_res = await ipc(
-                "kicad_reload_schematic",
-                {"file_path": file_path},
-            )
-            reload_triggered = isinstance(reload_res, dict) and reload_res.get("status") == "ok"
-            if not reload_triggered:
-                logger.warning("kicad_reload_schematic returned non-ok result: %s", reload_res)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("kicad_reload_schematic failed: %s", exc)
+    if reload_after_last and all_ok:
+        # Re-check whether the file is still open; KiCad may have been closed
+        # or the document closed during the batch.
+        file_still_open = is_file_open_in_kicad(file_path)
+        if file_still_open:
+            if reload_wait > 0:
+                await asyncio.sleep(reload_wait)
+            try:
+                reload_res = await ipc(
+                    "kicad_reload_schematic",
+                    {"file_path": file_path},
+                )
+                reload_triggered = isinstance(reload_res, dict) and reload_res.get("status") == "ok"
+                if not reload_triggered:
+                    logger.warning("kicad_reload_schematic returned non-ok result: %s", reload_res)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("kicad_reload_schematic failed: %s", exc)
 
     # Annotate the last result with reload info
     if results and isinstance(results[-1], dict) and "pipeline" in results[-1]:
