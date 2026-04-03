@@ -221,6 +221,7 @@ class ClaudeProvider(AIProvider):
         self._enable_thinking = enable_thinking
         self._thinking_budget = thinking_budget
         self._client = _anthropic.Anthropic(api_key=api_key)
+        self._async_client = _anthropic.AsyncAnthropic(api_key=api_key)
 
     # ------------------------------------------------------------------
     # AIProvider interface
@@ -297,7 +298,12 @@ class ClaudeProvider(AIProvider):
         tools: Optional[List[ToolSchema]] = None,
         system_prompt: Optional[str] = None,
     ) -> AsyncIterator[AIChunk]:
-        """Stream a Claude response.
+        """Stream a Claude response using the native async client.
+
+        Uses :class:`anthropic.AsyncAnthropic` so the event loop is not
+        blocked during network streaming.  The same ``thinking`` configuration
+        applied in :meth:`chat` is also applied here so streaming and
+        non-streaming behaviour remain consistent.
 
         Args:
             messages:      Conversation history.
@@ -310,6 +316,8 @@ class ClaudeProvider(AIProvider):
         Raises:
             Exception: On Anthropic API errors.
         """
+        import json as _json
+
         claude_messages = _messages_to_claude(messages)
 
         kwargs: Dict[str, Any] = {
@@ -324,14 +332,21 @@ class ClaudeProvider(AIProvider):
         if tools:
             kwargs["tools"] = [_mcp_schema_to_claude(t) for t in tools]
 
+        if self._enable_thinking:
+            kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": self._thinking_budget,
+            }
+
         accumulated_tool_calls: List[AIToolCall] = []
         current_tool_name: Optional[str] = None
         current_tool_id: Optional[str] = None
         current_tool_input: str = ""
+        usage: Dict[str, int] = {}
 
         try:
-            with self._client.messages.stream(**kwargs) as stream:
-                for event in stream:
+            async with self._async_client.messages.stream(**kwargs) as stream:
+                async for event in stream:
                     event_type = getattr(event, "type", None)
 
                     if event_type == "content_block_start":
@@ -354,7 +369,6 @@ class ClaudeProvider(AIProvider):
 
                     elif event_type == "content_block_stop":
                         if current_tool_name and current_tool_id:
-                            import json as _json
                             try:
                                 args = _json.loads(current_tool_input) if current_tool_input else {}
                             except _json.JSONDecodeError:
@@ -370,18 +384,14 @@ class ClaudeProvider(AIProvider):
                             current_tool_id = None
                             current_tool_input = ""
 
+                final_msg = await stream.get_final_message()
+                if hasattr(final_msg, "usage") and final_msg.usage:
+                    usage = {
+                        "input_tokens": getattr(final_msg.usage, "input_tokens", 0) or 0,
+                        "output_tokens": getattr(final_msg.usage, "output_tokens", 0) or 0,
+                    }
+
         except Exception as exc:
             raise Exception(f"Claude stream error: {exc}") from exc
-
-        usage: Dict[str, int] = {}
-        try:
-            final_msg = stream.get_final_message()
-            if hasattr(final_msg, "usage") and final_msg.usage:
-                usage = {
-                    "input_tokens": getattr(final_msg.usage, "input_tokens", 0) or 0,
-                    "output_tokens": getattr(final_msg.usage, "output_tokens", 0) or 0,
-                }
-        except Exception:
-            pass
 
         yield AIChunk(is_final=True, tool_calls=accumulated_tool_calls, usage=usage)

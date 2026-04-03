@@ -207,7 +207,8 @@ class ApiKeyStore:
             if config_path.exists():
                 try:
                     with open(config_path, 'r', encoding='utf-8') as f:
-                        config = json.load(f)
+                        loaded = json.load(f)
+                    config = loaded if isinstance(loaded, dict) else {}
                 except (json.JSONDecodeError, OSError, IOError):
                     config = {}
 
@@ -222,7 +223,7 @@ class ApiKeyStore:
                 pass  # Ignore permission errors on Windows
 
             return True
-        except (OSError, IOError):
+        except (OSError, IOError, TypeError):
             return False
 
     def _delete_from_file(self, provider: str = _DEFAULT_PROVIDER) -> None:

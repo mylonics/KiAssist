@@ -239,7 +239,59 @@ class TestGeminiProvider:
         tool = _mcp_schema_to_gemini(SAMPLE_TOOL)
         assert tool.function_declarations[0].name == "schematic_open"
 
-    def test_messages_to_gemini_skips_system(self):
+    def test_chat_with_tool_calls_unique_ids(self):
+        """Multiple calls to the same tool get distinct IDs."""
+        p = self._make_provider()
+
+        def _make_fc(name):
+            fc = MagicMock()
+            fc.name = name
+            fc.args = {}
+            part = MagicMock()
+            part.function_call = fc
+            return part
+
+        mock_content = MagicMock()
+        mock_content.parts = [
+            _make_fc("schematic_open"),
+            _make_fc("schematic_open"),  # same tool twice
+        ]
+        mock_candidate = MagicMock()
+        mock_candidate.content = mock_content
+
+        mock_resp = MagicMock()
+        mock_resp.text = ""
+        mock_resp.candidates = [mock_candidate]
+        mock_resp.usage_metadata = None
+        p._client.models.generate_content = MagicMock(return_value=mock_resp)
+
+        r = p.chat([AIMessage(role="user", content="open twice")])
+        assert len(r.tool_calls) == 2
+        ids = [tc.id for tc in r.tool_calls]
+        # IDs must be unique even though the tool name is the same
+        assert ids[0] != ids[1]
+        # But both should be for the same function
+        assert r.tool_calls[0].name == "schematic_open"
+        assert r.tool_calls[1].name == "schematic_open"
+
+    def test_messages_to_gemini_function_response_name_lookup(self):
+        """Tool result FunctionResponse.name resolves to function name via id_to_name map."""
+        tc = AIToolCall(id="schematic_open_abc12345", name="schematic_open", arguments={})
+        tr = AIToolResult(tool_call_id="schematic_open_abc12345", content="ok")
+        msgs = [
+            AIMessage(role="user", content="do it"),
+            AIMessage(role="assistant", content="", tool_calls=[tc]),
+            AIMessage(role="tool", tool_results=[tr]),
+        ]
+        result = _messages_to_gemini(msgs)
+        # The tool result content should be the last item with role="user"
+        tool_resp_content = result[-1]
+        assert tool_resp_content.role == "user"
+        func_resp = tool_resp_content.parts[0].function_response
+        # FunctionResponse.name must be the actual function name, not the synthetic ID
+        assert func_resp.name == "schematic_open"
+
+
         msgs = [
             AIMessage(role="system", content="You are KiAssist"),
             AIMessage(role="user", content="hello"),
@@ -269,7 +321,8 @@ class TestGeminiProvider:
 
 class TestClaudeProvider:
     def _make_provider(self):
-        with patch("kiassist_utils.ai.claude._anthropic.Anthropic"):
+        with patch("kiassist_utils.ai.claude._anthropic.Anthropic"), \
+             patch("kiassist_utils.ai.claude._anthropic.AsyncAnthropic"):
             return ClaudeProvider(api_key="fake_key", model="sonnet")
 
     def test_model_name_resolved(self):
@@ -277,7 +330,8 @@ class TestClaudeProvider:
         assert p._model_name == "claude-sonnet-4-5"
 
     def test_unknown_model_passthrough(self):
-        with patch("kiassist_utils.ai.claude._anthropic.Anthropic"):
+        with patch("kiassist_utils.ai.claude._anthropic.Anthropic"), \
+             patch("kiassist_utils.ai.claude._anthropic.AsyncAnthropic"):
             p = ClaudeProvider(api_key="fake", model="claude-custom-3")
         assert p._model_name == "claude-custom-3"
 
@@ -775,3 +829,31 @@ class TestApiKeyStoreMultiProvider:
 
         assert self.store._load_from_file("gemini") is None
         assert self.store._load_from_file("claude") == "c-key"
+
+    def test_save_to_file_handles_non_dict_json(self, tmp_path, monkeypatch):
+        """_save_to_file recovers gracefully if config.json contains a non-dict value."""
+        config_path = tmp_path / "config.json"
+        monkeypatch.setattr(self.store, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(self.store, "_ensure_config_dir", lambda: config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write a list (non-dict) to config.json to simulate corruption
+        config_path.write_text("[1, 2, 3]", encoding="utf-8")
+
+        # Should succeed (reset to fresh dict) rather than raising TypeError
+        result = self.store._save_to_file("g-key", "gemini")
+        assert result is True
+        assert self.store._load_from_file("gemini") == "g-key"
+
+    def test_save_to_file_handles_json_string_value(self, tmp_path, monkeypatch):
+        """_save_to_file recovers when config.json contains a bare JSON string."""
+        config_path = tmp_path / "config.json"
+        monkeypatch.setattr(self.store, "_get_config_path", lambda: config_path)
+        monkeypatch.setattr(self.store, "_ensure_config_dir", lambda: config_path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        config_path.write_text('"just-a-string"', encoding="utf-8")
+
+        result = self.store._save_to_file("o-key", "openai")
+        assert result is True
+        assert self.store._load_from_file("openai") == "o-key"

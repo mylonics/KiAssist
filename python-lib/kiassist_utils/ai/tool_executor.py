@@ -135,10 +135,13 @@ class ToolExecutor:
         for iteration in range(self.max_iterations):
             logger.debug("ToolExecutor iteration %d/%d", iteration + 1, self.max_iterations)
 
-            response = self.provider.chat(
+            # Run the synchronous provider.chat() in a thread pool so it
+            # does not block the event loop during network I/O.
+            response = await asyncio.to_thread(
+                self.provider.chat,
                 conversation,
-                tools=schemas if self.provider.supports_tool_calling() else None,
-                system_prompt=system_prompt,
+                schemas if self.provider.supports_tool_calling() else None,
+                system_prompt,
             )
 
             # If no tool calls → we have the final answer

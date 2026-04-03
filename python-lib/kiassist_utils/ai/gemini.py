@@ -20,7 +20,8 @@ Shortcut       Actual model ID
 
 from __future__ import annotations
 
-import json
+import asyncio
+import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from google import genai
@@ -122,12 +123,25 @@ def _messages_to_gemini(
     ``system`` role messages are filtered out here because they are handled
     separately via ``system_instruction``.
 
+    For tool-result messages, the :class:`types.FunctionResponse` ``name``
+    field must contain the *function name* (not the unique tool call ID).
+    This function builds a lookup table from all assistant messages so each
+    result can be mapped to the correct function name regardless of whether
+    IDs are synthetic UUIDs.
+
     Args:
         messages: Ordered conversation turns.
 
     Returns:
         List of :class:`types.Content` ready for the Gemini API.
     """
+    # Build a lookup: tool_call_id → function_name from all assistant messages
+    id_to_name: Dict[str, str] = {}
+    for msg in messages:
+        if msg.role == "assistant":
+            for tc in msg.tool_calls:
+                id_to_name[tc.id] = tc.name
+
     contents: List[types.Content] = []
     for msg in messages:
         if msg.role == "system":
@@ -157,15 +171,17 @@ def _messages_to_gemini(
                 )
 
         elif msg.role == "tool":
-            # Tool results become "user" messages with function_response parts
+            # Tool results become "user" messages with function_response parts.
+            # FunctionResponse.name must be the function name; look it up from
+            # the id_to_name map built above so synthetic unique IDs resolve
+            # to the correct function name.
             parts = []
             for tr in msg.tool_results:
-                # For Gemini, AIToolCall.id is set to the function name
-                # (see _extract_tool_calls), so tool_call_id == function name here.
+                func_name = id_to_name.get(tr.tool_call_id, tr.tool_call_id)
                 parts.append(
                     types.Part(
                         function_response=types.FunctionResponse(
-                            name=tr.tool_call_id,
+                            name=func_name,
                             response={
                                 "content": tr.content,
                                 "is_error": tr.is_error,
@@ -182,6 +198,11 @@ def _messages_to_gemini(
 def _extract_tool_calls(response: Any) -> List[AIToolCall]:
     """Extract tool calls from a Gemini response object.
 
+    Each call gets a unique synthetic ID (``{function_name}_{short_uuid}``)
+    so that multiple calls to the same tool within one response can be
+    distinguished.  The function name is always preserved separately in the
+    ``name`` field.
+
     Args:
         response: The ``GenerateContentResponse`` object.
 
@@ -193,9 +214,10 @@ def _extract_tool_calls(response: Any) -> List[AIToolCall]:
         for part in response.candidates[0].content.parts:
             if part.function_call:
                 fc = part.function_call
+                unique_id = f"{fc.name}_{uuid.uuid4().hex[:8]}"
                 tool_calls.append(
                     AIToolCall(
-                        id=fc.name,  # Gemini uses function name as ID
+                        id=unique_id,
                         name=fc.name,
                         arguments=dict(fc.args) if fc.args else {},
                     )
@@ -304,7 +326,10 @@ class GeminiProvider(AIProvider):
         tools: Optional[List[ToolSchema]] = None,
         system_prompt: Optional[str] = None,
     ) -> AsyncIterator[AIChunk]:
-        """Stream a Gemini response token-by-token.
+        """Stream a Gemini response token-by-token using the native async API.
+
+        Uses ``client.aio.models.generate_content_stream()`` so iteration
+        is non-blocking and does not stall the event loop.
 
         Args:
             messages:      Conversation history.
@@ -315,7 +340,7 @@ class GeminiProvider(AIProvider):
             :class:`AIChunk` instances; the final chunk has ``is_final=True``.
 
         Raises:
-            Exception: On Gemini API errors.
+            Exception: On Gemini API errors (both during setup and streaming).
         """
         contents = _messages_to_gemini(messages)
 
@@ -329,29 +354,26 @@ class GeminiProvider(AIProvider):
 
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
+        accumulated_tool_calls: List[AIToolCall] = []
         try:
+            stream_kwargs: Dict[str, Any] = {
+                "model": self._model_name,
+                "contents": contents,
+            }
             if config is not None:
-                stream = self._client.models.generate_content_stream(
-                    model=self._model_name,
-                    contents=contents,
-                    config=config,
-                )
-            else:
-                stream = self._client.models.generate_content_stream(
-                    model=self._model_name,
-                    contents=contents,
+                stream_kwargs["config"] = config
+
+            async for chunk in await self._client.aio.models.generate_content_stream(
+                **stream_kwargs
+            ):
+                tool_calls_in_chunk = _extract_tool_calls(chunk)
+                accumulated_tool_calls.extend(tool_calls_in_chunk)
+                yield AIChunk(
+                    text=chunk.text or "",
+                    is_final=False,
                 )
         except errors.APIError as exc:
             raise Exception(f"Gemini API error: {exc}") from exc
-
-        accumulated_tool_calls: List[AIToolCall] = []
-        for chunk in stream:
-            tool_calls_in_chunk = _extract_tool_calls(chunk)
-            accumulated_tool_calls.extend(tool_calls_in_chunk)
-            yield AIChunk(
-                text=chunk.text or "",
-                is_final=False,
-            )
 
         # Emit final sentinel
         yield AIChunk(

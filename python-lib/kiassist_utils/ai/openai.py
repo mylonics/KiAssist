@@ -235,6 +235,7 @@ class OpenAIProvider(AIProvider):
         if base_url:
             client_kwargs["base_url"] = base_url
         self._client = _openai.OpenAI(**client_kwargs)
+        self._async_client = _openai.AsyncOpenAI(**client_kwargs)
 
     # ------------------------------------------------------------------
     # AIProvider interface
@@ -303,7 +304,10 @@ class OpenAIProvider(AIProvider):
         tools: Optional[List[ToolSchema]] = None,
         system_prompt: Optional[str] = None,
     ) -> AsyncIterator[AIChunk]:
-        """Stream an OpenAI response.
+        """Stream an OpenAI response using the native async client.
+
+        Uses :class:`openai.AsyncOpenAI` so the event loop is not blocked
+        during network streaming.
 
         Args:
             messages:      Conversation history.
@@ -335,35 +339,35 @@ class OpenAIProvider(AIProvider):
         usage: Dict[str, int] = {}
 
         try:
-            stream = self._client.chat.completions.create(**kwargs)
-            for chunk in stream:
-                # Usage is reported on the final chunk when stream_options used
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage = {
-                        "input_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
-                        "output_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
-                    }
+            async with await self._async_client.chat.completions.create(**kwargs) as stream:
+                async for chunk in stream:
+                    # Usage is reported on the final chunk when stream_options used
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        usage = {
+                            "input_tokens": getattr(chunk.usage, "prompt_tokens", 0) or 0,
+                            "output_tokens": getattr(chunk.usage, "completion_tokens", 0) or 0,
+                        }
 
-                if not chunk.choices:
-                    continue
+                    if not chunk.choices:
+                        continue
 
-                delta = chunk.choices[0].delta
+                    delta = chunk.choices[0].delta
 
-                # Accumulate text
-                if delta.content:
-                    yield AIChunk(text=delta.content)
+                    # Accumulate text
+                    if delta.content:
+                        yield AIChunk(text=delta.content)
 
-                # Accumulate tool call fragments
-                for tc_delta in (delta.tool_calls or []):
-                    idx = tc_delta.index
-                    if idx not in tool_call_accum:
-                        tool_call_accum[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc_delta.id:
-                        tool_call_accum[idx]["id"] = tc_delta.id
-                    if tc_delta.function and tc_delta.function.name:
-                        tool_call_accum[idx]["name"] = tc_delta.function.name
-                    if tc_delta.function and tc_delta.function.arguments:
-                        tool_call_accum[idx]["arguments"] += tc_delta.function.arguments
+                    # Accumulate tool call fragments
+                    for tc_delta in (delta.tool_calls or []):
+                        idx = tc_delta.index
+                        if idx not in tool_call_accum:
+                            tool_call_accum[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc_delta.id:
+                            tool_call_accum[idx]["id"] = tc_delta.id
+                        if tc_delta.function and tc_delta.function.name:
+                            tool_call_accum[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function and tc_delta.function.arguments:
+                            tool_call_accum[idx]["arguments"] += tc_delta.function.arguments
 
         except Exception as exc:
             raise Exception(f"OpenAI stream error: {exc}") from exc
