@@ -304,7 +304,7 @@ class KiAssistAPI:
         """Send a message to the active AI provider and return a response.
 
         The user prompt and assistant response are persisted to the active
-        :class:`ConversationStore` so they appear in the sessions list.
+        ConversationStore so they appear in the sessions list.
 
         Args:
             message: The message to send.

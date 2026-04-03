@@ -178,11 +178,10 @@ async function loadProviders() {
         selectedProvider.value;
 
       const nextProviderInfo =
-        result.providers.find((p: ProviderInfo) => p.id === nextProvider) ??
-        storedProviderInfo;
+        result.providers.find((p: ProviderInfo) => p.id === nextProvider);
 
       const nextModel =
-        (storedProviderInfo ? storedModel : null) ??
+        storedModel ??
         result.current_model ??
         nextProviderInfo?.default_model ??
         selectedModel.value;
