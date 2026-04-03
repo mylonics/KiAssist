@@ -229,10 +229,15 @@ class KiAssistAPI:
     def _get_local_base_url(self) -> str:
         """Return the configured local model server base URL.
 
-        Checks (in order):
-        1. The value stored via :meth:`set_local_base_url`.
-        2. ``LOCAL_BASE_URL`` environment variable.
-        3. Falls back to the Ollama default ``http://localhost:11434/v1``.
+        Delegates to :meth:`~kiassist_utils.api_key.ApiKeyStore.get_api_key`
+        with provider ``"local"``, which checks (in order):
+
+        1. ``LOCAL_BASE_URL`` environment variable.
+        2. In-memory cache (set via :meth:`set_local_base_url`).
+        3. File-based config (``~/.kiassist/config.json``).
+
+        Falls back to the Ollama default ``http://localhost:11434/v1`` when
+        none of the above sources yield a value.
         """
         stored = self.api_key_store.get_api_key("local")
         if stored:
@@ -396,7 +401,7 @@ class KiAssistAPI:
         tags_url = f"{root_url}/api/tags"
 
         try:
-            with urllib.request.urlopen(tags_url, timeout=3) as resp:
+            with urllib.request.urlopen(tags_url, timeout=5) as resp:
                 import json as _json
                 data = _json.loads(resp.read().decode("utf-8"))
             raw_models = data.get("models", [])

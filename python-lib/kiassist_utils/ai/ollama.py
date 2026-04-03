@@ -74,9 +74,9 @@ class OllamaProvider(AIProvider):
         model:    Model name as known to the local server (e.g. ``"llama3.2"``
                   for Ollama or the name shown in LM Studio).
         base_url: Base URL of the local OpenAI-compatible server.  Defaults to
-                  the Ollama default ``http://localhost:11434/v1``.
+                  :data:`_DEFAULT_BASE_URL` (Ollama: ``http://localhost:11434/v1``).
         api_key:  Authentication key.  Most local servers accept any non-empty
-                  string.  Defaults to ``"local"``.
+                  string.  Defaults to :data:`_PLACEHOLDER_API_KEY` (``"local"``).
 
     Raises:
         ImportError: If the ``openai`` package is not installed.

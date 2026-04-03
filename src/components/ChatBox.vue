@@ -96,6 +96,11 @@ function generateMessageId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
+/** Returns the warning suffix for a provider dropdown option. */
+function providerWarning(p: ProviderInfo): string {
+  return p.id !== 'local' && !p.has_key ? ' ⚠' : '';
+}
+
 function renderMarkdown(text: string, isUser: boolean = false): string {
   if (!text) return '';
   if (isUser) {
@@ -738,7 +743,7 @@ onMounted(() => {
           <p class="modal-description">
             Configure the URL of your local OpenAI-compatible server.
             Supported servers: <strong>Ollama</strong> (default <code>http://localhost:11434/v1</code>)
-            and <strong>LM Studio</strong> (<code>http://localhost:1234/v1</code>).
+            and <strong>LM Studio</strong> (default <code>http://localhost:1234/v1</code>).
             No API key is required.
           </p>
           <div class="local-url-row">
@@ -835,7 +840,7 @@ onMounted(() => {
               @change="onProviderChange"
             >
               <option v-for="p in providers" :key="p.id" :value="p.id">
-                {{ p.name }}{{ p.id !== 'local' && !p.has_key ? ' ⚠' : '' }}
+                {{ p.name }}{{ providerWarning(p) }}
               </option>
             </select>
 
@@ -868,7 +873,7 @@ onMounted(() => {
               @change="onSecondaryProviderChange"
             >
               <option v-for="p in providers" :key="p.id" :value="p.id">
-                {{ p.name }}{{ p.id !== 'local' && !p.has_key ? ' ⚠' : '' }}
+                {{ p.name }}{{ providerWarning(p) }}
               </option>
             </select>
 
