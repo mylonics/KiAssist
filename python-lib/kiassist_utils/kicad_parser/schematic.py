@@ -68,8 +68,14 @@ def _parse_effects(tree: List[SExpr]) -> Effects:
         eff.italic = "italic" in font
     justify = _find(tree, "justify")
     if justify and len(justify) > 1:
-        eff.justify = str(justify[1])
-    eff.hide = _find(tree, "hide") is not None or "hide" in tree
+        # Support multi-word justify like (justify right bottom) or (justify left mirror)
+        eff.justify = " ".join(str(x) for x in justify[1:])
+    hide_node = _find(tree, "hide")
+    if hide_node is not None:
+        # (hide yes) or bare (hide) — check value when present
+        eff.hide = len(hide_node) < 2 or str(hide_node[1]).lower() == "yes"
+    else:
+        eff.hide = "hide" in tree  # legacy bare hide atom
     return eff
 
 
@@ -96,10 +102,11 @@ def _serialize_effects(eff: Effects) -> List[SExpr]:
     if eff.italic:
         font_node.append("italic")
     effects_node: List[SExpr] = ["effects", font_node]
-    if eff.justify:
-        effects_node.append(["justify", eff.justify])
     if eff.hide:
         effects_node.append(["hide", "yes"])
+    if eff.justify:
+        # justify may be multi-word like "right bottom" or "left mirror"
+        effects_node.append(["justify"] + eff.justify.split())
     return effects_node
 
 
@@ -485,6 +492,7 @@ class Sheet:
     size: Tuple[float, float] = (5.08, 5.08)
     properties: List[Property] = field(default_factory=list)
     uuid: KiUUID = field(default_factory=KiUUID)
+    _extra: List[List[SExpr]] = field(default_factory=list, repr=False)
 
     @classmethod
     def from_tree(cls, tree: List[SExpr]) -> "Sheet":
@@ -500,6 +508,10 @@ class Sheet:
         uuid_node = _find(tree, "uuid")
         if uuid_node and len(uuid_node) > 1:
             sh.uuid = KiUUID(str(uuid_node[1]))
+        _KNOWN_SHEET = {"at", "size", "property", "uuid", "stroke", "fill", "fields_autoplaced"}
+        for item in tree[1:]:
+            if isinstance(item, list) and item and str(item[0]) not in _KNOWN_SHEET:
+                sh._extra.append(item)
         return sh
 
     def to_tree(self) -> List[SExpr]:
@@ -512,9 +524,13 @@ class Sheet:
             prop_node: List[SExpr] = ["property", QStr(p.key), QStr(p.value)]
             if p.position:
                 prop_node.append(["at", p.position.x, p.position.y, p.position.angle])
+            if p.effects:
+                prop_node.append(_serialize_effects(p.effects))
             tree.append(prop_node)
         if self.uuid:
             tree.append(["uuid", QStr(self.uuid.value)])
+        for extra in self._extra:
+            tree.append(extra)
         return tree
 
 
@@ -559,6 +575,7 @@ class SchematicSymbol:
     unit: int = 1
     in_bom: bool = True
     on_board: bool = True
+    exclude_from_sim: bool = False
     properties: List[Property] = field(default_factory=list)
     pin_uuids: Dict[str, KiUUID] = field(default_factory=dict)
     uuid: KiUUID = field(default_factory=KiUUID)
@@ -607,6 +624,9 @@ class SchematicSymbol:
         on_board_node = _find(tree, "on_board")
         if on_board_node and len(on_board_node) > 1:
             sym.on_board = str(on_board_node[1]) == "yes"
+        exclude_node = _find(tree, "exclude_from_sim")
+        if exclude_node and len(exclude_node) > 1:
+            sym.exclude_from_sim = str(exclude_node[1]) == "yes"
         for prop in _find_all(tree, "property"):
             sym.properties.append(_parse_property(prop))
         # Parse pin UUIDs: (pin "N" (uuid "..."))
@@ -635,6 +655,7 @@ class SchematicSymbol:
             ["lib_id", QStr(self.lib_id)],
             ["at", self.position.x, self.position.y, self.position.angle],
             ["unit", self.unit],
+            ["exclude_from_sim", "yes" if self.exclude_from_sim else "no"],
             ["in_bom", "yes" if self.in_bom else "no"],
             ["on_board", "yes" if self.on_board else "no"],
         ]
@@ -645,11 +666,7 @@ class SchematicSymbol:
             if p.position:
                 prop_node.append(["at", p.position.x, p.position.y, p.position.angle])
             if p.effects:
-                font_node: List[SExpr] = [
-                    "font",
-                    ["size", p.effects.font_size[0], p.effects.font_size[1]],
-                ]
-                prop_node.append(["effects", font_node])
+                prop_node.append(_serialize_effects(p.effects))
             tree.append(prop_node)
         return tree
 
@@ -685,6 +702,7 @@ class Schematic:
 
     version: int = 0
     generator: str = ""
+    generator_version: str = ""
     uuid: KiUUID = field(default_factory=KiUUID)
     paper: str = "A4"
     title_block: Optional[TitleBlock] = None
@@ -1055,6 +1073,9 @@ class Schematic:
         gen_node = _find(tree, "generator")
         if gen_node and len(gen_node) > 1:
             sch.generator = str(gen_node[1])
+        gen_ver_node = _find(tree, "generator_version")
+        if gen_ver_node and len(gen_ver_node) > 1:
+            sch.generator_version = str(gen_ver_node[1])
         uuid_node = _find(tree, "uuid")
         if uuid_node and len(uuid_node) > 1:
             sch.uuid = KiUUID(str(uuid_node[1]))
@@ -1112,6 +1133,8 @@ class Schematic:
         tree: List[SExpr] = ["kicad_sch"]
         tree.append(["version", self.version])
         tree.append(["generator", QStr(self.generator)])
+        if self.generator_version:
+            tree.append(["generator_version", QStr(self.generator_version)])
         if self.uuid:
             tree.append(["uuid", QStr(self.uuid.value)])
         tree.append(["paper", QStr(self.paper)])

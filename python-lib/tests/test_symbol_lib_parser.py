@@ -229,3 +229,67 @@ class TestSymbolLibraryModifySymbol:
         lib.modify_symbol("R", pin_numbers_hide=True)
         sym = lib.find_by_name("R")
         assert sym.raw_tree is None
+
+
+class TestSymbolLibJustifyRoundTrip:
+    """Tests for multi-word justify in symbol lib effects."""
+
+    def test_hidden_property_parsed(self):
+        """Hidden property effects are parsed correctly."""
+        lib = SymbolLibrary.load(FIXTURE_SYM)
+        r_sym = lib.find_by_name("R")
+        footprint_prop = next(p for p in r_sym.properties if p.key == "Footprint")
+        assert footprint_prop.effects is not None
+        assert footprint_prop.effects.hide is True
+
+    def test_hidden_property_survives_round_trip_after_modify(self):
+        """Hidden property effect survives save → reload after modify clears raw_tree."""
+        lib = SymbolLibrary.load(FIXTURE_SYM)
+        lib.modify_symbol("R", pin_names_offset=1.016)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sym"
+            lib.save(out)
+            lib2 = SymbolLibrary.load(out)
+        r_sym = lib2.find_by_name("R")
+        fp_prop = next(p for p in r_sym.properties if p.key == "Footprint")
+        assert fp_prop.effects is not None
+        assert fp_prop.effects.hide is True
+
+    def test_property_bold_round_trip_after_modify(self):
+        """Bold property effect survives after modify clears raw_tree."""
+        from kiassist_utils.kicad_parser.models import Effects, Position, Property
+        lib = SymbolLibrary.load(FIXTURE_SYM)
+        # Add a symbol with a bold property effect
+        sym = SymbolDef(name="TestBold")
+        sym.properties = [
+            Property(
+                key="Reference",
+                value="T",
+                position=Position(0.0, 0.0, 0.0),
+                effects=Effects(font_size=(1.27, 1.27), bold=True),
+            )
+        ]
+        lib.add_symbol(sym)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sym"
+            lib.save(out)
+            lib2 = SymbolLibrary.load(out)
+        t_sym = lib2.find_by_name("TestBold")
+        ref_prop = next(p for p in t_sym.properties if p.key == "Reference")
+        assert ref_prop.effects is not None
+        assert ref_prop.effects.bold is True
+
+    def test_symbol_lib_generator_version_not_in_fixture(self):
+        """generator_version defaults to empty string when absent in file."""
+        lib = SymbolLibrary.load(FIXTURE_SYM)
+        assert lib.generator_version == ""
+
+    def test_symbol_lib_generator_version_survives_round_trip(self):
+        """generator_version is written and re-read when set."""
+        lib = SymbolLibrary.load(FIXTURE_SYM)
+        lib.generator_version = "8.0"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sym"
+            lib.save(out)
+            lib2 = SymbolLibrary.load(out)
+        assert lib2.generator_version == "8.0"

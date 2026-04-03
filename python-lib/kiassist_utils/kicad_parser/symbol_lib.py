@@ -56,8 +56,12 @@ def _parse_effects(tree: List[SExpr]) -> Effects:
         eff.italic = "italic" in font
     justify = _find(tree, "justify")
     if justify and len(justify) > 1:
-        eff.justify = str(justify[1])
-    eff.hide = _find(tree, "hide") is not None or "hide" in tree
+        eff.justify = " ".join(str(x) for x in justify[1:])
+    hide_node = _find(tree, "hide")
+    if hide_node is not None:
+        eff.hide = len(hide_node) < 2 or str(hide_node[1]).lower() == "yes"
+    else:
+        eff.hide = "hide" in tree
     return eff
 
 
@@ -245,12 +249,18 @@ class SymbolDef:
             if p.position:
                 prop_node.append(["at", p.position.x, p.position.y, p.position.angle])
             if p.effects:
-                font_node: List[SExpr] = ["font", ["size", p.effects.font_size[0], p.effects.font_size[1]]]
-                if p.effects.bold:
+                eff = p.effects
+                font_node: List[SExpr] = ["font", ["size", eff.font_size[0], eff.font_size[1]]]
+                if eff.bold:
                     font_node.append("bold")
-                if p.effects.italic:
+                if eff.italic:
                     font_node.append("italic")
-                prop_node.append(["effects", font_node])
+                effects_node: List[SExpr] = ["effects", font_node]
+                if eff.hide:
+                    effects_node.append(["hide", "yes"])
+                if eff.justify:
+                    effects_node.append(["justify"] + eff.justify.split())
+                prop_node.append(effects_node)
             tree.append(prop_node)
         for unit in self.units:
             tree.append(unit.to_tree(parent_name=self.name))
@@ -274,6 +284,7 @@ class SymbolLibrary:
 
     version: int = 0
     generator: str = ""
+    generator_version: str = ""
     symbols: List[SymbolDef] = field(default_factory=list)
 
     # ------------------------------------------------------------------
@@ -376,6 +387,9 @@ class SymbolLibrary:
         gen_node = _find(tree, "generator")
         if gen_node and len(gen_node) > 1:
             lib.generator = str(gen_node[1])
+        gen_ver_node = _find(tree, "generator_version")
+        if gen_ver_node and len(gen_ver_node) > 1:
+            lib.generator_version = str(gen_ver_node[1])
         for sym_tree in _find_all(tree, "symbol"):
             lib.symbols.append(SymbolDef.from_tree(sym_tree))
         return lib
@@ -384,6 +398,8 @@ class SymbolLibrary:
         tree: List[SExpr] = ["kicad_symbol_lib"]
         tree.append(["version", self.version])
         tree.append(["generator", QStr(self.generator)])
+        if self.generator_version:
+            tree.append(["generator_version", QStr(self.generator_version)])
         for sym in self.symbols:
             tree.append(sym.to_tree())
         return tree

@@ -272,3 +272,37 @@ class TestFootprintModifyPad:
         fp.modify_pad("1", size=(2.0, 2.0))
         pad = next(p for p in fp.pads if p.number == "1")
         assert pad.raw_tree is None
+
+
+class TestFootprintGeneratorVersion:
+    """Tests for Footprint generator_version field."""
+
+    def test_version_defaults_to_zero(self):
+        """version defaults to 0 for a new empty footprint."""
+        fp = Footprint()
+        assert fp.version == 0
+
+    def test_generator_version_default_empty(self):
+        """generator_version defaults to empty string."""
+        fp = Footprint()
+        assert fp.generator_version == ""
+
+    def test_generator_version_survives_round_trip(self):
+        """generator_version is written and re-read."""
+        fp = Footprint.load(FIXTURE_MOD)
+        fp.generator_version = "8.0"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_mod"
+            fp.save(out)
+            fp2 = Footprint.load(out)
+        assert fp2.generator_version == "8.0"
+
+    def test_version_survives_round_trip(self):
+        """version integer is written and re-read."""
+        fp = Footprint.load(FIXTURE_MOD)
+        fp.version = 20231120
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_mod"
+            fp.save(out)
+            fp2 = Footprint.load(out)
+        assert fp2.version == 20231120

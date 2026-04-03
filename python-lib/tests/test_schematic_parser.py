@@ -585,3 +585,185 @@ class TestGetConnectedNets:
         # D1 pin 1 is at (0,0) which is the same as the VCC label — should be connected
         assert "VCC" in result
         assert "D1:1" in result["VCC"]
+
+
+class TestJustifyMultiWord:
+    """Tests for multi-word (justify ...) parsing and round-tripping."""
+
+    def test_justify_right_bottom_parsed(self):
+        """(justify right bottom) is parsed as 'right bottom'."""
+        sch = Schematic.load(FIXTURE_SCH)
+        vcc = next(lbl for lbl in sch.labels if lbl.text == "VCC")
+        assert vcc.effects.justify == "right bottom"
+
+    def test_justify_left_parsed(self):
+        """(justify left) is parsed as 'left'."""
+        sch = Schematic.load(FIXTURE_SCH)
+        gnd = next(gl for gl in sch.global_labels if gl.text == "GND")
+        assert gnd.effects.justify == "left"
+
+    def test_justify_right_bottom_survives_round_trip(self):
+        """Multi-word justify survives save → reload."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        vcc = next(lbl for lbl in sch2.labels if lbl.text == "VCC")
+        assert vcc.effects.justify == "right bottom"
+
+    def test_justify_serialized_as_multiple_tokens(self):
+        """Multi-word justify is serialized with separate tokens."""
+        from kiassist_utils.kicad_parser.schematic import Label
+        from kiassist_utils.kicad_parser.models import Effects
+        from kiassist_utils.kicad_parser.sexpr import serialize
+        lbl = Label(text="TEST")
+        lbl.effects = Effects(font_size=(1.27, 1.27), justify="right bottom")
+        text = serialize(lbl.to_tree())
+        assert "(justify right bottom)" in text
+
+    def test_justify_mirror_round_trip(self):
+        """(justify left mirror) round-trips correctly."""
+        from kiassist_utils.kicad_parser.schematic import Label
+        from kiassist_utils.kicad_parser.models import Effects, Position
+        from kiassist_utils.kicad_parser.sexpr import parse, serialize
+        lbl = Label(text="MIRROR_NET", position=Position(10.0, 10.0, 0.0))
+        lbl.effects = Effects(font_size=(1.27, 1.27), justify="left mirror")
+        text = serialize(lbl.to_tree())
+        lbl2 = Label.from_tree(parse(text))
+        assert lbl2.effects.justify == "left mirror"
+
+
+class TestGeneratorVersion:
+    """Tests for generator_version preservation."""
+
+    def test_generator_version_parsed(self):
+        """generator_version field is parsed from the fixture."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.generator_version == "8.0"
+
+    def test_generator_version_survives_round_trip(self):
+        """generator_version survives save → reload."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        assert sch2.generator_version == "8.0"
+
+    def test_missing_generator_version_not_written(self):
+        """Empty generator_version is not written to the file."""
+        sch = Schematic()
+        sch.generator = "kiassist"
+        sch.version = 20231120
+        tree = sch._to_tree()
+        tags = [item[0] for item in tree if isinstance(item, list) and item]
+        assert "generator_version" not in tags
+
+
+class TestExcludeFromSim:
+    """Tests for SchematicSymbol.exclude_from_sim field."""
+
+    def test_exclude_from_sim_parsed(self):
+        """exclude_from_sim is parsed from symbols in the fixture."""
+        sch = Schematic.load(FIXTURE_SCH)
+        r1 = next(s for s in sch.symbols if s.reference == "R1")
+        assert r1.exclude_from_sim is False
+
+    def test_exclude_from_sim_default_false(self):
+        """exclude_from_sim defaults to False for new symbols."""
+        sym = SchematicSymbol()
+        assert sym.exclude_from_sim is False
+
+    def test_exclude_from_sim_serialized(self):
+        """exclude_from_sim is emitted when raw_tree is None."""
+        from kiassist_utils.kicad_parser.sexpr import serialize
+        sym = SchematicSymbol()
+        sym.lib_id = "Device:R"
+        sym.exclude_from_sim = False
+        text = serialize(sym.to_tree())
+        assert "exclude_from_sim" in text
+
+    def test_exclude_from_sim_true_serialized(self):
+        """exclude_from_sim yes is emitted when True."""
+        from kiassist_utils.kicad_parser.sexpr import serialize
+        sym = SchematicSymbol()
+        sym.exclude_from_sim = True
+        text = serialize(sym.to_tree())
+        assert "exclude_from_sim" in text
+        assert "yes" in text
+
+
+class TestSheetPinPreservation:
+    """Tests for Sheet._extra preserving sheet_pin elements."""
+
+    def test_sheet_parsed_from_fixture(self):
+        """The fixture sheet is parsed without errors."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert len(sch.sheets) == 1
+
+    def test_sheet_pin_preserved_in_extra(self):
+        """sheet_pin elements are captured in Sheet._extra."""
+        sch = Schematic.load(FIXTURE_SCH)
+        sheet = sch.sheets[0]
+        pin_items = [item for item in sheet._extra
+                     if isinstance(item, list) and item and item[0] == "pin"]
+        assert len(pin_items) == 1
+
+    def test_sheet_pin_survives_round_trip(self):
+        """sheet_pin elements survive save → reload."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        sheet = sch2.sheets[0]
+        pin_items = [item for item in sheet._extra
+                     if isinstance(item, list) and item and item[0] == "pin"]
+        assert len(pin_items) == 1
+
+    def test_sheet_properties_parsed(self):
+        """Sheet properties (Sheetname, Sheetfile) are parsed."""
+        sch = Schematic.load(FIXTURE_SCH)
+        sheet = sch.sheets[0]
+        assert any(p.key == "Sheetname" for p in sheet.properties)
+        assert any(p.key == "Sheetfile" for p in sheet.properties)
+
+    def test_sheet_property_effects_round_trip(self):
+        """Sheet property effects (justify, hide) survive round-trip."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        sheet = sch2.sheets[0]
+        sheetfile_prop = next(p for p in sheet.properties if p.key == "Sheetfile")
+        assert sheetfile_prop.effects is not None
+        assert sheetfile_prop.effects.hide is True
+
+
+class TestPropertyEffectsRoundTrip:
+    """Tests for property effects serialization (hide, justify, bold) in symbols."""
+
+    def test_symbol_hidden_property_stays_hidden_after_add(self):
+        """A newly added symbol with a hidden property serializes the hide flag."""
+        from kiassist_utils.kicad_parser.models import Effects, Property, Position
+        from kiassist_utils.kicad_parser.sexpr import parse, serialize
+        sch = Schematic()
+        sym = sch.add_symbol("Device:R", 50.0, 50.0, "R99", "10k")
+        # Set a hidden Footprint property
+        sym.properties.append(Property(
+            key="Footprint",
+            value="Resistor_SMD:R_0402",
+            position=Position(50.0, 50.0, 0.0),
+            effects=Effects(font_size=(1.27, 1.27), hide=True),
+        ))
+        sym.raw_tree = None  # Force re-serialization
+        text = serialize(sym.to_tree())
+        # Reload the symbol
+        parsed = parse(text)
+        from kiassist_utils.kicad_parser.schematic import SchematicSymbol
+        sym2 = SchematicSymbol.from_tree(parsed)
+        fp_prop = next(p for p in sym2.properties if p.key == "Footprint")
+        assert fp_prop.effects is not None
+        assert fp_prop.effects.hide is True

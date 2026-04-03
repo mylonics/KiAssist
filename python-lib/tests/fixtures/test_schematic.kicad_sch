@@ -137,7 +137,7 @@
     )
     (uuid "00000000-0000-0000-0000-000000000050")
   )
-  (symbol (lib_id "Device:R") (at 81.28 50.8 90) (unit 1) (in_bom yes) (on_board yes)
+  (symbol (lib_id "Device:R") (at 81.28 50.8 90) (unit 1) (exclude_from_sim no) (in_bom yes) (on_board yes)
     (uuid "00000000-0000-0000-0000-000000000060")
     (property "Reference" "R1" (at 82.5552 49.53 90)
       (effects
@@ -169,7 +169,7 @@
       )
     )
   )
-  (symbol (lib_id "Device:R") (at 91.44 50.8 90) (unit 1) (in_bom yes) (on_board yes)
+  (symbol (lib_id "Device:R") (at 91.44 50.8 90) (unit 1) (exclude_from_sim no) (in_bom yes) (on_board yes)
     (uuid "00000000-0000-0000-0000-000000000070")
     (property "Reference" "R2" (at 92.7152 49.53 90)
       (effects
@@ -195,6 +195,36 @@
     )
     (pin "1" (uuid "00000000-0000-0000-0000-000000000071"))
     (pin "2" (uuid "00000000-0000-0000-0000-000000000072"))
+  )
+  (sheet (at 110 50) (size 20 10)
+    (stroke (width 0) (type solid))
+    (fill (color 0 0 0 0.0000))
+    (uuid "00000000-0000-0000-0000-000000000080")
+    (property "Sheetname" "SubSheet" (at 110 48.5 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+        (justify left)
+      )
+    )
+    (property "Sheetfile" "sub.kicad_sch" (at 110 61.0 0)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+        (justify left)
+        (hide yes)
+      )
+    )
+    (pin "CLK" input (at 110 52.54 180)
+      (effects
+        (font
+          (size 1.27 1.27)
+        )
+      )
+      (uuid "00000000-0000-0000-0000-000000000081")
+    )
   )
   (sheet_instances
     (path "/" (page "1"))

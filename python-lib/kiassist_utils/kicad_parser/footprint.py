@@ -192,6 +192,9 @@ class Footprint:
     layer: str = "F.Cu"
     description: str = ""
     tags: str = ""
+    version: int = 0
+    generator: str = ""
+    generator_version: str = ""
     attributes: List[str] = field(default_factory=list)
     graphics: List[FootprintGraphic] = field(default_factory=list)
     pads: List[Pad] = field(default_factory=list)
@@ -342,6 +345,16 @@ class Footprint:
         if layer_node and len(layer_node) > 1:
             fp.layer = str(layer_node[1])
 
+        version_node = _find(tree, "version")
+        if version_node and len(version_node) > 1:
+            fp.version = int(version_node[1])
+        gen_node = _find(tree, "generator")
+        if gen_node and len(gen_node) > 1:
+            fp.generator = str(gen_node[1])
+        gen_ver_node = _find(tree, "generator_version")
+        if gen_ver_node and len(gen_ver_node) > 1:
+            fp.generator_version = str(gen_ver_node[1])
+
         desc_node = _find(tree, "descr")
         if desc_node and len(desc_node) > 1:
             fp.description = str(desc_node[1])
@@ -355,8 +368,8 @@ class Footprint:
             fp.attributes = [str(a) for a in attr_node[1:] if isinstance(a, (str, QStr))]
 
         _KNOWN = {
-            "footprint", "layer", "descr", "tags", "attr",
-            "pad", "model", "property",
+            "footprint", "layer", "version", "generator", "generator_version",
+            "descr", "tags", "attr", "pad", "model", "property",
         } | _GRAPHIC_TAGS
 
         for item in tree[2:]:
@@ -381,6 +394,12 @@ class Footprint:
     def _to_tree(self) -> List[SExpr]:
         tree: List[SExpr] = ["footprint", QStr(self.name)]
         tree.append(["layer", QStr(self.layer)])
+        if self.version:
+            tree.append(["version", self.version])
+        if self.generator:
+            tree.append(["generator", QStr(self.generator)])
+        if self.generator_version:
+            tree.append(["generator_version", QStr(self.generator_version)])
         if self.description:
             tree.append(["descr", QStr(self.description)])
         if self.tags:
