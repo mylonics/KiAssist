@@ -1486,14 +1486,26 @@ def kicad_reload_schematic(window_title_hint: str = "") -> Dict[str, Any]:
         elif system in ("Linux", "Darwin"):
             if system == "Linux":
                 if shutil.which("xdotool"):
-                    os.system("xdotool key --clearmodifiers ctrl+shift+r")
+                    result = subprocess.run(
+                        ["xdotool", "key", "--clearmodifiers", "ctrl+shift+r"],
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        return _err(f"xdotool exited with code {result.returncode}")
                     return _ok({"triggered": True, "method": "xdotool"})
                 return _err("xdotool not found; install xdotool for keyboard automation")
             else:
-                os.system(
-                    "osascript -e 'tell application \"System Events\" "
-                    'to keystroke "r" using {command down, shift down}\''
+                result = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        'tell application "System Events" to keystroke "r" '
+                        "using {command down, shift down}",
+                    ],
+                    check=False,
                 )
+                if result.returncode != 0:
+                    return _err(f"osascript exited with code {result.returncode}")
                 return _ok({"triggered": True, "method": "osascript"})
         else:
             return _err(f"Keyboard automation not supported on platform: {system}")
@@ -1529,6 +1541,109 @@ def kicad_get_board_info(path: str) -> Dict[str, Any]:
             "layer_stackup": board.get_layer_stackup(),
         }
     )
+
+
+# ===========================================================================
+# 2.5b  Phase 5 — IPC Save/Reload Workflow Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def kicad_check_file_status(path: str) -> Dict[str, Any]:
+    """Check whether a KiCad file is open in a live KiCad instance (Phase 5.1).
+
+    Returns information about the file's current state on disk and whether it
+    is currently open in a running KiCad editor.  Use this before any file edit
+    to decide whether a save/reload cycle is needed.
+
+    Args:
+        path: Path to a ``.kicad_sch`` or ``.kicad_pcb`` file.
+
+    Returns:
+        Dict with:
+
+        * ``path`` – resolved absolute path.
+        * ``exists`` – ``true`` if the file exists on disk.
+        * ``mtime`` – last-modified POSIX timestamp, or ``null``.
+        * ``open_in_kicad`` – ``true`` if a running KiCad instance has the
+          file open.
+        * ``bak_exists`` – ``true`` if a ``.bak`` backup is present.
+    """
+    try:
+        from .ipc_workflow import check_file_status
+    except ImportError as exc:
+        return _err(f"ipc_workflow module unavailable: {exc}")
+
+    try:
+        return _ok(check_file_status(path))
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+
+@mcp.tool()
+async def kicad_edit_file_pipeline(
+    file_path: str,
+    tool_name: str,
+    tool_args: str = "{}",
+    window_title_hint: str = "",
+    save_before_edit: bool = True,
+    reload_after_edit: bool = True,
+) -> Dict[str, Any]:
+    """Orchestrate the KiCad IPC save → edit → reload pipeline (Phase 5.3).
+
+    This tool wraps a single file-editing MCP tool call with the full
+    Phase 5 workflow:
+
+    1. If the file is open in KiCad and *save_before_edit* is ``true``,
+       trigger ``kicad_save_schematic`` so any unsaved KiCad changes are
+       flushed to disk first.
+    2. Acquire an advisory file lock to prevent concurrent modifications.
+    3. Execute *tool_name* with *tool_args*.
+    4. On failure, automatically restore the ``.bak`` backup (rollback).
+    5. Release the lock.
+    6. If the file is still open in KiCad and *reload_after_edit* is ``true``,
+       trigger ``kicad_reload_schematic`` so the editor shows the new content.
+
+    Args:
+        file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
+                           being edited.
+        tool_name:         Name of the MCP tool that performs the actual edit
+                           (e.g. ``"schematic_add_symbol"``).
+        tool_args:         JSON-encoded dict of arguments for *tool_name*.
+        window_title_hint: Optional KiCad window title fragment used to target
+                           a specific instance for save/reload.
+        save_before_edit:  Trigger KiCad save before the edit (default ``true``).
+        reload_after_edit: Trigger KiCad reload after the edit (default ``true``).
+
+    Returns:
+        The return value of *tool_name* annotated with a ``pipeline`` dict
+        containing:
+
+        * ``file_was_open_in_kicad``
+        * ``save_triggered``
+        * ``reload_triggered``
+    """
+    try:
+        from .ipc_workflow import SchematicEditPipeline
+    except ImportError as exc:
+        return _err(f"ipc_workflow module unavailable: {exc}")
+
+    try:
+        args: Dict[str, Any] = json.loads(tool_args) if isinstance(tool_args, str) else tool_args
+    except json.JSONDecodeError as exc:
+        return _err(f"Invalid JSON in tool_args: {exc}")
+
+    try:
+        pipeline = SchematicEditPipeline(
+            file_path,
+            window_title_hint=window_title_hint,
+            save_before_edit=save_before_edit,
+            reload_after_edit=reload_after_edit,
+        )
+        result = await pipeline.run(tool_name, args)
+        return result  # type: ignore[return-value]
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Pipeline execution failed: {exc}")
 
 
 # ===========================================================================
