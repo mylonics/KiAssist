@@ -84,9 +84,9 @@ body {
 }
 
 .left-panel {
-  width: 280px;
-  min-width: 280px;
-  max-width: 280px;
+  width: 260px;
+  min-width: 260px;
+  max-width: 260px;
   height: 100%;
   background-color: var(--bg-primary);
   border-right: 1px solid var(--border-color);

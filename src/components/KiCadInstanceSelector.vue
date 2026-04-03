@@ -311,6 +311,12 @@ onUnmounted(() => {
 
 <template>
   <div class="kicad-selector">
+    <!-- App Header -->
+    <div class="app-header">
+      <span class="app-title">KiAssist</span>
+      <span v-if="loading" class="loading-dot" title="Refreshing..."></span>
+    </div>
+
     <!-- Project Switcher -->
     <div class="switcher-wrapper" ref="switcherRef">
       <button class="switcher-btn" @click="toggleSwitcher">
@@ -439,12 +445,42 @@ onUnmounted(() => {
 
 <style scoped>
 .kicad-selector {
-  padding: 0.75rem;
+  padding: 0.625rem 0.75rem 0.75rem;
   height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+}
+
+/* ── App Header ── */
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.125rem 0 0.25rem;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 0.125rem;
+}
+
+.app-title {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent-color);
+  letter-spacing: -0.01em;
+}
+
+.loading-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--accent-color);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
 }
 
 /* ── Project Switcher ── */
