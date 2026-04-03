@@ -1,16 +1,11 @@
-"""KiCad schematic manipulation module using kicad-sch-api."""
+"""KiCad schematic manipulation module using kicad_parser."""
 
-import os
+import uuid
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-# Try to import kicad_sch_api - this is optional
-try:
-    from kicad_sch_api import load_schematic, create_schematic, Schematic
-    KICAD_SCH_API_AVAILABLE = True
-except ImportError:
-    KICAD_SCH_API_AVAILABLE = False
-    Schematic = None
+from .kicad_parser.schematic import Schematic
+from .kicad_parser.sexpr import QStr
 
 
 # Default position for test note (top right area of A4 schematic in mm)
@@ -24,12 +19,12 @@ DEFAULT_TEXT_SIZE = 2.54
 
 
 def is_schematic_api_available() -> bool:
-    """Check if kicad-sch-api is available.
-    
+    """Check if the KiCad schematic API is available.
+
     Returns:
-        True if the API is available, False otherwise
+        True — the built-in kicad_parser module is always available.
     """
-    return KICAD_SCH_API_AVAILABLE
+    return True
 
 
 def get_schematic_path_for_project(project_path: str) -> Optional[str]:
@@ -104,6 +99,27 @@ def find_existing_schematic(project_path: str) -> Optional[str]:
     return None
 
 
+def _make_text_node(text: str, x: float, y: float, size: float) -> list:
+    """Build a KiCad S-expression list for a schematic text item.
+
+    Args:
+        text: The annotation text.
+        x: X coordinate in mm.
+        y: Y coordinate in mm.
+        size: Font size in mm.
+
+    Returns:
+        A nested list suitable for appending to ``Schematic._extra``.
+    """
+    return [
+        "text",
+        QStr(text),
+        ["at", x, y, 0],
+        ["effects", ["font", ["size", size, size]]],
+        ["uuid", QStr(str(uuid.uuid4()))],
+    ]
+
+
 def inject_test_note(project_path: str, note_text: str = "KiAssist Test Note") -> Dict[str, Any]:
     """Inject a test note into the schematic for a KiCad project.
     
@@ -121,12 +137,6 @@ def inject_test_note(project_path: str, note_text: str = "KiAssist Test Note") -
             - schematic_path: str - Path to the modified/created schematic
             - error: str - Error message if operation failed
     """
-    if not KICAD_SCH_API_AVAILABLE:
-        return {
-            "success": False,
-            "error": "kicad-sch-api package is not available. Please install it with: pip install kicad-sch-api"
-        }
-    
     if not project_path:
         return {
             "success": False,
@@ -153,27 +163,21 @@ def inject_test_note(project_path: str, note_text: str = "KiAssist Test Note") -
     created_new = False
     
     try:
-        # Check if schematic exists
         existing_schematic = find_existing_schematic(str(project_path))
-        
+
         if existing_schematic:
-            # Load existing schematic
-            schematic = load_schematic(existing_schematic)
+            schematic = Schematic.load(existing_schematic)
             schematic_path = Path(existing_schematic)
         else:
-            # Create new schematic
-            schematic = create_schematic(project_name)
+            schematic = Schematic()
+            schematic.generator = "KiAssist"
+            schematic.version = 20231120
             created_new = True
-        
-        # Add the test note at top-right position
-        schematic.add_text(
-            text=note_text,
-            position=DEFAULT_NOTE_POSITION,
-            size=DEFAULT_TEXT_SIZE,
-            bold=True
-        )
-        
-        # Save the schematic
+
+        # Add the text note as a raw S-expression entry
+        x, y = DEFAULT_NOTE_POSITION
+        schematic._extra.append(_make_text_node(note_text, x, y, DEFAULT_TEXT_SIZE))
+
         schematic.save(str(schematic_path))
         
         action = "Created new schematic and added" if created_new else "Added"

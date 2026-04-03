@@ -1,9 +1,7 @@
 """Tests for KiCad schematic manipulation module."""
 
-import os
 import tempfile
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -12,7 +10,6 @@ from kiassist_utils.kicad_schematic import (
     get_schematic_path_for_project,
     find_existing_schematic,
     inject_test_note,
-    KICAD_SCH_API_AVAILABLE,
 )
 
 
@@ -24,10 +21,9 @@ class TestIsSchematicApiAvailable:
         result = is_schematic_api_available()
         assert isinstance(result, bool)
 
-    def test_matches_import_status(self):
-        """Test that function matches the module-level import status."""
-        result = is_schematic_api_available()
-        assert result == KICAD_SCH_API_AVAILABLE
+    def test_always_available(self):
+        """kicad_parser is a built-in module — API is always available."""
+        assert is_schematic_api_available()
 
 
 class TestGetSchematicPathForProject:
@@ -140,7 +136,6 @@ class TestInjectTestNote:
         assert 'error' in result
         assert 'does not exist' in result['error']
 
-    @pytest.mark.skipif(not KICAD_SCH_API_AVAILABLE, reason="kicad-sch-api not installed")
     def test_creates_new_schematic_when_none_exists(self):
         """Test that a new schematic is created when none exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -154,18 +149,19 @@ class TestInjectTestNote:
             assert result.get('created_new') is True
             assert Path(result['schematic_path']).exists()
 
-    @pytest.mark.skipif(not KICAD_SCH_API_AVAILABLE, reason="kicad-sch-api not installed")
     def test_modifies_existing_schematic(self):
         """Test that existing schematic is modified."""
         with tempfile.TemporaryDirectory() as tmpdir:
             project_file = Path(tmpdir) / 'test_project.kicad_pro'
             project_file.touch()
-            
-            # Create a schematic using the API first
-            from kicad_sch_api import create_schematic
-            schematic = create_schematic('test_project')
+
+            # Create a minimal schematic using kicad_parser
+            from kiassist_utils.kicad_parser.schematic import Schematic
+            sch = Schematic()
+            sch.generator = "test"
+            sch.version = 20231120
             schematic_path = Path(tmpdir) / 'test_project.kicad_sch'
-            schematic.save(str(schematic_path))
+            sch.save(str(schematic_path))
             
             result = inject_test_note(str(project_file))
             
@@ -173,7 +169,6 @@ class TestInjectTestNote:
             assert 'schematic_path' in result
             assert result.get('created_new') is False
 
-    @pytest.mark.skipif(not KICAD_SCH_API_AVAILABLE, reason="kicad-sch-api not installed")
     def test_custom_note_text(self):
         """Test that custom note text is used."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -186,10 +181,14 @@ class TestInjectTestNote:
             assert result['success'] is True
             assert custom_text in result.get('message', '')
 
-    def test_api_not_available_returns_error(self):
-        """Test that missing API returns appropriate error."""
-        with mock.patch('kiassist_utils.kicad_schematic.KICAD_SCH_API_AVAILABLE', False):
-            result = inject_test_note('/some/path')
-            
-            assert result['success'] is False
-            assert 'kicad-sch-api' in result['error']
+    def test_note_text_written_to_file(self):
+        """Test that the note text actually appears in the saved schematic file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_file = Path(tmpdir) / 'test_project.kicad_pro'
+            project_file.touch()
+
+            result = inject_test_note(str(project_file), note_text="CheckNote")
+
+            assert result['success'] is True
+            content = Path(result['schematic_path']).read_text(encoding='utf-8')
+            assert "CheckNote" in content

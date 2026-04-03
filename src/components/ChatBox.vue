@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from 'vue';
+import { ref, computed, onMounted, nextTick, watch } from 'vue';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
 import '../types/pywebview';
+import type { ProviderInfo, SessionInfo } from '../types/pywebview';
 
 // Configure marked with code highlighting
 marked.use({
@@ -27,14 +28,20 @@ interface Message {
 }
 
 const STORAGE_KEY = 'kiassist-chat-messages';
+const PROVIDER_KEY = 'kiassist-provider';
+const MODEL_KEY = 'kiassist-model';
 
 const copiedMessageId = ref<string | null>(null);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
+const selectedProvider = ref('gemini');
 const selectedModel = ref('3-flash');
 const hasApiKey = ref(false);
 const showApiKeyPrompt = ref(false);
+const showSessionsModal = ref(false);
 const apiKeyInput = ref('');
+// Which provider's key is being configured in the settings modal
+const configuringProvider = ref('gemini');
 const isLoading = ref(false);
 const apiKeyWarning = ref<string>('');
 const apiKeyError = ref<string>('');
@@ -42,11 +49,22 @@ const messagesContainer = ref<HTMLElement | null>(null);
 const editingMessageId = ref<string | null>(null);
 const editingText = ref('');
 
-const availableModels = [
-  { value: '3.1-pro', label: 'Gemini 3.1 Pro' },
-  { value: '3-flash', label: 'Gemini 3 Flash' },
-  { value: '3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
-];
+// Provider list is populated from the backend via get_providers()
+const providers = ref<ProviderInfo[]>([]);
+
+const sessions = ref<SessionInfo[]>([]);
+
+const currentProviderInfo = computed<ProviderInfo | undefined>(() =>
+  providers.value.find(p => p.id === selectedProvider.value)
+);
+
+const configuringProviderInfo = computed<ProviderInfo | undefined>(() =>
+  providers.value.find(p => p.id === configuringProvider.value)
+);
+
+const availableModels = computed(() =>
+  currentProviderInfo.value?.models ?? []
+);
 
 function generateMessageId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
@@ -111,14 +129,77 @@ function clearMessages() {
   localStorage.removeItem(STORAGE_KEY);
 }
 
-// API Key
-async function checkApiKey() {
+// Provider switching
+async function onProviderChange() {
+  const info = currentProviderInfo.value;
+  if (info) {
+    // Switch to the default model for the new provider
+    selectedModel.value = info.default_model;
+  }
+  localStorage.setItem(PROVIDER_KEY, selectedProvider.value);
+  localStorage.setItem(MODEL_KEY, selectedModel.value);
+
+  if (window.pywebview?.api) {
+    await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+  }
+  // Derive hasApiKey from the in-memory providers list (no extra IPC call)
+  hasApiKey.value = currentProviderInfo.value?.has_key ?? false;
+}
+
+async function onModelChange() {
+  localStorage.setItem(MODEL_KEY, selectedModel.value);
+  if (window.pywebview?.api) {
+    await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+  }
+}
+
+// Load provider state from backend; localStorage is the source of truth for
+// provider/model selection — backend defaults are only used when no saved
+// preference exists.
+async function loadProviders() {
+  if (!window.pywebview?.api) return;
   try {
-    if (window.pywebview?.api) {
-      hasApiKey.value = await window.pywebview.api.check_api_key();
+    const result = await window.pywebview.api.get_providers();
+    if (result.success && result.providers) {
+      // Backend is the single source of truth for provider metadata
+      providers.value = result.providers;
+
+      // Determine which provider/model to use, honouring localStorage first
+      const storedProvider = localStorage.getItem(PROVIDER_KEY);
+      const storedModel = localStorage.getItem(MODEL_KEY);
+
+      const storedProviderInfo = storedProvider
+        ? result.providers.find((p: ProviderInfo) => p.id === storedProvider)
+        : undefined;
+
+      const nextProvider =
+        storedProviderInfo?.id ??
+        result.current_provider ??
+        selectedProvider.value;
+
+      const nextProviderInfo =
+        result.providers.find((p: ProviderInfo) => p.id === nextProvider);
+
+      const nextModel =
+        storedModel ??
+        result.current_model ??
+        nextProviderInfo?.default_model ??
+        selectedModel.value;
+
+      selectedProvider.value = nextProvider;
+      selectedModel.value = nextModel ?? selectedModel.value;
+
+      // Persist the resolved selection and sync the backend
+      localStorage.setItem(PROVIDER_KEY, selectedProvider.value);
+      localStorage.setItem(MODEL_KEY, selectedModel.value);
+      await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+
+      // Derive hasApiKey from the providers list — no extra round-trips needed
+      const active = result.providers.find((p: ProviderInfo) => p.id === selectedProvider.value);
+      hasApiKey.value = active?.has_key ?? false;
     }
-  } catch (error) {
-    console.error('[UI] Error checking API key:', error);
+  } catch (e) {
+    console.error('[UI] Failed to load providers:', e);
   }
 }
 
@@ -135,15 +216,41 @@ async function waitForPywebviewAndCheckApiKey() {
     });
   }
   try {
-    await checkApiKey();
+    // loadProviders handles provider/model sync and derives hasApiKey
+    await loadProviders();
   } catch (err) {
     // Ignore stale callback errors from pywebview (e.g. during HMR reload)
     if (String(err).includes('_returnValuesCallbacks')) {
       console.warn('[ChatBox] Stale pywebview callback (likely HMR reload), ignoring.');
     } else {
-      console.error('[UI] Error during initial API key check:', err);
+      console.error('[UI] Error during initial provider load:', err);
     }
   }
+}
+
+function openSettings(provider?: string) {
+  configuringProvider.value = provider || selectedProvider.value;
+  apiKeyInput.value = '';
+  apiKeyError.value = '';
+  apiKeyWarning.value = '';
+  showApiKeyPrompt.value = true;
+}
+
+function selectProviderForConfig(providerId: string) {
+  configuringProvider.value = providerId;
+  apiKeyInput.value = '';
+  apiKeyError.value = '';
+  apiKeyWarning.value = '';
+}
+
+function validateApiKeyFormat(key: string, providerInfo: ProviderInfo): string | null {
+  if (key.length < providerInfo.key_min_length) {
+    return `API key seems too short (minimum ${providerInfo.key_min_length} characters).`;
+  }
+  if (providerInfo.key_prefix && !key.startsWith(providerInfo.key_prefix)) {
+    return `This doesn't look like a valid ${providerInfo.name} API key. Keys should start with "${providerInfo.key_prefix}". Get your key from ${providerInfo.key_url}`;
+  }
+  return null;
 }
 
 async function saveApiKey() {
@@ -151,21 +258,28 @@ async function saveApiKey() {
   apiKeyError.value = '';
   apiKeyWarning.value = '';
   const trimmedKey = apiKeyInput.value.trim();
+  const info = configuringProviderInfo.value;
 
-  if (trimmedKey.length < 30) {
-    apiKeyError.value = 'API key seems too short. Gemini API keys are typically 39 characters long.';
-    return;
-  }
-  if (!trimmedKey.startsWith('AIza')) {
-    apiKeyError.value = 'This doesn\'t look like a valid Gemini API key. Keys should start with "AIza". Get your key from https://aistudio.google.com/apikey';
-    return;
+  if (info) {
+    const validationError = validateApiKeyFormat(trimmedKey, info);
+    if (validationError) {
+      apiKeyError.value = validationError;
+      return;
+    }
   }
 
   try {
     if (window.pywebview?.api) {
-      const result = await window.pywebview.api.set_api_key(trimmedKey);
+      const result = await window.pywebview.api.set_api_key(trimmedKey, configuringProvider.value);
       if (result.success) {
-        hasApiKey.value = true;
+        // Update local has_key status
+        const localProvider = providers.value.find(p => p.id === configuringProvider.value);
+        if (localProvider) localProvider.has_key = true;
+
+        // If we just configured the active provider, mark as having key
+        if (configuringProvider.value === selectedProvider.value) {
+          hasApiKey.value = true;
+        }
         showApiKeyPrompt.value = false;
         apiKeyInput.value = '';
         if (result.warning) {
@@ -192,7 +306,7 @@ async function saveApiKey() {
 async function sendMessageWithText(messageText: string) {
   if (!messageText.trim()) return;
   if (!hasApiKey.value) {
-    showApiKeyPrompt.value = true;
+    openSettings();
     return;
   }
 
@@ -341,6 +455,67 @@ async function copyMessage(messageId: string, text: string) {
   }
 }
 
+// Session management
+async function openSessionsModal() {
+  if (window.pywebview?.api) {
+    try {
+      const result = await window.pywebview.api.get_sessions();
+      if (result.success) {
+        sessions.value = result.sessions ?? [];
+      }
+    } catch (e) {
+      console.error('[UI] Failed to load sessions:', e);
+    }
+  }
+  showSessionsModal.value = true;
+}
+
+async function resumeSession(sessionId: string) {
+  if (!window.pywebview?.api) return;
+  try {
+    const result = await window.pywebview.api.resume_session(sessionId);
+    if (result.success && result.messages) {
+      messages.value = result.messages.map((m: any) => ({
+        id: generateMessageId(),
+        text: m.content,
+        sender: m.role === 'user' ? 'user' : 'assistant',
+        timestamp: new Date(),
+        isStreaming: false,
+      }));
+      saveMessages();
+    }
+  } catch (e) {
+    console.error('[UI] Failed to resume session:', e);
+  }
+  showSessionsModal.value = false;
+}
+
+async function exportSession(sessionId: string) {
+  if (!window.pywebview?.api) return;
+  try {
+    const result = await window.pywebview.api.export_session(sessionId);
+    if (result.success && result.content) {
+      const blob = new Blob([result.content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `session-${sessionId.substring(0, 8)}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+  } catch (e) {
+    console.error('[UI] Failed to export session:', e);
+  }
+}
+
+function formatSessionDate(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
 // Watchers
 watch(() => messages.value.length, () => { scrollToBottom(); });
 watch(() => {
@@ -365,16 +540,33 @@ onMounted(() => {
     <!-- API Key Prompt Modal -->
     <div v-if="showApiKeyPrompt" class="modal-overlay">
       <div class="modal-content">
-        <h3>Configure Gemini API Key</h3>
-        <p class="modal-description">
-          Please enter your Google Gemini API key to enable AI-powered chat functionality.
-          You can get your API key from the
-          <a href="https://makersuite.google.com/app/apikey" target="_blank">Google AI Studio</a>.
+        <h3>Configure API Key</h3>
+
+        <!-- Provider selector inside settings modal -->
+        <div class="modal-provider-selector">
+          <label class="modal-label">Provider:</label>
+          <div class="provider-tabs">
+            <button
+              v-for="p in providers"
+              :key="p.id"
+              :class="['provider-tab', { active: configuringProvider === p.id, 'has-key': p.has_key }]"
+              @click="selectProviderForConfig(p.id)"
+            >
+              {{ p.name }}
+              <span v-if="p.has_key" class="key-indicator" title="Key configured">✓</span>
+            </button>
+          </div>
+        </div>
+
+        <p class="modal-description" v-if="configuringProviderInfo">
+          Enter your {{ configuringProviderInfo.name }} API key.
+          Get your key from
+          <a :href="configuringProviderInfo.key_url" target="_blank">{{ configuringProviderInfo.key_url }}</a>.
         </p>
         <input
           v-model="apiKeyInput"
           type="password"
-          placeholder="Enter your Gemini API key..."
+          :placeholder="`Enter your ${configuringProviderInfo?.name ?? ''} API key...`"
           class="api-key-input"
           @keypress.enter="saveApiKey"
         />
@@ -393,13 +585,61 @@ onMounted(() => {
       </div>
     </div>
 
+    <!-- Sessions Modal -->
+    <div v-if="showSessionsModal" class="modal-overlay">
+      <div class="modal-content modal-wide">
+        <h3>Conversation Sessions</h3>
+        <div v-if="sessions.length === 0" class="sessions-empty">
+          No saved sessions found.
+        </div>
+        <div v-else class="sessions-list">
+          <div
+            v-for="session in sessions"
+            :key="session.session_id"
+            class="session-item"
+          >
+            <div class="session-info">
+              <span class="session-id">{{ session.session_id.substring(0, 8) }}…</span>
+              <span class="session-date">{{ formatSessionDate(session.started_at) }}</span>
+              <span class="session-count">{{ session.message_count }} messages</span>
+            </div>
+            <div class="session-actions">
+              <button @click="resumeSession(session.session_id)" class="btn-primary btn-sm">
+                Resume
+              </button>
+              <button @click="exportSession(session.session_id)" class="btn-secondary btn-sm">
+                Export
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button @click="showSessionsModal = false" class="btn-secondary">Close</button>
+        </div>
+      </div>
+    </div>
+
     <div class="chat-header">
       <div class="header-controls">
-        <template v-if="hasApiKey">
+        <!-- Provider selector — always visible so users can switch/configure providers -->
+        <template v-if="providers.length > 0">
+          <label for="provider-select" class="model-label">Provider:</label>
+          <select
+            id="provider-select"
+            v-model="selectedProvider"
+            class="model-select"
+            @change="onProviderChange"
+          >
+            <option v-for="p in providers" :key="p.id" :value="p.id">
+              {{ p.name }}{{ p.has_key ? '' : ' ⚠' }}
+            </option>
+          </select>
+
+          <!-- Model selector (provider-specific) -->
           <label for="model-select" class="model-label">Model:</label>
-          <select id="model-select" v-model="selectedModel" class="model-select">
-            <option v-for="model in availableModels" :key="model.value" :value="model.value">
-              {{ model.label }}
+          <select id="model-select" v-model="selectedModel" class="model-select" @change="onModelChange">
+            <option v-for="model in availableModels" :key="model.id" :value="model.id">
+              {{ model.name }}
             </option>
           </select>
         </template>
@@ -407,7 +647,10 @@ onMounted(() => {
         <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" :disabled="isLoading">
           <span class="material-icons">delete_sweep</span>
         </button>
-        <button @click="showApiKeyPrompt = true" class="icon-btn" title="Configure API Key">
+        <button @click="openSessionsModal" class="icon-btn" title="Conversation sessions">
+          <span class="material-icons">history</span>
+        </button>
+        <button @click="openSettings()" class="icon-btn" title="Configure API Keys">
           <span class="material-icons">settings</span>
         </button>
       </div>
@@ -417,7 +660,7 @@ onMounted(() => {
       <div v-if="messages.length === 0" class="welcome-message">
         <span class="material-icons welcome-icon">smart_toy</span>
         <p>Welcome to KiAssist!</p>
-        <p class="hint">Ask me anything about KiCAD or PCB design. Powered by Google Gemini.</p>
+        <p class="hint">Ask me anything about KiCAD or PCB design. Powered by {{ currentProviderInfo?.name ?? 'AI' }}.</p>
       </div>
 
       <div
@@ -1168,5 +1411,120 @@ button:disabled {
 
 .chat-messages::-webkit-scrollbar-thumb:hover {
   background: var(--text-secondary);
+}
+
+/* Multi-provider modal styles */
+.modal-provider-selector {
+  margin-bottom: 1rem;
+}
+
+.modal-label {
+  display: block;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+  margin-bottom: 0.375rem;
+}
+
+.provider-tabs {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.provider-tab {
+  padding: 0.375rem 0.75rem;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.provider-tab.active {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  background-color: rgba(88, 101, 242, 0.08);
+}
+
+.provider-tab.has-key {
+  color: var(--text-primary);
+}
+
+.provider-tab:hover:not(.active) {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+.key-indicator {
+  font-size: 0.75rem;
+  color: #22c55e;
+  font-weight: 700;
+}
+
+/* Wide modal for sessions */
+.modal-wide {
+  max-width: 560px;
+}
+
+/* Sessions list */
+.sessions-empty {
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  margin: 1rem 0;
+}
+
+.sessions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 320px;
+  overflow-y: auto;
+  margin-bottom: 1rem;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.625rem 0.75rem;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  gap: 0.75rem;
+}
+
+.session-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+}
+
+.session-id {
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+}
+
+.session-date {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.session-count {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.session-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
 }
 </style>
