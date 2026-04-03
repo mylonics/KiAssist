@@ -349,6 +349,75 @@ class TestSchematicAddJunctionAndNoConnect:
         assert lbl.text == "NET1"
 
 
+class TestLabelEffectsRoundTrip:
+    """Tests for Label / GlobalLabel / HierarchicalLabel effects serialisation."""
+
+    def test_label_effects_in_to_tree(self):
+        """Label.to_tree() includes an effects node."""
+        from kiassist_utils.kicad_parser.schematic import Label
+        from kiassist_utils.kicad_parser.models import Effects
+        lbl = Label(text="VCC")
+        lbl.effects = Effects(font_size=(1.27, 1.27), bold=False, italic=False)
+        tree = lbl.to_tree()
+        tags = [item[0] for item in tree if isinstance(item, list) and item]
+        assert "effects" in tags
+
+    def test_label_effects_survive_round_trip(self):
+        """Label effects survive a save → reload cycle."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        assert len(sch2.labels) == len(sch.labels)
+        # Labels should be parseable without errors after reload
+        for lbl in sch2.labels:
+            assert lbl.text != ""
+
+    def test_global_label_effects_in_to_tree(self):
+        """GlobalLabel.to_tree() includes an effects node."""
+        from kiassist_utils.kicad_parser.schematic import GlobalLabel
+        gl = GlobalLabel(text="VCC", shape="input")
+        tree = gl.to_tree()
+        tags = [item[0] for item in tree if isinstance(item, list) and item]
+        assert "effects" in tags
+
+    def test_hierarchical_label_effects_in_to_tree(self):
+        """HierarchicalLabel.to_tree() includes an effects node."""
+        from kiassist_utils.kicad_parser.schematic import HierarchicalLabel
+        hl = HierarchicalLabel(text="CLK", shape="output")
+        tree = hl.to_tree()
+        tags = [item[0] for item in tree if isinstance(item, list) and item]
+        assert "effects" in tags
+
+    def test_label_bold_effects_round_trip(self):
+        """Bold label effects survive serialization."""
+        from kiassist_utils.kicad_parser.schematic import Label
+        from kiassist_utils.kicad_parser.models import Effects, Position
+        from kiassist_utils.kicad_parser.sexpr import parse, serialize
+        lbl = Label(text="BOLD_NET", position=Position(10.0, 20.0, 0.0))
+        lbl.effects = Effects(font_size=(1.27, 1.27), bold=True)
+        tree = lbl.to_tree()
+        text = serialize(tree)
+        parsed = parse(text)
+        lbl2 = Label.from_tree(parsed)
+        assert lbl2.effects.bold is True
+        assert lbl2.text == "BOLD_NET"
+
+    def test_label_hide_effects_round_trip(self):
+        """Hidden label effects survive serialization."""
+        from kiassist_utils.kicad_parser.schematic import Label
+        from kiassist_utils.kicad_parser.models import Effects, Position
+        from kiassist_utils.kicad_parser.sexpr import parse, serialize
+        lbl = Label(text="HIDDEN_NET", position=Position(5.0, 5.0, 0.0))
+        lbl.effects = Effects(font_size=(1.27, 1.27), hide=True)
+        tree = lbl.to_tree()
+        text = serialize(tree)
+        parsed = parse(text)
+        lbl2 = Label.from_tree(parsed)
+        assert lbl2.effects.hide is True
+
+
 class TestSchematicTitleBlock:
     """Tests for TitleBlock parsing and round-trip."""
 

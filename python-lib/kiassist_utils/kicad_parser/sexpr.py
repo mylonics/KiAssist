@@ -81,8 +81,10 @@ def _tokenize(text: str) -> Iterator[Union[QStr, str, int, float]]:
 
         # Double-quoted string
         if c == '"':
+            start_i = i
             i += 1
             buf: list[str] = []
+            closed = False
             while i < n:
                 ch = text[i]
                 if ch == "\\" and i + 1 < n:
@@ -91,10 +93,15 @@ def _tokenize(text: str) -> Iterator[Union[QStr, str, int, float]]:
                     i += 2
                 elif ch == '"':
                     i += 1
+                    closed = True
                     break
                 else:
                     buf.append(ch)
                     i += 1
+            if not closed:
+                raise ValueError(
+                    f"Unterminated string starting at position {start_i}"
+                )
             yield QStr("".join(buf))
             continue
 
@@ -105,16 +112,14 @@ def _tokenize(text: str) -> Iterator[Union[QStr, str, int, float]]:
         atom = text[i:j]
         i = j
 
-        # Try to interpret as number
+        # Try to interpret as number — int first, then float (handles sci notation)
         try:
-            if "." in atom or (
-                "e" in atom.lower() and atom.lower().lstrip("-").replace("e", "", 1).replace(".", "", 1).isdigit()
-            ):
-                yield float(atom)
-            else:
-                yield int(atom)
+            yield int(atom)
         except ValueError:
-            yield atom  # plain str — unquoted identifier
+            try:
+                yield float(atom)
+            except ValueError:
+                yield atom  # plain str — unquoted identifier
 
 
 # ---------------------------------------------------------------------------

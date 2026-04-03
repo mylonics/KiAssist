@@ -212,3 +212,49 @@ class TestLibraryDiscovery:
         """_kicad_config_dir() returns a Path object."""
         result = _kicad_config_dir()
         assert isinstance(result, Path)
+
+    def test_resolve_symbol_library_with_kiprjmod(self):
+        """resolve_symbol_library() resolves ${KIPRJMOD}-based URIs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            # Create a real sym file in the project dir
+            sym_file = project_dir / "LocalLib.kicad_sym"
+            sym_file.write_text("(kicad_symbol_lib (version 20231120))\n")
+            content = (
+                '(sym_lib_table\n'
+                '  (lib (name "LocalLib") (type "KiCad") '
+                '(uri "${KIPRJMOD}/LocalLib.kicad_sym") (options "") (descr "local"))\n'
+                ')\n'
+            )
+            (project_dir / "sym-lib-table").write_text(content)
+            with mock.patch(
+                "kiassist_utils.kicad_parser.library._kicad_config_dir",
+                return_value=Path("/nonexistent/kicad/config"),
+            ):
+                disc = LibraryDiscovery(project_dir=project_dir)
+                result = disc.resolve_symbol_library("LocalLib")
+        assert result is not None
+        assert result == sym_file
+
+    def test_resolve_footprint_library_with_kiprjmod(self):
+        """resolve_footprint_library() resolves ${KIPRJMOD}-based URIs."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            # Create a real .pretty dir in the project dir
+            fp_dir = project_dir / "LocalFP.pretty"
+            fp_dir.mkdir()
+            content = (
+                '(fp_lib_table\n'
+                '  (lib (name "LocalFP") (type "KiCad") '
+                '(uri "${KIPRJMOD}/LocalFP.pretty") (options "") (descr "local"))\n'
+                ')\n'
+            )
+            (project_dir / "fp-lib-table").write_text(content)
+            with mock.patch(
+                "kiassist_utils.kicad_parser.library._kicad_config_dir",
+                return_value=Path("/nonexistent/kicad/config"),
+            ):
+                disc = LibraryDiscovery(project_dir=project_dir)
+                result = disc.resolve_footprint_library("LocalFP")
+        assert result is not None
+        assert result == fp_dir

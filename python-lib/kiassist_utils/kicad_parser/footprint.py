@@ -126,7 +126,7 @@ class Pad:
             QStr(self.number),
             self.type,
             self.shape,
-            ["at", self.position.x, self.position.y],
+            ["at", self.position.x, self.position.y, self.position.angle],
             ["size", self.size[0], self.size[1]],
         ]
         if self.drill:

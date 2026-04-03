@@ -256,3 +256,52 @@ class TestRoundTrip:
         text = r'(descr "Resistor SMD 0402 (1005 Metric)")'
         result = self._round_trip(text)
         assert result[1] == "Resistor SMD 0402 (1005 Metric)"
+
+
+class TestTokenizerEdgeCases:
+    """Tests for edge cases in the tokenizer."""
+
+    def test_unterminated_string_raises(self):
+        """An unterminated double-quoted string raises ValueError."""
+        with pytest.raises(ValueError, match="Unterminated string"):
+            parse('(text "unterminated')
+
+    def test_unterminated_string_with_escape_raises(self):
+        """Unterminated string after escape sequence raises ValueError."""
+        with pytest.raises(ValueError, match="Unterminated string"):
+            parse('(text "foo\\')
+
+    def test_scientific_notation_positive_exponent(self):
+        """Scientific notation with positive exponent parses as float."""
+        result = parse('(cap 1e3)')
+        assert isinstance(result[1], float)
+        assert result[1] == pytest.approx(1000.0)
+
+    def test_scientific_notation_negative_exponent(self):
+        """Scientific notation with negative exponent parses as float."""
+        result = parse('(cap 1e-3)')
+        assert isinstance(result[1], float)
+        assert result[1] == pytest.approx(0.001)
+
+    def test_scientific_notation_signed_coefficient(self):
+        """Negative scientific notation parses as float."""
+        result = parse('(at -2.5e+6)')
+        assert isinstance(result[1], float)
+        assert result[1] == pytest.approx(-2500000.0)
+
+    def test_scientific_notation_uppercase_e(self):
+        """Scientific notation with uppercase E parses as float."""
+        result = parse('(size 1E-6)')
+        assert isinstance(result[1], float)
+        assert result[1] == pytest.approx(1e-6)
+
+    def test_integer_stays_int(self):
+        """Plain integer (no dot, no e) parses as int not float."""
+        result = parse('(version 20231120)')
+        assert isinstance(result[1], int)
+
+    def test_empty_string_is_qstr(self):
+        """Empty quoted string parses as empty QStr."""
+        result = parse('(text "")')
+        assert isinstance(result[1], QStr)
+        assert result[1] == ""

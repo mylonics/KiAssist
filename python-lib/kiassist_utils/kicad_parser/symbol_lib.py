@@ -156,10 +156,14 @@ class SymbolUnit:
             unit.pins.append(Pin.from_tree(pin_tree))
         return unit
 
-    def to_tree(self) -> List[SExpr]:
+    def to_tree(self, parent_name: str = "") -> List[SExpr]:
         if self.raw_tree is not None:
             return self.raw_tree
-        return ["symbol", QStr(f"unit_{self.unit_number}_{self.style}")]
+        unit_name = f"{parent_name}_{self.unit_number}_{self.style}" if parent_name else f"unit_{self.unit_number}_{self.style}"
+        tree: List[SExpr] = ["symbol", QStr(unit_name)]
+        for pin in self.pins:
+            tree.append(pin.to_tree())
+        return tree
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +238,7 @@ class SymbolDef:
         if self.extends:
             tree.append(["extends", QStr(self.extends)])
         if self.pin_numbers_hide:
-            tree.append(["pin_numbers", "hide"])
+            tree.append(["pin_numbers", ["hide", "yes"]])
         tree.append(["pin_names", ["offset", self.pin_names_offset]])
         for p in self.properties:
             prop_node: List[SExpr] = ["property", QStr(p.key), QStr(p.value)]
@@ -249,7 +253,7 @@ class SymbolDef:
                 prop_node.append(["effects", font_node])
             tree.append(prop_node)
         for unit in self.units:
-            tree.append(unit.to_tree())
+            tree.append(unit.to_tree(parent_name=self.name))
         return tree
 
 

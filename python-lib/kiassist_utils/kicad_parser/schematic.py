@@ -85,6 +85,24 @@ def _parse_stroke(tree: List[SExpr]) -> Stroke:
     return stroke
 
 
+def _serialize_effects(eff: Effects) -> List[SExpr]:
+    """Serialize an :class:`Effects` object back to an S-expression list."""
+    font_node: List[SExpr] = [
+        "font",
+        ["size", eff.font_size[0], eff.font_size[1]],
+    ]
+    if eff.bold:
+        font_node.append("bold")
+    if eff.italic:
+        font_node.append("italic")
+    effects_node: List[SExpr] = ["effects", font_node]
+    if eff.justify:
+        effects_node.append(["justify", eff.justify])
+    if eff.hide:
+        effects_node.append(["hide", "yes"])
+    return effects_node
+
+
 def _parse_property(tree: List[SExpr]) -> Property:
     """Parse a ``(property "key" "value" …)`` sub-expression."""
     key = str(tree[1]) if len(tree) > 1 else ""
@@ -370,6 +388,7 @@ class Label:
             "label",
             QStr(self.text),
             ["at", self.position.x, self.position.y, self.position.angle],
+            _serialize_effects(self.effects),
         ]
         if self.uuid:
             tree.append(["uuid", QStr(self.uuid.value)])
@@ -410,6 +429,7 @@ class GlobalLabel:
             QStr(self.text),
             ["shape", self.shape],
             ["at", self.position.x, self.position.y, self.position.angle],
+            _serialize_effects(self.effects),
         ]
         if self.uuid:
             tree.append(["uuid", QStr(self.uuid.value)])
@@ -450,6 +470,7 @@ class HierarchicalLabel:
             QStr(self.text),
             ["shape", self.shape],
             ["at", self.position.x, self.position.y, self.position.angle],
+            _serialize_effects(self.effects),
         ]
         if self.uuid:
             tree.append(["uuid", QStr(self.uuid.value)])
