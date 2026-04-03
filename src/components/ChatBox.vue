@@ -13,7 +13,7 @@ const copiedMessageId = ref<string | null>(null);
 
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
-const selectedModel = ref('2.5-flash');
+const selectedModel = ref('3-flash');
 const hasApiKey = ref(false);
 const showApiKeyPrompt = ref(false);
 const apiKeyInput = ref('');
@@ -21,10 +21,9 @@ const isLoading = ref(false);
 const apiKeyWarning = ref<string>('');
 
 const availableModels = [
-  { value: '2.5-flash', label: 'Gemini 2.5 Flash' },
-  { value: '2.5-pro', label: 'Gemini 2.5 Pro' },
-  { value: '3-flash', label: 'Gemini 3.0 Flash' },
-  { value: '3-pro', label: 'Gemini 3.0 Pro' },
+  { value: '3.1-pro', label: 'Gemini 3.1 Pro' },
+  { value: '3-flash', label: 'Gemini 3 Flash' },
+  { value: '3.1-flash-lite', label: 'Gemini 3.1 Flash Lite' },
 ];
 
 function generateMessageId(): string {

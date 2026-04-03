@@ -103,7 +103,7 @@ class KiAssistAPI:
             traceback.print_exc()
             return {"success": False, "error": str(e)}
     
-    def send_message(self, message: str, model: str = "2.5-flash") -> dict:
+    def send_message(self, message: str, model: str = "3-flash") -> dict:
         """Send a message to Gemini API.
         
         Args:
@@ -238,12 +238,14 @@ class KiAssistAPI:
             # Get open KiCad instances
             open_instances = detect_kicad_instances()
             
-            # Get open project paths for comparison
+            # Get open project paths for comparison, and auto-add them to recent projects
             open_paths = set()
             for instance in open_instances:
                 project_path = instance.get('project_path', '')
                 if project_path:
                     open_paths.add(os.path.normpath(os.path.abspath(project_path)))
+                    # Automatically track every opened project in recent projects
+                    self.recent_projects_store.add_project(project_path)
             
             # Get recent projects (excluding currently open ones)
             all_recent = self.recent_projects_store.get_recent_projects()
@@ -318,7 +320,7 @@ class KiAssistAPI:
         return save_requirements_file(project_dir, requirements_content, todo_content)
     
     def refine_wizard_questions(self, initial_answers: Dict[str, str], 
-                               model: str = "2.5-flash") -> Dict[str, Any]:
+                               model: str = "3-flash") -> Dict[str, Any]:
         """Send initial answers to LLM to refine remaining questions.
         
         Args:
@@ -358,7 +360,7 @@ class KiAssistAPI:
     def synthesize_requirements(self, questions: List[Dict[str, Any]], 
                                answers: Dict[str, str],
                                project_name: str = "PCB Project",
-                               model: str = "2.5-flash") -> Dict[str, Any]:
+                               model: str = "3-flash") -> Dict[str, Any]:
         """Send all Q&A to LLM to synthesize requirements documents.
         
         Args:
@@ -473,12 +475,26 @@ def get_frontend_path() -> Path:
     return None
 
 
-def create_window(api: KiAssistAPI):
+def create_window(api: KiAssistAPI, dev_mode: bool = False):
     """Create and show the main application window.
     
     Args:
         api: The backend API instance
+        dev_mode: If True, connect to the Vite dev server for live reloading
     """
+    if dev_mode:
+        # Connect to Vite dev server for hot module replacement
+        url = "http://localhost:1420"
+        print(f"[DEBUG] Dev mode: loading from Vite dev server at {url}")
+        window = webview.create_window(
+            "KiAssist (Dev)",
+            url,
+            js_api=api,
+            width=800,
+            height=600,
+        )
+        return
+
     frontend_path = get_frontend_path()
     
     if frontend_path and (frontend_path / "index.html").exists():
@@ -522,8 +538,16 @@ def create_window(api: KiAssistAPI):
 
 def main():
     """Main entry point for the application."""
+    import argparse
+    parser = argparse.ArgumentParser(description="KiAssist - KiCAD AI Assistant")
+    parser.add_argument("--dev", action="store_true",
+                        help="Connect to Vite dev server (http://localhost:1420) for live reloading")
+    args = parser.parse_args()
+
     print("\n" + "="*60)
     print("KiAssist - KiCAD AI Assistant")
+    if args.dev:
+        print("  ** DEV MODE — connect to Vite dev server for HMR **")
     print("="*60)
     print("TIP: Open browser DevTools to see [UI] debug messages")
     print("     (Right-click in app > Inspect Element > Console tab)")
@@ -533,7 +557,7 @@ def main():
     api = KiAssistAPI()
     
     # Create the window
-    create_window(api)
+    create_window(api, dev_mode=args.dev)
     
     # Start the webview
     webview.start(debug=True)

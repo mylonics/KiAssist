@@ -24,12 +24,12 @@ class GeminiAPI:
         """
         self.client = genai.Client(api_key=api_key)
     
-    def send_message(self, message: str, model: str = "2.5-flash") -> str:
+    def send_message(self, message: str, model: str = "3-flash") -> str:
         """Send a message to Gemini and get a response.
         
         Args:
             message: The message to send
-            model: The model identifier (2.5-flash, 2.5-pro, etc.)
+            model: The model identifier (3-flash, 3.1-pro, etc.)
             
         Returns:
             The response text from Gemini
@@ -38,7 +38,7 @@ class GeminiAPI:
             Exception: If the API call fails
         """
         # Map model name to full Gemini model ID
-        model_id = self.MODEL_MAP.get(model, "gemini-2.0-flash")
+        model_id = self.MODEL_MAP.get(model, "gemini-3-flash-preview")
         
         try:
             response = self.client.models.generate_content(

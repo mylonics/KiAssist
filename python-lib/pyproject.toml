@@ -10,10 +10,10 @@ readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "pywebview>=5.0",
-    "google-genai>=1.52.0",
+    "google-genai>=1.70.0",
     "keyring>=24.0.0",
-    "kicad-python>=0.5.0",
-    "kicad-sch-api>=0.5.0",
+    "kicad-python>=0.6.0",
+    "kicad-sch-api>=0.5.6",
 ]
 authors = [
     {name = "KiAssist Contributors"}

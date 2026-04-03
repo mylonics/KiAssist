@@ -5,7 +5,7 @@ import RequirementsWizard from './RequirementsWizard.vue';
 
 // Configuration
 const MAX_VISIBLE_RECENT = 5;
-const REFRESH_INTERVAL_MS = 10000; // 10 seconds
+const REFRESH_INTERVAL_MS = 1000; // 3 seconds
 const MESSAGE_DISPLAY_DURATION_MS = 5000; // 5 seconds for success messages
 
 const openProjects = ref<KiCadInstance[]>([]);
@@ -13,6 +13,7 @@ const recentProjects = ref<RecentProject[]>([]);
 const selectedProject = ref<KiCadInstance | RecentProject | null>(null);
 const loading = ref(false);
 const error = ref<string>('');
+const switcherOpen = ref(false);
 const showAllRecent = ref(false);
 let refreshTimer: number | null = null;
 
@@ -24,6 +25,9 @@ const todoExists = ref(false);
 // Inject test state
 const injectingTest = ref(false);
 const injectTestMessage = ref<string>('');
+
+// Refs for click-outside detection
+const switcherRef = ref<HTMLElement | null>(null);
 
 async function waitForAPI(maxAttempts = 20, delayMs = 100): Promise<boolean> {
   for (let i = 0; i < maxAttempts; i++) {
@@ -53,6 +57,28 @@ async function refreshProjectsList() {
       openProjects.value = result.open_projects;
       recentProjects.value = result.recent_projects;
       
+      // Sync selected project with refreshed data so updated paths are reflected
+      if (selectedProject.value && 'socket_path' in selectedProject.value) {
+        const currentSocket = selectedProject.value.socket_path;
+        const updated = result.open_projects.find(
+          (p: KiCadInstance) => p.socket_path === currentSocket
+        );
+        if (updated) {
+          selectedProject.value = updated;
+        }
+      } else if ('path' in (selectedProject.value || {})) {
+        // If a recent project was selected, check if it's now open in KiCad
+        const currentPath = (selectedProject.value as RecentProject)?.path?.toLowerCase();
+        if (currentPath) {
+          const nowOpen = result.open_projects.find(
+            (p: KiCadInstance) => p.project_path.toLowerCase() === currentPath
+          );
+          if (nowOpen) {
+            selectedProject.value = nowOpen;
+          }
+        }
+      }
+      
       // Auto-select if only one open project
       if (result.open_projects.length === 1 && !selectedProject.value) {
         selectedProject.value = result.open_projects[0];
@@ -69,6 +95,7 @@ async function refreshProjectsList() {
 }
 
 async function browseForProject() {
+  switcherOpen.value = false;
   try {
     const apiAvailable = await waitForAPI();
     if (!apiAvailable) {
@@ -79,13 +106,8 @@ async function browseForProject() {
     const result = await window.pywebview!.api.browse_for_project();
     
     if (result.success && result.path) {
-      // Add to recent projects
       await window.pywebview!.api.add_recent_project(result.path);
-      
-      // Refresh the list
       await refreshProjectsList();
-      
-      // Select the newly added project
       const newProject = recentProjects.value.find(p => p.path === result.path);
       if (newProject) {
         selectProject(newProject, false);
@@ -101,10 +123,20 @@ async function browseForProject() {
 
 function selectProject(project: KiCadInstance | RecentProject, isOpen: boolean) {
   selectedProject.value = project;
+  switcherOpen.value = false;
   
-  // Add to recent projects if selecting from recent list
   if (!isOpen && 'path' in project) {
     window.pywebview?.api.add_recent_project(project.path);
+  }
+}
+
+function toggleSwitcher() {
+  switcherOpen.value = !switcherOpen.value;
+}
+
+function handleClickOutside(event: MouseEvent) {
+  if (switcherRef.value && !switcherRef.value.contains(event.target as Node)) {
+    switcherOpen.value = false;
   }
 }
 
@@ -115,20 +147,6 @@ function isProjectOpen(project: RecentProject): boolean {
   );
 }
 
-function getProjectName(project: KiCadInstance | RecentProject): string {
-  if ('display_name' in project) {
-    return project.display_name || project.project_name;
-  }
-  return project.name;
-}
-
-function getProjectPath(project: KiCadInstance | RecentProject): string {
-  if ('project_path' in project) {
-    return project.project_path;
-  }
-  return project.path;
-}
-
 function copyError() {
   if (error.value) {
     navigator.clipboard.writeText(error.value);
@@ -136,9 +154,7 @@ function copyError() {
 }
 
 function startRefreshTimer() {
-  if (refreshTimer) {
-    clearInterval(refreshTimer);
-  }
+  if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = window.setInterval(() => {
     refreshProjectsList();
   }, REFRESH_INTERVAL_MS);
@@ -151,53 +167,86 @@ function stopRefreshTimer() {
   }
 }
 
-// Computed properties
-const visibleRecentProjects = computed(() => {
-  if (showAllRecent.value) {
-    return recentProjects.value;
+// Helpers
+function fileName(fullPath: string): string {
+  if (!fullPath) return '';
+  const sep = Math.max(fullPath.lastIndexOf('/'), fullPath.lastIndexOf('\\'));
+  return sep >= 0 ? fullPath.substring(sep + 1) : fullPath;
+}
+
+function getProjectName(project: KiCadInstance | RecentProject): string {
+  if ('display_name' in project) {
+    return project.display_name || project.project_name;
   }
-  return recentProjects.value.slice(0, MAX_VISIBLE_RECENT);
-});
+  return project.name;
+}
 
-const hasMoreRecentProjects = computed(() => {
-  return recentProjects.value.length > MAX_VISIBLE_RECENT;
-});
-
+// Computed properties
 const selectedProjectInfo = computed(() => {
   if (!selectedProject.value) return null;
   
-  // Check if it's a KiCadInstance (has socket_path)
   if ('socket_path' in selectedProject.value) {
+    const inst = selectedProject.value;
     return {
-      name: selectedProject.value.display_name || selectedProject.value.project_name,
-      projectPath: selectedProject.value.project_path,
-      pcbPath: selectedProject.value.pcb_path,
-      schematicPath: selectedProject.value.schematic_path,
-      isOpen: true
+      name: inst.display_name || inst.project_name,
+      projectPath: inst.project_path,
+      pcbPath: inst.pcb_path,
+      schematicPath: inst.schematic_path,
+      isOpen: true,
+      pcbOpen: inst.pcb_open ?? false,
+      schematicOpen: inst.schematic_open ?? false,
     };
   }
   
   // It's a RecentProject
+  const rp = selectedProject.value;
   return {
-    name: selectedProject.value.name,
-    projectPath: selectedProject.value.path,
-    pcbPath: '',
-    schematicPath: '',
-    isOpen: isProjectOpen(selectedProject.value)
+    name: rp.name,
+    projectPath: rp.path,
+    pcbPath: rp.pcb_path || '',
+    schematicPath: rp.schematic_path || '',
+    isOpen: isProjectOpen(rp),
+    pcbOpen: false,
+    schematicOpen: false,
   };
 });
 
-// Get project directory from project path
 const selectedProjectDir = computed(() => {
   if (!selectedProjectInfo.value) return '';
   const path = selectedProjectInfo.value.projectPath;
-  // Remove filename to get directory
   const lastSep = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
   return lastSep > 0 ? path.substring(0, lastSep) : path;
 });
 
 const selectedProjectName = computed(() => {
   return selectedProjectInfo.value?.name || 'Project';
+});
+
+const switcherLabel = computed(() => {
+  if (!selectedProjectInfo.value) return 'Select Project';
+  return selectedProjectInfo.value.name;
+});
+
+// Dropdown items: open projects not currently selected, then recents
+const otherOpenProjects = computed(() => {
+  return openProjects.value.filter(p => {
+    if (!selectedProject.value) return true;
+    if ('socket_path' in selectedProject.value) {
+      return p.socket_path !== selectedProject.value.socket_path;
+    }
+    return true;
+  });
+});
+
+const switcherRecentProjects = computed(() => {
+  // Exclude any recent project that matches a currently open one
+  const openPaths = new Set(openProjects.value.map(p => p.project_path.toLowerCase()));
+  const sel = selectedProject.value;
+  const selPath = sel && 'path' in sel ? (sel as RecentProject).path.toLowerCase() : '';
+  return recentProjects.value.filter(p => {
+    const norm = p.path.toLowerCase();
+    return !openPaths.has(norm) && norm !== selPath;
+  });
 });
 
 // Check requirements file when project changes
@@ -259,7 +308,6 @@ async function injectTestNote() {
     
     if (result.success) {
       injectTestMessage.value = result.message || 'Test note injected successfully!';
-      // Clear message after the configured duration
       setTimeout(() => {
         injectTestMessage.value = '';
       }, MESSAGE_DISPLAY_DURATION_MS);
@@ -282,155 +330,148 @@ watch(selectedProject, () => {
 onMounted(() => {
   refreshProjectsList();
   startRefreshTimer();
+  document.addEventListener('click', handleClickOutside);
 });
 
 onUnmounted(() => {
   stopRefreshTimer();
+  document.removeEventListener('click', handleClickOutside);
 });
 </script>
 
 <template>
   <div class="kicad-selector">
-    <div class="selector-header">
-      <h3>KiCAD Connection</h3>
-      <button @click="refreshProjectsList" :disabled="loading" class="refresh-btn" :title="loading ? 'Refreshing...' : 'Refresh'">
-        <span class="material-icons" :class="{ spinning: loading }">{{ loading ? 'sync' : 'refresh' }}</span>
+    <!-- Project Switcher -->
+    <div class="switcher-wrapper" ref="switcherRef">
+      <button class="switcher-btn" @click="toggleSwitcher">
+        <span class="switcher-label">{{ switcherLabel }}</span>
+        <span class="material-icons switcher-arrow">{{ switcherOpen ? 'expand_less' : 'expand_more' }}</span>
       </button>
+
+      <div v-if="switcherOpen" class="switcher-dropdown">
+        <!-- Open in KiCad -->
+        <div v-if="otherOpenProjects.length > 0" class="dropdown-section">
+          <div class="dropdown-section-label">Open in KiCAD</div>
+          <button
+            v-for="project in otherOpenProjects"
+            :key="project.socket_path"
+            class="dropdown-item"
+            @click="selectProject(project, true)"
+          >
+            <span class="material-icons dropdown-item-icon open">memory</span>
+            <span class="dropdown-item-text">{{ getProjectName(project) }}</span>
+          </button>
+        </div>
+
+        <!-- Recent Projects -->
+        <div v-if="switcherRecentProjects.length > 0" class="dropdown-section">
+          <div class="dropdown-section-label">Recent</div>
+          <button
+            v-for="project in (showAllRecent ? switcherRecentProjects : switcherRecentProjects.slice(0, MAX_VISIBLE_RECENT))"
+            :key="project.path"
+            class="dropdown-item"
+            @click="selectProject(project, false)"
+          >
+            <span class="material-icons dropdown-item-icon">folder</span>
+            <span class="dropdown-item-text">{{ project.name }}</span>
+          </button>
+          <button
+            v-if="switcherRecentProjects.length > MAX_VISIBLE_RECENT"
+            class="dropdown-item show-more"
+            @click.stop="showAllRecent = !showAllRecent"
+          >
+            <span class="material-icons dropdown-item-icon">{{ showAllRecent ? 'expand_less' : 'expand_more' }}</span>
+            <span class="dropdown-item-text">{{ showAllRecent ? 'Show less' : `${switcherRecentProjects.length - MAX_VISIBLE_RECENT} more...` }}</span>
+          </button>
+        </div>
+
+        <!-- Empty state -->
+        <div v-if="otherOpenProjects.length === 0 && switcherRecentProjects.length === 0" class="dropdown-empty">
+          No other projects
+        </div>
+
+        <!-- Browse -->
+        <div class="dropdown-section dropdown-browse">
+          <button class="dropdown-item browse" @click="browseForProject">
+            <span class="material-icons dropdown-item-icon">folder_open</span>
+            <span class="dropdown-item-text">Browse for Project...</span>
+          </button>
+        </div>
+      </div>
     </div>
 
+    <!-- Error -->
     <div v-if="error" class="error-message">
       <span class="material-icons error-icon">warning</span>
       <span class="error-text">{{ error }}</span>
-      <button @click="copyError" class="copy-btn" title="Copy error message">
+      <button @click="copyError" class="copy-btn" title="Copy error">
         <span class="material-icons">content_copy</span>
       </button>
     </div>
 
-    <div v-else class="projects-container">
-      <!-- Open Projects Section -->
-      <div v-if="openProjects.length > 0" class="section">
-        <div class="section-header">
-          <span class="material-icons section-icon">desktop_windows</span>
-          <span class="section-title">Open in KiCAD</span>
-        </div>
-        <div class="project-list">
-          <button
-            v-for="project in openProjects"
-            :key="project.socket_path"
-            class="project-item"
-            :class="{ selected: selectedProject === project }"
-            @click="selectProject(project, true)"
-          >
-            <span class="material-icons status-icon open">check_circle</span>
-            <div class="project-info">
-              <div class="project-name">{{ getProjectName(project) }}</div>
-              <div class="project-path" :title="getProjectPath(project)">{{ getProjectPath(project) }}</div>
-            </div>
-          </button>
-        </div>
+    <!-- Project Status Rows -->
+    <div v-if="selectedProjectInfo" class="status-panel">
+      <!-- Project row -->
+      <div class="status-row" :title="selectedProjectInfo.projectPath">
+        <span class="status-dot" :class="{ active: selectedProjectInfo.isOpen }"></span>
+        <span class="status-label">Project</span>
+        <span class="status-value">{{ selectedProjectInfo.projectPath ? fileName(selectedProjectInfo.projectPath) : '—' }}</span>
       </div>
 
-      <!-- Recent Projects Section -->
-      <div v-if="recentProjects.length > 0" class="section">
-        <div class="section-header">
-          <span class="material-icons section-icon">history</span>
-          <span class="section-title">Recent Projects</span>
-        </div>
-        <div class="project-list">
-          <button
-            v-for="project in visibleRecentProjects"
-            :key="project.path"
-            class="project-item"
-            :class="{ selected: selectedProject === project }"
-            @click="selectProject(project, false)"
-          >
-            <span class="material-icons status-icon" :class="{ open: isProjectOpen(project) }">
-              {{ isProjectOpen(project) ? 'check_circle' : 'folder' }}
-            </span>
-            <div class="project-info">
-              <div class="project-name">{{ project.name }}</div>
-              <div class="project-path" :title="project.path">{{ project.path }}</div>
-            </div>
-          </button>
-        </div>
-        <button
-          v-if="hasMoreRecentProjects"
-          class="show-more-btn"
-          @click="showAllRecent = !showAllRecent"
-        >
-          <span class="material-icons">{{ showAllRecent ? 'expand_less' : 'expand_more' }}</span>
-          {{ showAllRecent ? 'Show less' : `Show ${recentProjects.length - MAX_VISIBLE_RECENT} more` }}
-        </button>
+      <!-- PCB row -->
+      <div class="status-row" :title="selectedProjectInfo.pcbPath">
+        <span class="status-dot" :class="{ active: selectedProjectInfo.pcbOpen }"></span>
+        <span class="status-label">PCB</span>
+        <span class="status-value">{{ selectedProjectInfo.pcbPath ? fileName(selectedProjectInfo.pcbPath) : '—' }}</span>
       </div>
 
-      <!-- No projects message -->
-      <div v-if="openProjects.length === 0 && recentProjects.length === 0 && !loading" class="no-projects">
-        <span class="material-icons">folder_off</span>
-        <p>No projects found</p>
-        <p class="hint">Open KiCAD or browse for a project</p>
-      </div>
-
-      <!-- Browse Button - Always visible -->
-      <div class="browse-section">
-        <button class="browse-btn" @click="browseForProject">
-          <span class="material-icons">folder_open</span>
-          Browse for Project...
-        </button>
+      <!-- Schematic row -->
+      <div class="status-row" :title="selectedProjectInfo.schematicPath">
+        <span class="status-dot" :class="{ active: selectedProjectInfo.schematicOpen }"></span>
+        <span class="status-label">Schematic</span>
+        <span class="status-value">{{ selectedProjectInfo.schematicPath ? fileName(selectedProjectInfo.schematicPath) : '—' }}</span>
       </div>
     </div>
 
-    <!-- Selected Project Info -->
-    <div v-if="selectedProjectInfo" class="selected-info">
-      <div class="connection-status" :class="{ connected: selectedProjectInfo.isOpen }">
-        <span class="status-dot"></span>
-        {{ selectedProjectInfo.isOpen ? 'Connected to KiCAD' : 'Project Selected' }}
+    <!-- No project selected -->
+    <div v-else-if="!loading" class="no-project">
+      <span class="material-icons">folder_off</span>
+      <p>No project selected</p>
+      <p class="hint">Open KiCAD or browse for a project</p>
+    </div>
+
+    <!-- Requirements Status -->
+    <div v-if="selectedProjectInfo" class="requirements-section">
+      <div class="requirements-status" :class="{ exists: requirementsExists }">
+        <span class="material-icons req-icon">{{ requirementsExists ? 'check_circle' : 'error_outline' }}</span>
+        <span class="status-text">{{ requirementsExists ? 'requirements.md' : 'No requirements.md' }}</span>
       </div>
-      <div class="info-row" v-if="selectedProjectInfo.projectPath">
-        <span class="label">Project:</span>
-        <span class="value" :title="selectedProjectInfo.projectPath">{{ selectedProjectInfo.projectPath }}</span>
-      </div>
-      <div class="info-row" v-if="selectedProjectInfo.pcbPath">
-        <span class="label">PCB:</span>
-        <span class="value" :title="selectedProjectInfo.pcbPath">{{ selectedProjectInfo.pcbPath }}</span>
-      </div>
-      <div class="info-row" v-if="selectedProjectInfo.schematicPath">
-        <span class="label">Schematic:</span>
-        <span class="value" :title="selectedProjectInfo.schematicPath">{{ selectedProjectInfo.schematicPath }}</span>
-      </div>
-      
-      <!-- Requirements Status -->
-      <div class="requirements-section">
-        <div class="requirements-status" :class="{ exists: requirementsExists }">
-          <span class="material-icons status-icon">{{ requirementsExists ? 'check_circle' : 'error_outline' }}</span>
-          <span class="status-text">{{ requirementsExists ? 'requirements.md exists' : 'No requirements.md' }}</span>
-        </div>
-        <button 
-          @click="openRequirementsWizard" 
-          class="requirements-btn"
-          :title="requirementsExists ? 'Update requirements' : 'Create requirements'"
-        >
-          <span class="material-icons">{{ requirementsExists ? 'edit' : 'add' }}</span>
-          {{ requirementsExists ? 'Edit' : 'Create' }}
-        </button>
-      </div>
-      
-      <!-- Inject Test Section -->
-      <div class="inject-test-section">
-        <button 
-          @click="injectTestNote" 
-          class="inject-test-btn"
-          :disabled="injectingTest || !selectedProjectInfo.projectPath"
-          title="Add a test note to the schematic"
-        >
-          <span class="material-icons" :class="{ spinning: injectingTest }">
-            {{ injectingTest ? 'sync' : 'science' }}
-          </span>
-          {{ injectingTest ? 'Injecting...' : 'Inject Test' }}
-        </button>
-        <div v-if="injectTestMessage" class="inject-test-message success">
-          <span class="material-icons">check_circle</span>
-          {{ injectTestMessage }}
-        </div>
+      <button 
+        @click="openRequirementsWizard" 
+        class="requirements-btn"
+        :title="requirementsExists ? 'Update requirements' : 'Create requirements'"
+      >
+        <span class="material-icons">{{ requirementsExists ? 'edit' : 'add' }}</span>
+        {{ requirementsExists ? 'Edit' : 'Create' }}
+      </button>
+    </div>
+
+    <!-- Inject Test Section -->
+    <div v-if="selectedProjectInfo" class="inject-test-section">
+      <button 
+        @click="injectTestNote" 
+        class="inject-test-btn"
+        :disabled="injectingTest || !selectedProjectInfo.projectPath"
+        title="Add a test note to the schematic"
+      >
+        <span class="material-icons" :class="{ spinning: injectingTest }">
+          {{ injectingTest ? 'sync' : 'science' }}
+        </span>
+        {{ injectingTest ? 'Injecting...' : 'Inject Test' }}
+      </button>
+      <div v-if="injectTestMessage" class="inject-test-message success">
+        <span class="material-icons">check_circle</span>
+        {{ injectTestMessage }}
       </div>
     </div>
     

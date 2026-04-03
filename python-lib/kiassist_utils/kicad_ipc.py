@@ -1,7 +1,9 @@
 """KiCad IPC instance detection module."""
 
+import json
 import os
 import platform
+import re
 import subprocess
 from pathlib import Path
 from tempfile import gettempdir
@@ -17,7 +19,8 @@ class KiCadInstance:
     
     def __init__(self, socket_path: str, project_name: str = "Unknown Project", 
                  display_name: str = "", version: str = "", project_path: str = "",
-                 pcb_path: str = "", schematic_path: str = ""):
+                 pcb_path: str = "", schematic_path: str = "",
+                 pcb_open: bool = False, schematic_open: bool = False):
         """Initialize KiCad instance.
         
         Args:
@@ -28,6 +31,8 @@ class KiCadInstance:
             project_path: Path to the project file
             pcb_path: Path to the PCB file
             schematic_path: Path to the schematic file
+            pcb_open: Whether the PCB editor is confirmed open
+            schematic_open: Whether the schematic editor is confirmed open
         """
         self.socket_path = socket_path
         self.project_name = project_name
@@ -36,8 +41,10 @@ class KiCadInstance:
         self.project_path = project_path
         self.pcb_path = pcb_path
         self.schematic_path = schematic_path
+        self.pcb_open = pcb_open
+        self.schematic_open = schematic_open
     
-    def to_dict(self) -> Dict[str, str]:
+    def to_dict(self) -> Dict[str, Any]:
         """Convert instance to dictionary.
         
         Returns:
@@ -51,6 +58,8 @@ class KiCadInstance:
             "project_path": self.project_path,
             "pcb_path": self.pcb_path,
             "schematic_path": self.schematic_path,
+            "pcb_open": self.pcb_open,
+            "schematic_open": self.schematic_open,
         }
 
 
@@ -169,6 +178,222 @@ def socket_path_to_uri(socket_file: Path) -> str:
     return f"ipc://{socket_file}"
 
 
+def _get_kicad_file_history() -> List[str]:
+    """Read KiCad's recent project file history from its config.
+    
+    Returns:
+        List of .kicad_pro file paths from KiCad's file_history, newest first.
+    """
+    try:
+        if _CURRENT_PLATFORM == "Windows":
+            appdata = os.environ.get('APPDATA', '')
+            if not appdata:
+                return []
+            config_base = Path(appdata) / "kicad"
+        else:
+            config_base = Path.home() / ".config" / "kicad"
+        
+        if not config_base.exists():
+            return []
+        
+        # Find the newest kicad.json (highest version number)
+        candidates = []
+        for d in config_base.iterdir():
+            kicad_json = d / "kicad.json"
+            if d.is_dir() and kicad_json.exists():
+                candidates.append(kicad_json)
+        
+        # Sort by version number descending (e.g. 10.0 > 9.0)
+        def version_key(p: Path) -> float:
+            try:
+                return float(p.parent.name)
+            except ValueError:
+                return 0.0
+        candidates.sort(key=version_key, reverse=True)
+        
+        # Merge histories from all versions, newest first, deduplicating
+        seen: set = set()
+        merged: list = []
+        for kicad_json in candidates:
+            try:
+                with open(kicad_json, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                history = data.get('system', {}).get('file_history', [])
+                for h in history:
+                    if isinstance(h, str) and h not in seen:
+                        seen.add(h)
+                        merged.append(h)
+            except Exception:
+                continue
+        
+        return merged
+    except Exception:
+        return []
+
+
+def _get_kicad_process_info() -> List[Dict[str, str]]:
+    """Get info about running KiCad processes.
+    
+    Returns:
+        List of dicts with 'pid' and 'title' keys.
+    """
+    results = []
+    try:
+        if _CURRENT_PLATFORM == "Windows":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            result = subprocess.run(
+                ['powershell', '-Command',
+                 "Get-Process | Where-Object {$_.ProcessName -like '*kicad*' -and $_.MainWindowTitle -ne ''} "
+                 "| ForEach-Object { $_.Id.ToString() + '|' + $_.MainWindowTitle }"],
+                capture_output=True, text=True, timeout=5,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if '|' in line:
+                        pid, title = line.split('|', 1)
+                        results.append({'pid': pid.strip(), 'title': title.strip()})
+        else:
+            # On Linux, try wmctrl or xdotool
+            result = subprocess.run(
+                ['wmctrl', '-l', '-p'],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    if 'kicad' in line.lower():
+                        parts = line.split(None, 4)
+                        if len(parts) >= 5:
+                            results.append({'pid': parts[2], 'title': parts[4]})
+    except Exception:
+        pass
+    return results
+
+
+def _extract_project_name_from_title(title: str) -> Optional[str]:
+    """Extract the project name from a KiCad window title.
+    
+    Window titles follow patterns like:
+        "project_name \u2014 KiCad"
+        "project_name \u2014 PCB Editor"
+        "project_name \u2014 Schematic Editor"
+        "project_name - PCB Editor"
+    
+    Returns:
+        Project name or None
+    """
+    if not title:
+        return None
+    
+    # Split on em-dash (\u2014) or regular dash with spaces
+    for sep in ['\u2014', ' \u2014 ', ' - ']:
+        if sep in title:
+            name = title.split(sep)[0].strip()
+            if name:
+                return name
+    
+    return None
+
+
+def _find_project_path_for_name(project_name: str, file_history: List[str]) -> Optional[str]:
+    """Find the project directory path matching a project name in the file history.
+    
+    Args:
+        project_name: Project name (e.g. 'myl-dbg')
+        file_history: List of .kicad_pro file paths
+    
+    Returns:
+        Project directory path or None
+    """
+    for pro_file in file_history:
+        pro_path = Path(pro_file)
+        if pro_path.stem == project_name:
+            # Return the parent directory (project directory)
+            project_dir = pro_path.parent
+            if project_dir.exists():
+                return str(project_dir)
+    return None
+
+
+def _fallback_detect_project(socket_path: str) -> Optional[Dict[str, str]]:
+    """Fallback: detect project from KiCad process window title + config file history.
+    
+    Used when the IPC API cannot provide project info (e.g. no editor frames open).
+    
+    Args:
+        socket_path: The IPC socket path (used to match PID for multi-instance)
+    
+    Returns:
+        Dict with project_name, project_path, or None
+    """
+    try:
+        processes = _get_kicad_process_info()
+        if not processes:
+            return None
+        
+        # Try to match socket to process via PID embedded in socket filename
+        # Socket format: ipc://...\api-<PID>.sock or ipc://...\api.sock
+        target_pid = None
+        sock_basename = Path(socket_path.replace('ipc://', '')).name
+        pid_match = re.match(r'api-(\d+)\.sock', sock_basename)
+        if pid_match:
+            target_pid = pid_match.group(1)
+        
+        # Find the matching process
+        proc_info = None
+        if target_pid:
+            for p in processes:
+                if p['pid'] == target_pid:
+                    proc_info = p
+                    break
+        
+        # For api.sock (no PID), find the process that does NOT have its own
+        # api-<PID>.sock socket — those PIDs are claimed by other sockets.
+        if not proc_info and not target_pid:
+            claimed_pids = set()
+            try:
+                all_sockets = discover_socket_files()
+                for s in all_sockets:
+                    m = re.match(r'api-(\d+)\.sock', s.name)
+                    if m:
+                        claimed_pids.add(m.group(1))
+            except Exception:
+                pass
+            
+            # Pick the first process whose PID is not claimed by another socket
+            for p in processes:
+                if p['pid'] not in claimed_pids:
+                    proc_info = p
+                    break
+            
+            # Last resort: first process
+            if not proc_info:
+                proc_info = processes[0]
+        
+        if not proc_info:
+            return None
+        
+        project_name = _extract_project_name_from_title(proc_info['title'])
+        if not project_name:
+            return None
+        
+        # Look up full path from file history
+        file_history = _get_kicad_file_history()
+        project_path = _find_project_path_for_name(project_name, file_history)
+        
+        return {
+            'project_name': project_name,
+            'project_path': project_path or '',
+        }
+    except Exception:
+        return None
+
+
 def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
     """Try to connect to a KiCad instance and retrieve its information.
     
@@ -207,35 +432,52 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
         project_path = ""
         pcb_path = ""
         schematic_path = ""
+        pcb_open = False
+        schematic_open = False
+        
+        # Try to get project info via DOCTYPE_PROJECT first
+        try:
+            project_docs = kicad.get_open_documents(base_types_pb2.DocumentType.DOCTYPE_PROJECT)
+            if project_docs and len(project_docs) > 0:
+                doc = project_docs[0]
+                if doc.project and doc.project.path:
+                    project_path = doc.project.path
+                    project_name = Path(project_path).stem
+        except Exception:
+            pass  # Expected if not supported
         
         try:
             # Get PCB documents
             pcb_docs = kicad.get_open_documents(base_types_pb2.DocumentType.DOCTYPE_PCB)
             if pcb_docs and len(pcb_docs) > 0:
+                pcb_open = True
                 doc = pcb_docs[0]
-                project_path = doc.project.path
-                project_name = Path(project_path).stem
+                if not project_path and doc.project and doc.project.path:
+                    project_path = doc.project.path
+                    project_name = Path(project_path).stem
                 # Try to get the PCB file path from the document
                 try:
-                    # Try different attributes that might contain the path
-                    if hasattr(doc, 'path'):
+                    if hasattr(doc, 'board_filename') and doc.board_filename:
+                        pcb_path = doc.board_filename
+                    elif hasattr(doc, 'path'):
                         pcb_path = doc.path
                     elif hasattr(doc, 'file_path'):
                         pcb_path = doc.file_path
-                    elif hasattr(doc, 'filename'):
-                        pcb_path = doc.filename
                 except Exception as e:
                     print(f"Could not get PCB path from document: {e}")
         except Exception as e:
-            print(f"Could not get PCB documents: {e}")
+            # "no handler available" is expected when KiCad PCB editor isn't open yet
+            if "no handler" not in str(e).lower():
+                print(f"Could not get PCB documents: {e}")
         
         try:
             # Get schematic documents
             sch_docs = kicad.get_open_documents(base_types_pb2.DocumentType.DOCTYPE_SCHEMATIC)
             if sch_docs and len(sch_docs) > 0:
+                schematic_open = True
                 doc = sch_docs[0]
                 # Use project path from schematic if not set yet
-                if not project_path:
+                if not project_path and doc.project and doc.project.path:
                     project_path = doc.project.path
                     project_name = Path(project_path).stem
                 # Try to get the schematic file path from the document
@@ -244,33 +486,43 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
                         schematic_path = doc.path
                     elif hasattr(doc, 'file_path'):
                         schematic_path = doc.file_path
-                    elif hasattr(doc, 'filename'):
-                        schematic_path = doc.filename
                 except Exception as e:
                     print(f"Could not get schematic path from document: {e}")
         except Exception as e:
-            print(f"Could not get schematic documents: {e}")
+            # "no handler available" is expected when KiCad schematic editor isn't open yet
+            if "no handler" not in str(e).lower():
+                print(f"Could not get schematic documents: {e}")
         
-        # If we have a project path but no file paths, try to find them in the project directory
-        if project_path and (not pcb_path or not schematic_path):
+        # Fallback: if IPC didn't give us a project, try process window title
+        if not project_path:
+            fallback = _fallback_detect_project(socket_path)
+            if fallback:
+                project_name = fallback['project_name']
+                project_path = fallback.get('project_path', '')
+        
+        # Always try to guess missing file paths from the project directory
+        if project_path:
             try:
                 project_dir = Path(project_path)
                 if project_dir.is_dir():
-                    # Look for .kicad_pcb file
                     if not pcb_path:
-                        pcb_files = list(project_dir.glob("*.kicad_pcb"))
-                        if pcb_files:
-                            pcb_path = str(pcb_files[0])
+                        # Prefer file matching project name
+                        expected_pcb = project_dir / f"{project_name}.kicad_pcb"
+                        if expected_pcb.exists():
+                            pcb_path = str(expected_pcb)
+                        else:
+                            pcb_files = list(project_dir.glob("*.kicad_pcb"))
+                            if pcb_files:
+                                pcb_path = str(pcb_files[0])
                     
-                    # Look for .kicad_sch file (root schematic)
                     if not schematic_path:
-                        sch_files = list(project_dir.glob("*.kicad_sch"))
-                        # Try to find the root schematic (usually same name as project)
-                        root_sch = project_dir / f"{project_name}.kicad_sch"
-                        if root_sch.exists():
-                            schematic_path = str(root_sch)
-                        elif sch_files:
-                            schematic_path = str(sch_files[0])
+                        expected_sch = project_dir / f"{project_name}.kicad_sch"
+                        if expected_sch.exists():
+                            schematic_path = str(expected_sch)
+                        else:
+                            sch_files = list(project_dir.glob("*.kicad_sch"))
+                            if sch_files:
+                                schematic_path = str(sch_files[0])
             except Exception as e:
                 print(f"Could not search project directory: {e}")
         
@@ -283,7 +535,9 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
             version=version_str,
             project_path=project_path,
             pcb_path=pcb_path,
-            schematic_path=schematic_path
+            schematic_path=schematic_path,
+            pcb_open=pcb_open,
+            schematic_open=schematic_open
         )
     except Exception as e:
         print(f"Warning: Could not probe KiCad instance at {socket_path}: {e}")

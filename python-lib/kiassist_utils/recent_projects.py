@@ -63,6 +63,11 @@ class RecentProjectsStore:
         # Normalize the path
         project_path = os.path.normpath(os.path.abspath(project_path))
         
+        # Skip save if already at the top of the list
+        if (self._recent_projects and 
+                self._recent_projects[0].get('path') == project_path):
+            return
+        
         # Remove if already exists (to move it to top)
         self._recent_projects = [
             p for p in self._recent_projects 
