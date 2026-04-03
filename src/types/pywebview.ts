@@ -93,15 +93,64 @@ export interface InjectTestNoteResult extends ApiResult {
   created_new?: boolean;
 }
 
+// Multi-provider AI types
+export interface ProviderModel {
+  id: string;
+  name: string;
+}
+
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  models: ProviderModel[];
+  default_model: string;
+  key_url: string;
+  key_prefix: string;
+  key_min_length: number;
+  has_key: boolean;
+}
+
+export interface ProvidersResult extends ApiResult {
+  providers?: ProviderInfo[];
+  current_provider?: string;
+  current_model?: string;
+}
+
+// Session management types
+export interface SessionInfo {
+  session_id: string;
+  started_at: string;
+  last_at: string;
+  message_count: number;
+}
+
+export interface SessionsResult extends ApiResult {
+  sessions: SessionInfo[];
+}
+
+export interface ResumeSessionResult extends ApiResult {
+  session_id?: string;
+  messages?: Array<{ role: string; content: string }>;
+}
+
+export interface ExportSessionResult extends ApiResult {
+  content?: string;
+}
+
 export interface PyWebViewAPI {
   echo_message: (message: string) => Promise<string>;
   detect_kicad_instances: () => Promise<KiCadInstance[]>;
-  check_api_key: () => Promise<boolean>;
-  get_api_key: () => Promise<string | null>;
-  set_api_key: (apiKey: string) => Promise<ApiResult>;
-  send_message: (message: string, model: string) => Promise<SendMessageResult>;
+  // API key management (provider-aware)
+  check_api_key: (provider?: string) => Promise<boolean>;
+  get_api_key: (provider?: string) => Promise<string | null>;
+  set_api_key: (apiKey: string, provider?: string) => Promise<ApiResult>;
+  // Provider management
+  get_providers: () => Promise<ProvidersResult>;
+  set_provider: (provider: string, model: string) => Promise<ApiResult>;
+  // Chat API
+  send_message: (message: string, model?: string) => Promise<SendMessageResult>;
   // Streaming API
-  start_stream_message: (message: string, model: string) => Promise<ApiResult>;
+  start_stream_message: (message: string, model?: string) => Promise<ApiResult>;
   poll_stream: () => Promise<StreamPollResult>;
   // Project API
   get_recent_projects: () => Promise<RecentProject[]>;
@@ -111,6 +160,11 @@ export interface PyWebViewAPI {
   browse_for_project: () => Promise<BrowseProjectResult>;
   get_open_project_paths: () => Promise<string[]>;
   get_projects_list: () => Promise<ProjectsListResult>;
+  set_project_path: (path: string) => Promise<ApiResult>;
+  // Session management
+  get_sessions: (projectPath?: string) => Promise<SessionsResult>;
+  resume_session: (sessionId: string, projectPath?: string) => Promise<ResumeSessionResult>;
+  export_session: (sessionId: string, projectPath?: string) => Promise<ExportSessionResult>;
   // Requirements Wizard API
   get_wizard_questions: () => Promise<WizardQuestionsResult>;
   check_requirements_file: (projectDir: string) => Promise<RequirementsFileResult>;

@@ -1,5 +1,6 @@
 """Main KiAssist application module using pywebview."""
 
+import asyncio
 import os
 import sys
 import threading
@@ -8,7 +9,8 @@ from typing import Optional, List, Dict, Any
 import webview
 
 from .api_key import ApiKeyStore
-from .gemini import GeminiAPI
+from .ai.base import AIProvider, AIMessage
+from .ai.gemini import GeminiProvider
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path
 from .requirements_wizard import (
@@ -22,16 +24,67 @@ from .requirements_wizard import (
     parse_synthesized_docs,
 )
 from .kicad_schematic import inject_test_note, is_schematic_api_available
+from .context.history import ConversationStore
+
+# ---------------------------------------------------------------------------
+# Provider metadata registry
+# ---------------------------------------------------------------------------
+
+_PROVIDER_REGISTRY: List[Dict[str, Any]] = [
+    {
+        "id": "gemini",
+        "name": "Google Gemini",
+        "models": [
+            {"id": "3.1-pro", "name": "Gemini 3.1 Pro"},
+            {"id": "3-flash", "name": "Gemini 3 Flash"},
+            {"id": "3.1-flash-lite", "name": "Gemini 3.1 Flash Lite"},
+        ],
+        "default_model": "3-flash",
+        "key_url": "https://aistudio.google.com/apikey",
+        "key_prefix": "AIza",
+        "key_min_length": 30,
+    },
+    {
+        "id": "claude",
+        "name": "Anthropic Claude",
+        "models": [
+            {"id": "sonnet", "name": "Claude Sonnet"},
+            {"id": "haiku", "name": "Claude Haiku"},
+            {"id": "opus", "name": "Claude Opus"},
+        ],
+        "default_model": "sonnet",
+        "key_url": "https://console.anthropic.com/",
+        "key_prefix": "sk-ant-",
+        "key_min_length": 30,
+    },
+    {
+        "id": "openai",
+        "name": "OpenAI",
+        "models": [
+            {"id": "gpt-4o", "name": "GPT-4o"},
+            {"id": "gpt-4o-mini", "name": "GPT-4o Mini"},
+            {"id": "o3", "name": "o3"},
+        ],
+        "default_model": "gpt-4o",
+        "key_url": "https://platform.openai.com/api-keys",
+        "key_prefix": "sk-",
+        "key_min_length": 20,
+    },
+]
 
 
 class KiAssistAPI:
     """Backend API exposed to the frontend via pywebview."""
-    
+
     def __init__(self):
         """Initialize the backend API."""
         self.api_key_store = ApiKeyStore()
-        self.gemini_api: Optional[GeminiAPI] = None
+        self.current_provider: Optional[AIProvider] = None
+        self.current_provider_name: str = "gemini"
+        self.current_model: str = "3-flash"
         self.recent_projects_store = RecentProjectsStore()
+        self.current_session_id: Optional[str] = None
+        self._current_project_path: Optional[str] = None
         # Streaming state
         self._stream_lock = threading.Lock()
         self._stream_buffer = ""
@@ -40,137 +93,274 @@ class KiAssistAPI:
     
     def echo_message(self, message: str) -> str:
         """Echo a message (for testing).
-        
+
         Args:
             message: The message to echo
-            
+
         Returns:
             The echoed message
         """
         return f"Echo: {message}"
-    
+
     def detect_kicad_instances(self):
         """Detect available KiCad instances.
-        
+
         Returns:
             List of KiCad instances
         """
         return detect_kicad_instances()
-    
-    def check_api_key(self) -> bool:
-        """Check if an API key is stored.
-        
+
+    # ------------------------------------------------------------------
+    # Provider management
+    # ------------------------------------------------------------------
+
+    def get_providers(self) -> Dict[str, Any]:
+        """Return available AI providers, their models, and configuration status.
+
         Returns:
-            True if API key exists, False otherwise
+            Dictionary with providers list, current provider and model.
         """
-        has_key = self.api_key_store.has_api_key()
-        print(f"[DEBUG] check_api_key result: {has_key}")
-        if has_key:
-            key = self.api_key_store.get_api_key()
-            print(f"[DEBUG] Key exists, length: {len(key) if key else 0}")
-        return has_key
-    
-    def get_api_key(self) -> Optional[str]:
-        """Get the stored API key.
-        
-        Returns:
-            The API key or None
-        """
-        return self.api_key_store.get_api_key()
-    
-    def set_api_key(self, api_key: str) -> dict:
-        """Set/save an API key.
-        
+        providers = []
+        for info in _PROVIDER_REGISTRY:
+            entry = dict(info)
+            entry["has_key"] = self.api_key_store.has_api_key(info["id"])
+            providers.append(entry)
+        return {
+            "success": True,
+            "providers": providers,
+            "current_provider": self.current_provider_name,
+            "current_model": self.current_model,
+        }
+
+    def set_provider(self, provider: str, model: str) -> dict:
+        """Set the active AI provider and model.
+
         Args:
-            api_key: The API key to store
-            
+            provider: Provider ID (``gemini``, ``claude``, or ``openai``).
+            model: Model shortcut string.
+
         Returns:
-            Result dictionary with success status and optional warning
+            Result dictionary with success status and optional warning.
         """
+        valid_ids = {p["id"] for p in _PROVIDER_REGISTRY}
+        if provider not in valid_ids:
+            return {"success": False, "error": f"Unknown provider: {provider}"}
+
+        self.current_provider_name = provider
+        self.current_model = model
+        self.current_provider = None  # force re-creation
+
         try:
-            print(f"[DEBUG] set_api_key called with key length: {len(api_key) if api_key else 0}")
-            success, warning = self.api_key_store.set_api_key(api_key)
+            new_provider = self._create_provider(provider, model)
+            if new_provider:
+                self.current_provider = new_provider
+                return {"success": True}
+            else:
+                return {
+                    "success": True,
+                    "warning": f"No API key configured for {provider}. Please add one via Settings.",
+                }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def _create_provider(self, provider_name: str, model: str) -> Optional[AIProvider]:
+        """Instantiate and return an :class:`AIProvider` for *provider_name*.
+
+        Returns ``None`` when no API key is available for the provider.
+        """
+        api_key = self.api_key_store.get_api_key(provider_name)
+        if not api_key:
+            return None
+
+        if provider_name == "gemini":
+            return GeminiProvider(api_key, model)
+
+        if provider_name == "claude":
+            from .ai.claude import ClaudeProvider  # optional dep
+            return ClaudeProvider(api_key, model)
+
+        if provider_name == "openai":
+            from .ai.openai import OpenAIProvider  # optional dep
+            return OpenAIProvider(api_key, model)
+
+        return None
+
+    def _get_or_create_provider(
+        self, model: Optional[str] = None
+    ) -> Optional[AIProvider]:
+        """Return the current provider, creating or updating it as needed.
+
+        When *model* differs from ``current_model`` a temporary provider for
+        that model is returned without persisting the change.
+        """
+        effective_model = model if model is not None else self.current_model
+        # Reuse cached provider when nothing changed
+        if self.current_provider and effective_model == self.current_model:
+            return self.current_provider
+        provider = self._create_provider(self.current_provider_name, effective_model)
+        if provider and model is None:
+            self.current_provider = provider
+            self.current_model = effective_model
+        return provider
+
+    def _send_to_ai(self, prompt: str, model: Optional[str] = None) -> str:
+        """Send a single-turn prompt to the current AI provider.
+
+        Args:
+            prompt: Text to send.
+            model: Optional model override.
+
+        Returns:
+            The text response from the AI.
+
+        Raises:
+            RuntimeError: When no provider is configured.
+        """
+        provider = self._get_or_create_provider(model)
+        if not provider:
+            raise RuntimeError(
+                "No AI provider configured. Please add an API key via Settings."
+            )
+        msgs = [AIMessage(role="user", content=prompt)]
+        response = provider.chat(msgs)
+        return response.content
+
+    # ------------------------------------------------------------------
+    # API key management
+    # ------------------------------------------------------------------
+
+    def check_api_key(self, provider: Optional[str] = None) -> bool:
+        """Check if an API key is stored for *provider* (default: current provider).
+
+        Args:
+            provider: Provider ID to check, or ``None`` to use the active provider.
+
+        Returns:
+            ``True`` if an API key exists, ``False`` otherwise.
+        """
+        target = provider or self.current_provider_name
+        has_key = self.api_key_store.has_api_key(target)
+        print(f"[DEBUG] check_api_key({target!r}) -> {has_key}")
+        return has_key
+
+    def get_api_key(self, provider: Optional[str] = None) -> Optional[str]:
+        """Get the stored API key for *provider* (default: current provider).
+
+        Args:
+            provider: Provider ID, or ``None`` to use the active provider.
+
+        Returns:
+            The API key or ``None``.
+        """
+        target = provider or self.current_provider_name
+        return self.api_key_store.get_api_key(target)
+
+    def set_api_key(self, api_key: str, provider: Optional[str] = None) -> dict:
+        """Store *api_key* for *provider* (default: current provider).
+
+        Also creates/refreshes the active provider instance when the stored
+        key belongs to the currently selected provider.
+
+        Args:
+            api_key: The API key to store.
+            provider: Provider ID, or ``None`` to use the active provider.
+
+        Returns:
+            Result dictionary with ``success`` status and optional ``warning``.
+        """
+        target = provider or self.current_provider_name
+        try:
+            print(
+                f"[DEBUG] set_api_key(provider={target!r}, len={len(api_key) if api_key else 0})"
+            )
+            success, warning = self.api_key_store.set_api_key(api_key, target)
             print(f"[DEBUG] set_api_key result - success: {success}, warning: {warning}")
-            
-            # Verify the key was saved by trying to retrieve it
-            retrieved = self.api_key_store.get_api_key()
-            print(f"[DEBUG] Retrieved key matches: {retrieved == api_key}")
-            
-            # Update the Gemini API instance
-            self.gemini_api = GeminiAPI(api_key)
-            result = {"success": success}
+
+            # Refresh active provider if this key belongs to the current provider
+            if target == self.current_provider_name:
+                self.current_provider = None  # force re-creation on next use
+                new_provider = self._create_provider(target, self.current_model)
+                if new_provider:
+                    self.current_provider = new_provider
+
+            result: Dict[str, Any] = {"success": success}
             if warning:
                 result["warning"] = warning
-            print(f"[DEBUG] Returning result: {result}")
             return result
-        except Exception as e:
-            print(f"[DEBUG] Exception in set_api_key: {e}")
+        except Exception as exc:
+            print(f"[DEBUG] Exception in set_api_key: {exc}")
             import traceback
             traceback.print_exc()
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": str(exc)}
     
-    def send_message(self, message: str, model: str = "3-flash") -> dict:
-        """Send a message to Gemini API.
-        
+    # ------------------------------------------------------------------
+    # Chat / messaging
+    # ------------------------------------------------------------------
+
+    def send_message(self, message: str, model: Optional[str] = None) -> dict:
+        """Send a message to the active AI provider and return a response.
+
         Args:
-            message: The message to send
-            model: The model to use
-            
+            message: The message to send.
+            model: Optional model override (uses current model when omitted).
+
         Returns:
-            Dictionary with response or error
+            Dictionary with ``response`` text or ``error``.
         """
         try:
-            # Get API key
-            api_key = self.api_key_store.get_api_key()
-            if not api_key:
-                return {"success": False, "error": "API key not configured"}
-            
-            # Create or update Gemini API instance
-            if not self.gemini_api:
-                self.gemini_api = GeminiAPI(api_key)
-            
-            # Send message
-            response = self.gemini_api.send_message(message, model)
+            response = self._send_to_ai(message, model)
             return {"success": True, "response": response}
-            
-        except Exception as e:
-            return {"success": False, "error": f"Gemini API error: {str(e)}"}
-    
-    def start_stream_message(self, message: str, model: str = "3-flash") -> dict:
-        """Start streaming a message from Gemini API in a background thread."""
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def start_stream_message(self, message: str, model: Optional[str] = None) -> dict:
+        """Start streaming a response from the active AI provider in a background thread.
+
+        Args:
+            message: The message to send.
+            model: Optional model override.
+
+        Returns:
+            ``{"success": True}`` on successful start, or an error dict.
+        """
         try:
-            api_key = self.api_key_store.get_api_key()
-            if not api_key:
-                return {"success": False, "error": "API key not configured"}
-            
-            if not self.gemini_api:
-                self.gemini_api = GeminiAPI(api_key)
-            
+            provider = self._get_or_create_provider(model)
+            if not provider:
+                return {
+                    "success": False,
+                    "error": "No AI provider configured. Please add an API key via Settings.",
+                }
+
             with self._stream_lock:
                 self._stream_buffer = ""
                 self._stream_done = False
                 self._stream_error = None
-            
+
+            msgs = [AIMessage(role="user", content=message)]
+
             def _run_stream():
-                try:
-                    for chunk in self.gemini_api.send_message_stream(message, model):
+                async def _async_stream():
+                    try:
+                        async for chunk in provider.chat_stream(msgs):
+                            if chunk.text:
+                                with self._stream_lock:
+                                    self._stream_buffer += chunk.text
+                    except Exception as exc:
                         with self._stream_lock:
-                            self._stream_buffer += chunk
-                except Exception as e:
-                    with self._stream_lock:
-                        self._stream_error = str(e)
-                finally:
-                    with self._stream_lock:
-                        self._stream_done = True
-            
+                            self._stream_error = str(exc)
+                    finally:
+                        with self._stream_lock:
+                            self._stream_done = True
+
+                asyncio.run(_async_stream())
+
             thread = threading.Thread(target=_run_stream, daemon=True)
             thread.start()
-            
             return {"success": True}
-            
-        except Exception as e:
-            return {"success": False, "error": f"Stream error: {str(e)}"}
-    
+
+        except Exception as exc:
+            return {"success": False, "error": f"Stream error: {exc}"}
+
     def poll_stream(self) -> dict:
         """Poll for new streaming content."""
         with self._stream_lock:
@@ -178,9 +368,31 @@ class KiAssistAPI:
                 "success": True,
                 "text": self._stream_buffer,
                 "done": self._stream_done,
-                "error": self._stream_error
+                "error": self._stream_error,
             }
     
+    # ------------------------------------------------------------------
+    # Project management
+    # ------------------------------------------------------------------
+
+    def set_project_path(self, path: str) -> dict:
+        """Set the current active project path.
+
+        Args:
+            path: Path to the ``.kicad_pro`` project file or project directory.
+
+        Returns:
+            Result dictionary with success status.
+        """
+        try:
+            p = Path(path)
+            if not p.exists():
+                return {"success": False, "error": f"Path does not exist: {path}"}
+            self._current_project_path = str(p)
+            return {"success": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
     def get_recent_projects(self) -> List[Dict[str, Any]]:
         """Get list of recently opened projects.
         
@@ -318,7 +530,7 @@ class KiAssistAPI:
             return {"success": False, "error": str(e), "open_projects": [], "recent_projects": []}
     
     # Requirements Wizard API methods
-    
+
     def get_wizard_questions(self) -> Dict[str, Any]:
         """Get the default wizard questions.
         
@@ -370,95 +582,59 @@ class KiAssistAPI:
         """
         return save_requirements_file(project_dir, requirements_content, todo_content)
     
-    def refine_wizard_questions(self, initial_answers: Dict[str, str], 
-                               model: str = "3-flash") -> Dict[str, Any]:
+    def refine_wizard_questions(self, initial_answers: Dict[str, str],
+                               model: Optional[str] = None) -> Dict[str, Any]:
         """Send initial answers to LLM to refine remaining questions.
-        
+
         Args:
-            initial_answers: Dictionary of question_id to answer text
-            model: The model to use
-            
+            initial_answers: Dictionary of question_id to answer text.
+            model: Optional model override.
+
         Returns:
-            Dictionary with refined questions or error
+            Dictionary with refined questions or error.
         """
         try:
-            # Get API key
-            api_key = self.api_key_store.get_api_key()
-            if not api_key:
-                return {"success": False, "error": "API key not configured"}
-            
-            # Create or update Gemini API instance
-            if not self.gemini_api:
-                self.gemini_api = GeminiAPI(api_key)
-            
-            # Build the prompt
             prompt = build_refine_prompt(initial_answers)
-            
-            # Send to LLM
-            response = self.gemini_api.send_message(prompt, model)
-            
-            # Parse the response
+            response = self._send_to_ai(prompt, model)
             refined_questions = parse_refined_questions(response)
-            
-            return {
-                "success": True,
-                "questions": refined_questions
-            }
-            
-        except Exception as e:
-            return {"success": False, "error": f"Error refining questions: {str(e)}"}
-    
-    def synthesize_requirements(self, questions: List[Dict[str, Any]], 
+            return {"success": True, "questions": refined_questions}
+        except Exception as exc:
+            return {"success": False, "error": f"Error refining questions: {exc}"}
+
+    def synthesize_requirements(self, questions: List[Dict[str, Any]],
                                answers: Dict[str, str],
                                project_name: str = "PCB Project",
-                               model: str = "3-flash") -> Dict[str, Any]:
+                               model: Optional[str] = None) -> Dict[str, Any]:
         """Send all Q&A to LLM to synthesize requirements documents.
-        
+
         Args:
-            questions: List of question dictionaries
-            answers: Dictionary of question_id to answer text
-            project_name: Name of the project
-            model: The model to use
-            
+            questions: List of question dictionaries.
+            answers: Dictionary of question_id to answer text.
+            project_name: Name of the project.
+            model: Optional model override.
+
         Returns:
-            Dictionary with requirements and todo content or error
+            Dictionary with requirements and todo content or error.
         """
         try:
-            # Get API key
-            api_key = self.api_key_store.get_api_key()
-            if not api_key:
-                return {"success": False, "error": "API key not configured"}
-            
-            # Create or update Gemini API instance
-            if not self.gemini_api:
-                self.gemini_api = GeminiAPI(api_key)
-            
-            # Build the prompt
             prompt = build_synthesize_prompt(questions, answers, project_name)
-            
-            # Send to LLM
-            response = self.gemini_api.send_message(prompt, model)
-            
-            # Parse the response
+            response = self._send_to_ai(prompt, model)
             docs = parse_synthesized_docs(response)
-            
             if docs['requirements'] or docs['todo']:
                 return {
                     "success": True,
                     "requirements": docs['requirements'],
-                    "todo": docs['todo']
+                    "todo": docs['todo'],
                 }
-            else:
-                return {
-                    "success": False,
-                    "error": "Failed to parse LLM response into documents"
-                }
-            
-        except Exception as e:
-            return {"success": False, "error": f"Error synthesizing requirements: {str(e)}"}
+            return {
+                "success": False,
+                "error": "Failed to parse LLM response into documents",
+            }
+        except Exception as exc:
+            return {"success": False, "error": f"Error synthesizing requirements: {exc}"}
     
     # Schematic API methods
-    
+
     def inject_schematic_test_note(self, project_path: str) -> Dict[str, Any]:
         """Inject a test note into the schematic for a KiCad project.
         
@@ -481,11 +657,91 @@ class KiAssistAPI:
     
     def is_schematic_api_available(self) -> bool:
         """Check if the schematic API (kicad-sch-api) is available.
-        
+
         Returns:
             True if the API is available, False otherwise
         """
         return is_schematic_api_available()
+
+    # ------------------------------------------------------------------
+    # Session management
+    # ------------------------------------------------------------------
+
+    def _get_session_store(self, project_path: Optional[str] = None) -> ConversationStore:
+        """Return a :class:`ConversationStore` for *project_path*.
+
+        Falls back to ``self._current_project_path`` and then the user's home
+        directory when no explicit path is provided.
+        """
+        path = project_path or self._current_project_path or str(Path.home())
+        return ConversationStore(path)
+
+    def get_sessions(self, project_path: Optional[str] = None) -> Dict[str, Any]:
+        """Return a list of conversation sessions.
+
+        Args:
+            project_path: Path to the project directory or ``.kicad_pro`` file.
+                          Defaults to the current project or home directory.
+
+        Returns:
+            Dictionary with ``sessions`` list (each session has ``session_id``,
+            ``started_at``, ``last_at``, ``message_count``).
+        """
+        try:
+            store = self._get_session_store(project_path)
+            sessions = store.list_sessions()
+            return {"success": True, "sessions": sessions}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "sessions": []}
+
+    def resume_session(
+        self, session_id: str, project_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Load the messages for an existing session.
+
+        Args:
+            session_id: ID of the session to resume.
+            project_path: Optional project path override.
+
+        Returns:
+            Dictionary with ``messages`` list and ``session_id``.
+        """
+        try:
+            store = self._get_session_store(project_path)
+            messages = store.load_session(session_id)
+            serialized = [
+                {"role": m.role, "content": m.content}
+                for m in messages
+            ]
+            self.current_session_id = session_id
+            return {"success": True, "session_id": session_id, "messages": serialized}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def export_session(
+        self, session_id: str, project_path: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Export a conversation session as plain text.
+
+        Args:
+            session_id: ID of the session to export.
+            project_path: Optional project path override.
+
+        Returns:
+            Dictionary with ``content`` string.
+        """
+        try:
+            store = self._get_session_store(project_path)
+            messages = store.load_session(session_id)
+            lines = []
+            for m in messages:
+                if m.role == "user":
+                    lines.append(f"User: {m.content}\n")
+                elif m.role == "assistant":
+                    lines.append(f"Assistant: {m.content}\n")
+            return {"success": True, "content": "\n".join(lines)}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
 
 
 def get_frontend_path() -> Path:
