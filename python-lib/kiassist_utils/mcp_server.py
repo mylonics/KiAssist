@@ -1,0 +1,1647 @@
+"""Unified KiAssist MCP server.
+
+Exposes KiCad schematic, symbol library, footprint, IPC bridge, and project
+context operations as MCP tools via the FastMCP framework.
+
+Usage (stdio transport, for use with MCP-compatible AI clients)::
+
+    kiassist-mcp            # registered as a console script
+
+In-process usage (no network overhead)::
+
+    import asyncio
+    from kiassist_utils.mcp_server import in_process_call
+
+    result = asyncio.run(in_process_call("schematic_open", {"path": "my.kicad_sch"}))
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from mcp.server.fastmcp import FastMCP
+
+from .kicad_ipc import detect_kicad_instances, get_open_project_paths
+from .kicad_parser.footprint import Footprint, Pad
+from .kicad_parser.library import LibraryDiscovery
+from .kicad_parser.models import Position
+from .kicad_parser.pcb import PCBBoard
+from .kicad_parser.schematic import Schematic
+from .kicad_parser.symbol_lib import Pin, SymbolDef, SymbolLibrary
+
+# ---------------------------------------------------------------------------
+# Server instance
+# ---------------------------------------------------------------------------
+
+mcp: FastMCP = FastMCP(
+    name="KiAssist",
+    instructions=(
+        "KiAssist MCP server: tools for reading and writing KiCad schematic, "
+        "symbol library, footprint, and PCB files, plus KiCad IPC bridge tools."
+    ),
+)
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _ok(data: Any) -> Dict[str, Any]:
+    """Wrap a successful result payload."""
+    return {"status": "ok", "data": data}
+
+
+def _err(message: str) -> Dict[str, Any]:
+    """Wrap an error result payload."""
+    return {"status": "error", "message": message}
+
+
+def _pos_dict(pos: Position) -> Dict[str, float]:
+    return {"x": pos.x, "y": pos.y, "angle": pos.angle}
+
+
+# ===========================================================================
+# 2.2  Schematic Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def schematic_open(path: str) -> Dict[str, Any]:
+    """Load a schematic file and return a summary.
+
+    Args:
+        path: Absolute or relative path to a ``.kicad_sch`` file.
+
+    Returns:
+        Summary dict with ``component_count``, ``sheet_count``, ``paper``,
+        ``title``, and ``version``.
+    """
+    try:
+        sch = Schematic.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to load schematic: {exc}")
+
+    title = ""
+    if sch.title_block:
+        title = sch.title_block.title
+    return _ok(
+        {
+            "path": str(path),
+            "version": sch.version,
+            "paper": sch.paper,
+            "title": title,
+            "component_count": len(sch.symbols),
+            "wire_count": len(sch.wires),
+            "sheet_count": len(sch.sheets),
+            "lib_symbol_count": len(sch.lib_symbols),
+        }
+    )
+
+
+@mcp.tool()
+def schematic_list_symbols(path: str) -> Dict[str, Any]:
+    """List all placed symbols in a schematic.
+
+    Args:
+        path: Path to a ``.kicad_sch`` file.
+
+    Returns:
+        List of dicts, each with ``reference``, ``value``, ``footprint``,
+        ``lib_id``, and ``position``.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    result = []
+    for sym in sch.symbols:
+        result.append(
+            {
+                "reference": sym.reference,
+                "value": sym.value,
+                "footprint": sym.footprint,
+                "lib_id": sym.lib_id,
+                "position": _pos_dict(sym.position),
+            }
+        )
+    return _ok(result)
+
+
+@mcp.tool()
+def schematic_get_symbol(path: str, reference: str) -> Dict[str, Any]:
+    """Get detailed information for a specific symbol.
+
+    Args:
+        path:      Path to a ``.kicad_sch`` file.
+        reference: Reference designator (e.g. ``"U1"``).
+
+    Returns:
+        Dict with ``reference``, ``value``, ``footprint``, ``lib_id``,
+        ``position``, ``properties``, and ``pin_positions``.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    syms = sch.find_symbols(reference=reference)
+    if not syms:
+        return _err(f"Symbol '{reference}' not found")
+
+    sym = syms[0]
+    props = {p.key: p.value for p in sym.properties}
+    pin_positions = {
+        pin: _pos_dict(pos) for pin, pos in sch.get_pin_positions(reference).items()
+    }
+    return _ok(
+        {
+            "reference": sym.reference,
+            "value": sym.value,
+            "footprint": sym.footprint,
+            "lib_id": sym.lib_id,
+            "position": _pos_dict(sym.position),
+            "properties": props,
+            "pin_positions": pin_positions,
+        }
+    )
+
+
+@mcp.tool()
+def schematic_add_symbol(
+    path: str,
+    lib_id: str,
+    x: float,
+    y: float,
+    reference: str = "U?",
+    value: str = "",
+    footprint: str = "",
+    angle: float = 0.0,
+) -> Dict[str, Any]:
+    """Place a symbol on the schematic and save.
+
+    Args:
+        path:      Path to a ``.kicad_sch`` file (modified in-place).
+        lib_id:    Library identifier string (e.g. ``"Device:R"``).
+        x:         X position in mm.
+        y:         Y position in mm.
+        reference: Reference designator (e.g. ``"R1"``).
+        value:     Component value string.
+        footprint: Footprint assignment.
+        angle:     Rotation angle in degrees.
+
+    Returns:
+        Dict with the added symbol's ``reference`` and ``position``.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    sym = sch.add_symbol(lib_id, x, y, reference, value, footprint, angle)
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"reference": sym.reference, "position": _pos_dict(sym.position)})
+
+
+@mcp.tool()
+def schematic_remove_symbol(path: str, reference: str) -> Dict[str, Any]:
+    """Remove a symbol from the schematic by reference designator.
+
+    Args:
+        path:      Path to a ``.kicad_sch`` file (modified in-place).
+        reference: Reference designator to remove.
+
+    Returns:
+        ``{"removed": true}`` on success or an error.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    removed = sch.remove_symbol(reference)
+    if not removed:
+        return _err(f"Symbol '{reference}' not found")
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"removed": True})
+
+
+@mcp.tool()
+def schematic_modify_symbol(
+    path: str,
+    reference: str,
+    value: Optional[str] = None,
+    footprint: Optional[str] = None,
+    properties: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Update properties on a placed schematic symbol.
+
+    Args:
+        path:       Path to a ``.kicad_sch`` file (modified in-place).
+        reference:  Reference designator of the symbol to modify.
+        value:      New value string (optional).
+        footprint:  New footprint string (optional).
+        properties: Arbitrary property key→value pairs to set (optional).
+
+    Returns:
+        The updated symbol's basic info on success.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    syms = sch.find_symbols(reference=reference)
+    if not syms:
+        return _err(f"Symbol '{reference}' not found")
+
+    sym = syms[0]
+    prop_map = {p.key: p for p in sym.properties}
+
+    if value is not None:
+        if "Value" in prop_map:
+            prop_map["Value"].value = value
+        else:
+            from .kicad_parser.models import Property
+            sym.properties.append(Property("Value", value, sym.position))
+
+    if footprint is not None:
+        if "Footprint" in prop_map:
+            prop_map["Footprint"].value = footprint
+        else:
+            from .kicad_parser.models import Property
+            sym.properties.append(Property("Footprint", footprint, sym.position))
+
+    if properties:
+        for k, v in properties.items():
+            if k in prop_map:
+                prop_map[k].value = v
+            else:
+                from .kicad_parser.models import Property
+                sym.properties.append(Property(k, v, sym.position))
+
+    # Clear raw_tree so the symbol is re-serialised from dataclass fields.
+    sym.raw_tree = None  # type: ignore[assignment]
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok(
+        {
+            "reference": sym.reference,
+            "value": sym.value,
+            "footprint": sym.footprint,
+        }
+    )
+
+
+@mcp.tool()
+def schematic_add_wire(
+    path: str, x1: float, y1: float, x2: float, y2: float
+) -> Dict[str, Any]:
+    """Add a wire segment between two points.
+
+    Args:
+        path:       Path to a ``.kicad_sch`` file (modified in-place).
+        x1, y1:     Start coordinate in mm.
+        x2, y2:     End coordinate in mm.
+
+    Returns:
+        ``{"added": true}`` on success.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    sch.add_wire(x1, y1, x2, y2)
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"added": True})
+
+
+@mcp.tool()
+def schematic_connect_pins(
+    path: str, pin_a: str, pin_b: str
+) -> Dict[str, Any]:
+    """Auto-route a straight wire between two pin references.
+
+    This draws a direct wire between the resolved positions of two pins.
+    For non-aligned pins the wire goes first horizontally then vertically
+    via an intermediate point.
+
+    Args:
+        path:  Path to a ``.kicad_sch`` file (modified in-place).
+        pin_a: Pin reference string in ``"RefDes:PinNum"`` format (e.g. ``"R1:1"``).
+        pin_b: Pin reference string in ``"RefDes:PinNum"`` format (e.g. ``"U1:5"``).
+
+    Returns:
+        Number of wire segments added.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    def _resolve_pin(pin_ref: str):
+        parts = pin_ref.split(":", 1)
+        if len(parts) != 2:
+            return None
+        ref, pin_num = parts
+        positions = sch.get_pin_positions(ref)
+        return positions.get(pin_num)
+
+    pos_a = _resolve_pin(pin_a)
+    if pos_a is None:
+        return _err(f"Could not resolve pin position for '{pin_a}'")
+    pos_b = _resolve_pin(pin_b)
+    if pos_b is None:
+        return _err(f"Could not resolve pin position for '{pin_b}'")
+
+    segments = 0
+    if abs(pos_a.x - pos_b.x) < 1e-4 or abs(pos_a.y - pos_b.y) < 1e-4:
+        # Collinear — single segment
+        sch.add_wire(pos_a.x, pos_a.y, pos_b.x, pos_b.y)
+        segments = 1
+    else:
+        # L-shape via midpoint
+        mid_x, mid_y = pos_b.x, pos_a.y
+        sch.add_wire(pos_a.x, pos_a.y, mid_x, mid_y)
+        sch.add_wire(mid_x, mid_y, pos_b.x, pos_b.y)
+        segments = 2
+
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"segments_added": segments})
+
+
+@mcp.tool()
+def schematic_add_label(
+    path: str,
+    text: str,
+    x: float,
+    y: float,
+    angle: float = 0.0,
+    global_label: bool = False,
+) -> Dict[str, Any]:
+    """Add a net label (or global label) at a position.
+
+    Args:
+        path:         Path to a ``.kicad_sch`` file (modified in-place).
+        text:         Label / net name.
+        x, y:         Position in mm.
+        angle:        Rotation angle in degrees.
+        global_label: If ``True``, add a global label instead of a net label.
+
+    Returns:
+        ``{"added": true, "type": "label"|"global_label"}`` on success.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if global_label:
+        from .kicad_parser.schematic import GlobalLabel
+        from .kicad_parser.models import KiUUID
+
+        gl = GlobalLabel()
+        gl.text = text
+        gl.position = Position(x, y, angle)
+        gl.uuid = KiUUID.new()
+        sch.global_labels.append(gl)
+        label_type = "global_label"
+    else:
+        sch.add_label(text, x, y, angle)
+        label_type = "label"
+
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"added": True, "type": label_type})
+
+
+@mcp.tool()
+def schematic_get_nets(path: str) -> Dict[str, Any]:
+    """List all nets and their connected pins.
+
+    Args:
+        path: Path to a ``.kicad_sch`` file.
+
+    Returns:
+        Dict mapping net name → list of ``"RefDes:PinNum"`` strings.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    nets = sch.get_connected_nets()
+    return _ok(nets)
+
+
+@mcp.tool()
+def schematic_find_pins(
+    path: str,
+    reference: Optional[str] = None,
+    pin_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Find pins matching a reference designator or pin name pattern.
+
+    Args:
+        path:      Path to a ``.kicad_sch`` file.
+        reference: Filter by reference designator prefix (substring match).
+        pin_name:  Filter by pin name (substring match, case-insensitive).
+
+    Returns:
+        List of dicts with ``symbol_reference``, ``pin_number``, ``pin_name``,
+        and ``position``.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    results = []
+    for sym in sch.symbols:
+        ref = sym.reference
+        if reference is not None and reference.lower() not in ref.lower():
+            continue
+        for lib_sym in sch.lib_symbols:
+            if lib_sym.name != sym.lib_id and not lib_sym.name.endswith(
+                ":" + sym.lib_id.split(":")[-1]
+            ):
+                continue
+            if lib_sym.raw_tree:
+                from .kicad_parser.schematic import _find_all, _find, _parse_position
+
+                for unit in _find_all(lib_sym.raw_tree, "symbol"):
+                    for pin_tree in _find_all(unit, "pin"):
+                        name_node = _find(pin_tree, "name")
+                        num_node = _find(pin_tree, "number")
+                        at_node = _find(pin_tree, "at")
+                        p_name = str(name_node[1]) if name_node and len(name_node) > 1 else ""
+                        p_num = str(num_node[1]) if num_node and len(num_node) > 1 else ""
+                        if pin_name is not None and pin_name.lower() not in p_name.lower():
+                            continue
+                        pin_pos = None
+                        if at_node:
+                            raw_pos = _parse_position(at_node)
+                            import math
+
+                            angle_rad = math.radians(sym.position.angle)
+                            rx = raw_pos.x * math.cos(angle_rad) - raw_pos.y * math.sin(angle_rad)
+                            ry = raw_pos.x * math.sin(angle_rad) + raw_pos.y * math.cos(angle_rad)
+                            pin_pos = _pos_dict(
+                                Position(sym.position.x + rx, sym.position.y + ry)
+                            )
+                        results.append(
+                            {
+                                "symbol_reference": ref,
+                                "pin_number": p_num,
+                                "pin_name": p_name,
+                                "position": pin_pos,
+                            }
+                        )
+    return _ok(results)
+
+
+@mcp.tool()
+def schematic_get_power_pins(path: str, reference: str) -> Dict[str, Any]:
+    """Get all power pins for a specific symbol.
+
+    Args:
+        path:      Path to a ``.kicad_sch`` file.
+        reference: Reference designator of the target symbol.
+
+    Returns:
+        List of dicts with ``pin_number``, ``pin_name``, and ``position``.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    syms = sch.find_symbols(reference=reference)
+    if not syms:
+        return _err(f"Symbol '{reference}' not found")
+
+    sym = syms[0]
+    results = []
+    for lib_sym in sch.lib_symbols:
+        if lib_sym.name != sym.lib_id and not lib_sym.name.endswith(
+            ":" + sym.lib_id.split(":")[-1]
+        ):
+            continue
+        if lib_sym.raw_tree:
+            from .kicad_parser.schematic import _find_all, _find, _parse_position
+            import math
+
+            for unit in _find_all(lib_sym.raw_tree, "symbol"):
+                for pin_tree in _find_all(unit, "pin"):
+                    # Power pins have type "power_in" or "power_out"
+                    pin_type = str(pin_tree[1]) if len(pin_tree) > 1 else ""
+                    if "power" not in pin_type.lower():
+                        continue
+                    name_node = _find(pin_tree, "name")
+                    num_node = _find(pin_tree, "number")
+                    at_node = _find(pin_tree, "at")
+                    p_name = str(name_node[1]) if name_node and len(name_node) > 1 else ""
+                    p_num = str(num_node[1]) if num_node and len(num_node) > 1 else ""
+                    pin_pos = None
+                    if at_node:
+                        raw_pos = _parse_position(at_node)
+                        angle_rad = math.radians(sym.position.angle)
+                        rx = raw_pos.x * math.cos(angle_rad) - raw_pos.y * math.sin(angle_rad)
+                        ry = raw_pos.x * math.sin(angle_rad) + raw_pos.y * math.cos(angle_rad)
+                        pin_pos = _pos_dict(
+                            Position(sym.position.x + rx, sym.position.y + ry)
+                        )
+                    results.append(
+                        {
+                            "pin_number": p_num,
+                            "pin_name": p_name,
+                            "position": pin_pos,
+                        }
+                    )
+    return _ok(results)
+
+
+@mcp.tool()
+def schematic_add_junction(path: str, x: float, y: float) -> Dict[str, Any]:
+    """Add a junction marker at a coordinate.
+
+    Args:
+        path: Path to a ``.kicad_sch`` file (modified in-place).
+        x:    X position in mm.
+        y:    Y position in mm.
+
+    Returns:
+        ``{"added": true}`` on success.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    sch.add_junction(x, y)
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"added": True})
+
+
+@mcp.tool()
+def schematic_add_no_connect(path: str, x: float, y: float) -> Dict[str, Any]:
+    """Add a no-connect marker at a coordinate.
+
+    Args:
+        path: Path to a ``.kicad_sch`` file (modified in-place).
+        x:    X position in mm.
+        y:    Y position in mm.
+
+    Returns:
+        ``{"added": true}`` on success.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    sch.add_no_connect(x, y)
+    try:
+        sch.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+
+    return _ok({"added": True})
+
+
+@mcp.tool()
+def schematic_search(
+    path: str, query: str
+) -> Dict[str, Any]:
+    """Fuzzy search for symbols across references, values, and properties.
+
+    Args:
+        path:  Path to a ``.kicad_sch`` file.
+        query: Search string (case-insensitive substring match).
+
+    Returns:
+        List of matching symbol dicts.
+    """
+    try:
+        sch = Schematic.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    q = query.lower()
+    results = []
+    for sym in sch.symbols:
+        props = {p.key: p.value for p in sym.properties}
+        # Match if query appears in any field
+        searchable = [sym.reference, sym.value, sym.footprint, sym.lib_id] + list(
+            props.values()
+        )
+        if any(q in s.lower() for s in searchable):
+            results.append(
+                {
+                    "reference": sym.reference,
+                    "value": sym.value,
+                    "footprint": sym.footprint,
+                    "lib_id": sym.lib_id,
+                    "position": _pos_dict(sym.position),
+                    "properties": props,
+                }
+            )
+    return _ok(results)
+
+
+# ===========================================================================
+# 2.3  Symbol Library Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def symbol_lib_open(path: str) -> Dict[str, Any]:
+    """Open a symbol library and list its symbols.
+
+    Args:
+        path: Path to a ``.kicad_sym`` file.
+
+    Returns:
+        Summary with ``symbol_count`` and a list of symbol names.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    names = [s.name for s in lib.symbols]
+    return _ok({"path": str(path), "symbol_count": len(names), "symbols": names})
+
+
+@mcp.tool()
+def symbol_lib_get_symbol(path: str, name: str) -> Dict[str, Any]:
+    """Get the full definition of a symbol in a library.
+
+    Args:
+        path: Path to a ``.kicad_sym`` file.
+        name: Symbol name.
+
+    Returns:
+        Dict with ``name``, ``extends``, ``properties``, and ``pin_count``.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    sym = lib.find_by_name(name)
+    if sym is None:
+        return _err(f"Symbol '{name}' not found in library")
+
+    props = {p.key: p.value for p in sym.properties}
+    pins = sym.pins()
+    pin_list = [
+        {
+            "number": p.number,
+            "name": p.name,
+            "type": p.electrical_type,
+            "position": _pos_dict(p.position),
+        }
+        for p in pins
+    ]
+    return _ok(
+        {
+            "name": sym.name,
+            "extends": sym.extends,
+            "properties": props,
+            "pin_count": len(pin_list),
+            "pins": pin_list,
+        }
+    )
+
+
+@mcp.tool()
+def symbol_lib_create_symbol(
+    path: str,
+    name: str,
+    properties: Optional[Dict[str, str]] = None,
+    pins: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Create a new symbol in a library.
+
+    Args:
+        path:       Path to a ``.kicad_sym`` file (modified in-place).
+        name:       Unique symbol name.
+        properties: Optional dict of property key→value pairs.
+        pins:       Optional list of pin dicts, each with ``number``,
+                    ``name``, ``type``, ``x``, ``y``, and optionally
+                    ``length`` and ``angle``.
+
+    Returns:
+        ``{"created": true, "name": "<name>"}`` on success.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except FileNotFoundError:
+        # Create a new empty library if the file does not exist
+        lib = SymbolLibrary()
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if lib.find_by_name(name) is not None:
+        return _err(f"Symbol '{name}' already exists in the library")
+
+    sym = SymbolDef(name=name)
+
+    if properties:
+        from .kicad_parser.models import Property
+        for k, v in properties.items():
+            sym.properties.append(Property(k, v, Position(0.0, 0.0)))
+
+    if pins:
+        for p_dict in pins:
+            pin = Pin(
+                electrical_type=p_dict.get("type", "input"),
+                graphic_style=p_dict.get("style", "line"),
+                position=Position(
+                    float(p_dict.get("x", 0.0)),
+                    float(p_dict.get("y", 0.0)),
+                    float(p_dict.get("angle", 0.0)),
+                ),
+                length=float(p_dict.get("length", 2.54)),
+                name=p_dict.get("name", "~"),
+                number=str(p_dict.get("number", "1")),
+            )
+            from .kicad_parser.symbol_lib import SymbolUnit
+            if not sym.units:
+                sym.units.append(SymbolUnit())
+            sym.units[0].pins.append(pin)
+
+    lib.add_symbol(sym)
+    try:
+        lib.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save library: {exc}")
+
+    return _ok({"created": True, "name": name})
+
+
+@mcp.tool()
+def symbol_lib_modify_symbol(
+    path: str,
+    name: str,
+    properties: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Modify an existing symbol's properties.
+
+    Args:
+        path:       Path to a ``.kicad_sym`` file (modified in-place).
+        name:       Name of the symbol to modify.
+        properties: Property key→value pairs to update.
+
+    Returns:
+        ``{"modified": true}`` on success.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if properties is None:
+        properties = {}
+
+    modified = lib.modify_symbol(name, **properties)
+    if not modified:
+        return _err(f"Symbol '{name}' not found")
+
+    try:
+        lib.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save library: {exc}")
+
+    return _ok({"modified": True})
+
+
+@mcp.tool()
+def symbol_lib_delete_symbol(path: str, name: str) -> Dict[str, Any]:
+    """Remove a symbol from a library.
+
+    Args:
+        path: Path to a ``.kicad_sym`` file (modified in-place).
+        name: Name of the symbol to remove.
+
+    Returns:
+        ``{"deleted": true}`` on success.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    removed = lib.remove_symbol(name)
+    if not removed:
+        return _err(f"Symbol '{name}' not found")
+
+    try:
+        lib.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save library: {exc}")
+
+    return _ok({"deleted": True})
+
+
+@mcp.tool()
+def symbol_lib_add_pin(
+    path: str,
+    symbol_name: str,
+    pin_number: str,
+    pin_name: str,
+    electrical_type: str = "input",
+    x: float = 0.0,
+    y: float = 0.0,
+    angle: float = 0.0,
+    length: float = 2.54,
+) -> Dict[str, Any]:
+    """Add a pin to an existing symbol.
+
+    Args:
+        path:             Path to a ``.kicad_sym`` file (modified in-place).
+        symbol_name:      Target symbol name.
+        pin_number:       Pin number string (e.g. ``"3"``).
+        pin_name:         Pin name (e.g. ``"CLK"``).
+        electrical_type:  KiCad pin type (``"input"``, ``"output"``, ``"bidirectional"``,
+                          ``"power_in"``, ``"power_out"``, etc.).
+        x, y:             Pin position in mm (relative to symbol origin).
+        angle:            Pin angle in degrees.
+        length:           Pin length in mm.
+
+    Returns:
+        ``{"added": true}`` on success.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    sym = lib.find_by_name(symbol_name)
+    if sym is None:
+        return _err(f"Symbol '{symbol_name}' not found")
+
+    new_pin = Pin(
+        electrical_type=electrical_type,
+        graphic_style="line",
+        position=Position(x, y, angle),
+        length=length,
+        name=pin_name,
+        number=pin_number,
+    )
+    from .kicad_parser.symbol_lib import SymbolUnit
+    if not sym.units:
+        sym.units.append(SymbolUnit())
+    sym.units[0].pins.append(new_pin)
+    # Clear raw_tree to force re-serialisation
+    sym.raw_tree = None  # type: ignore[assignment]
+
+    try:
+        lib.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save library: {exc}")
+
+    return _ok({"added": True})
+
+
+@mcp.tool()
+def symbol_lib_bulk_update(
+    path: str,
+    properties: Dict[str, str],
+) -> Dict[str, Any]:
+    """Apply a property update to every symbol in a library.
+
+    Args:
+        path:       Path to a ``.kicad_sym`` file (modified in-place).
+        properties: Property key→value pairs to set on all symbols.
+
+    Returns:
+        ``{"updated_count": N}`` on success.
+    """
+    try:
+        lib = SymbolLibrary.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    count = 0
+    for sym in lib.symbols:
+        lib.modify_symbol(sym.name, **properties)
+        count += 1
+
+    try:
+        lib.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save library: {exc}")
+
+    return _ok({"updated_count": count})
+
+
+@mcp.tool()
+def symbol_lib_list_libraries(
+    project_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Discover all available symbol libraries.
+
+    Args:
+        project_dir: Optional project directory to include project-local
+                     libraries in addition to global ones.
+
+    Returns:
+        List of dicts with ``nickname`` and ``path`` for each library.
+    """
+    try:
+        disc = LibraryDiscovery(project_dir)
+        entries = disc.list_symbol_libraries()
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    libs = [{"nickname": e.nickname, "path": str(e.uri)} for e in entries]
+    return _ok(libs)
+
+
+# ===========================================================================
+# 2.4  Footprint Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def footprint_open(path: str) -> Dict[str, Any]:
+    """Open a footprint file and return a summary.
+
+    Args:
+        path: Path to a ``.kicad_mod`` file.
+
+    Returns:
+        Summary with ``name``, ``description``, ``tags``, ``layer``,
+        and ``pad_count``.
+    """
+    try:
+        fp = Footprint.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    return _ok(
+        {
+            "path": str(path),
+            "name": fp.name,
+            "description": fp.description,
+            "tags": fp.tags,
+            "layer": fp.layer,
+            "pad_count": len(fp.pads),
+        }
+    )
+
+
+@mcp.tool()
+def footprint_get_details(path: str) -> Dict[str, Any]:
+    """Get the full definition of a footprint.
+
+    Args:
+        path: Path to a ``.kicad_mod`` file.
+
+    Returns:
+        Full footprint dict with ``pads`` list and ``graphics`` count.
+    """
+    try:
+        fp = Footprint.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    pads = []
+    for pad in fp.pads:
+        pads.append(
+            {
+                "number": pad.number,
+                "type": pad.type,
+                "shape": pad.shape,
+                "position": _pos_dict(pad.position),
+                "size": {"w": pad.size[0], "h": pad.size[1]},
+                "layers": pad.layers,
+                "drill": pad.drill,
+                "net_name": pad.net,
+            }
+        )
+    return _ok(
+        {
+            "name": fp.name,
+            "description": fp.description,
+            "tags": fp.tags,
+            "layer": fp.layer,
+            "pad_count": len(pads),
+            "pads": pads,
+            "graphic_count": len(fp.graphics),
+        }
+    )
+
+
+@mcp.tool()
+def footprint_create(
+    path: str,
+    name: str,
+    description: str = "",
+    tags: str = "",
+    layer: str = "F.Cu",
+    pads: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Create a new footprint file.
+
+    Args:
+        path:        Destination ``.kicad_mod`` file path.
+        name:        Footprint name.
+        description: Human-readable description.
+        tags:        Space-separated tag keywords.
+        layer:       Primary copper layer (default ``"F.Cu"``).
+        pads:        Optional list of pad dicts.  Each dict may contain
+                     ``number``, ``type``, ``shape``, ``x``, ``y``,
+                     ``width``, ``height``, and ``layers``.
+
+    Returns:
+        ``{"created": true, "name": "<name>"}`` on success.
+    """
+    fp = Footprint(name=name, description=description, tags=tags, layer=layer)
+
+    if pads:
+        for p_dict in pads:
+            fp.add_pad(
+                number=str(p_dict.get("number", "1")),
+                pad_type=p_dict.get("type", "smd"),
+                shape=p_dict.get("shape", "rect"),
+                x=float(p_dict.get("x", 0.0)),
+                y=float(p_dict.get("y", 0.0)),
+                width=float(p_dict.get("width", 1.0)),
+                height=float(p_dict.get("height", 1.0)),
+                layers=p_dict.get("layers", [layer]),
+            )
+
+    try:
+        fp.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save footprint: {exc}")
+
+    return _ok({"created": True, "name": name})
+
+
+@mcp.tool()
+def footprint_modify(
+    path: str,
+    description: Optional[str] = None,
+    tags: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Modify footprint top-level properties.
+
+    Args:
+        path:        Path to a ``.kicad_mod`` file (modified in-place).
+        description: New description (optional).
+        tags:        New tags string (optional).
+
+    Returns:
+        ``{"modified": true}`` on success.
+    """
+    try:
+        fp = Footprint.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if description is not None:
+        fp.description = description
+    if tags is not None:
+        fp.tags = tags
+
+    # Clear raw_tree to force re-serialisation
+    fp.raw_tree = None  # type: ignore[assignment]
+    try:
+        fp.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save footprint: {exc}")
+
+    return _ok({"modified": True})
+
+
+@mcp.tool()
+def footprint_add_pad(
+    path: str,
+    number: str,
+    pad_type: str,
+    shape: str,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    layers: Optional[List[str]] = None,
+    drill: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Add a pad to an existing footprint.
+
+    Args:
+        path:     Path to a ``.kicad_mod`` file (modified in-place).
+        number:   Pad number string (e.g. ``"1"``).
+        pad_type: Pad type: ``"smd"``, ``"thru_hole"``, ``"connect"``, or
+                  ``"np_thru_hole"``.
+        shape:    Pad shape: ``"rect"``, ``"circle"``, ``"oval"``, etc.
+        x, y:     Center position in mm.
+        width:    Pad width in mm.
+        height:   Pad height in mm.
+        layers:   Layer list (default ``["F.Cu", "F.Paste", "F.Mask"]``).
+        drill:    Drill diameter in mm for through-hole pads (optional).
+
+    Returns:
+        ``{"added": true}`` on success.
+    """
+    try:
+        fp = Footprint.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if layers is None:
+        if pad_type == "thru_hole":
+            layers = ["*.Cu", "*.Mask", "F.Paste"]
+        else:
+            layers = ["F.Cu", "F.Paste", "F.Mask"]
+
+    fp.add_pad(
+        number=number,
+        pad_type=pad_type,
+        shape=shape,
+        x=x,
+        y=y,
+        width=width,
+        height=height,
+        layers=layers,
+        drill=drill,
+    )
+    try:
+        fp.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save footprint: {exc}")
+
+    return _ok({"added": True})
+
+
+@mcp.tool()
+def footprint_remove_pad(path: str, number: str) -> Dict[str, Any]:
+    """Remove a pad from a footprint by pad number.
+
+    Args:
+        path:   Path to a ``.kicad_mod`` file (modified in-place).
+        number: Pad number to remove.
+
+    Returns:
+        ``{"removed": true}`` on success.
+    """
+    try:
+        fp = Footprint.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    removed = fp.remove_pad(number)
+    if not removed:
+        return _err(f"Pad '{number}' not found")
+
+    try:
+        fp.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save footprint: {exc}")
+
+    return _ok({"removed": True})
+
+
+@mcp.tool()
+def footprint_renumber_pads(path: str, start: int = 1) -> Dict[str, Any]:
+    """Renumber all pads sequentially starting from *start*.
+
+    Args:
+        path:  Path to a ``.kicad_mod`` file (modified in-place).
+        start: First pad number (default ``1``).
+
+    Returns:
+        ``{"renumbered": N}`` where *N* is the total pad count.
+    """
+    try:
+        fp = Footprint.load(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    fp.renumber_pads(start)
+    try:
+        fp.save(path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save footprint: {exc}")
+
+    return _ok({"renumbered": len(fp.pads)})
+
+
+@mcp.tool()
+def footprint_list_libraries(
+    project_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Discover all available footprint libraries.
+
+    Args:
+        project_dir: Optional project directory to include project-local
+                     libraries.
+
+    Returns:
+        List of dicts with ``nickname`` and ``path`` for each library.
+    """
+    try:
+        disc = LibraryDiscovery(project_dir)
+        entries = disc.list_footprint_libraries()
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    libs = [{"nickname": e.nickname, "path": str(e.uri)} for e in entries]
+    return _ok(libs)
+
+
+# ===========================================================================
+# 2.5  IPC Bridge Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def kicad_list_instances() -> Dict[str, Any]:
+    """List all currently running KiCad instances.
+
+    Returns:
+        List of instance dicts with ``project_name``, ``project_path``,
+        and ``socket_path``.
+    """
+    try:
+        instances = detect_kicad_instances()
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    return _ok(instances)
+
+
+@mcp.tool()
+def kicad_get_project_info(project_path: str) -> Dict[str, Any]:
+    """Get information about an open KiCad project.
+
+    Args:
+        project_path: Path to the ``.kicad_pro`` project file.
+
+    Returns:
+        Dict with ``schematics``, ``pcb``, ``libraries``, and ``is_open``.
+    """
+    project_path_obj = Path(project_path)
+    if not project_path_obj.exists():
+        return _err(f"Project path not found: {project_path}")
+
+    project_dir = project_path_obj.parent
+    schematics = [str(p) for p in project_dir.rglob("*.kicad_sch")]
+    pcb_files = [str(p) for p in project_dir.rglob("*.kicad_pcb")]
+
+    is_open = False
+    try:
+        open_paths = get_open_project_paths()
+        norm = os.path.normpath(os.path.abspath(project_path))
+        is_open = any(os.path.normpath(os.path.abspath(p)) == norm for p in open_paths)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return _ok(
+        {
+            "project_path": str(project_path),
+            "schematics": schematics,
+            "pcb": pcb_files,
+            "is_open": is_open,
+        }
+    )
+
+
+@mcp.tool()
+def kicad_save_schematic(window_title_hint: str = "") -> Dict[str, Any]:
+    """Trigger a save in the KiCad schematic editor via keyboard automation.
+
+    Sends Ctrl+S to the focused KiCad window.  This is a best-effort
+    approach because KiCad does not expose a programmatic save command.
+
+    Args:
+        window_title_hint: Optional substring of the KiCad window title to
+                           target a specific instance (currently unused on
+                           non-Windows platforms; reserved for future use).
+
+    Returns:
+        ``{"triggered": true}`` if the keyboard shortcut was sent, or an
+        error if the platform is not supported or automation is unavailable.
+    """
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import ctypes
+
+            VK_CONTROL = 0x11
+            VK_S = 0x53
+            KEYEVENTF_KEYUP = 0x0002
+
+            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_S, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_S, 0, KEYEVENTF_KEYUP, 0)
+            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            return _ok({"triggered": True, "method": "ctypes_keybd_event"})
+
+        elif system in ("Linux", "Darwin"):
+            # Try xdotool on Linux, osascript on macOS
+            if system == "Linux":
+                if shutil.which("xdotool"):
+                    os.system("xdotool key --clearmodifiers ctrl+s")
+                    return _ok({"triggered": True, "method": "xdotool"})
+                return _err("xdotool not found; install xdotool for keyboard automation")
+            else:
+                os.system(
+                    "osascript -e 'tell application \"System Events\" "
+                    'to keystroke "s" using command down\''
+                )
+                return _ok({"triggered": True, "method": "osascript"})
+        else:
+            return _err(f"Keyboard automation not supported on platform: {system}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to send save shortcut: {exc}")
+
+
+@mcp.tool()
+def kicad_reload_schematic(window_title_hint: str = "") -> Dict[str, Any]:
+    """Trigger a schematic reload in KiCad via keyboard automation.
+
+    Sends Ctrl+Shift+R (or equivalent) to the focused KiCad window.
+
+    Args:
+        window_title_hint: Optional window title hint (reserved for future).
+
+    Returns:
+        ``{"triggered": true}`` on success or an error.
+    """
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import ctypes
+
+            VK_CONTROL = 0x11
+            VK_SHIFT = 0x10
+            VK_R = 0x52
+            KEYEVENTF_KEYUP = 0x0002
+
+            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_R, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
+            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
+            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            return _ok({"triggered": True, "method": "ctypes_keybd_event"})
+
+        elif system in ("Linux", "Darwin"):
+            if system == "Linux":
+                if shutil.which("xdotool"):
+                    os.system("xdotool key --clearmodifiers ctrl+shift+r")
+                    return _ok({"triggered": True, "method": "xdotool"})
+                return _err("xdotool not found; install xdotool for keyboard automation")
+            else:
+                os.system(
+                    "osascript -e 'tell application \"System Events\" "
+                    'to keystroke "r" using {command down, shift down}\''
+                )
+                return _ok({"triggered": True, "method": "osascript"})
+        else:
+            return _err(f"Keyboard automation not supported on platform: {system}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to send reload shortcut: {exc}")
+
+
+@mcp.tool()
+def kicad_get_board_info(path: str) -> Dict[str, Any]:
+    """Read board information from a PCB file (read-only).
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        Dict with ``net_count``, ``footprint_count``, ``track_count``,
+        ``via_count``, and ``layer_stackup``.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    return _ok(
+        {
+            "path": str(path),
+            "net_count": len(board.nets),
+            "footprint_count": len(board.footprints),
+            "track_count": len(board.tracks),
+            "via_count": len(board.vias),
+            "layer_stackup": board.get_layer_stackup(),
+        }
+    )
+
+
+# ===========================================================================
+# 2.6  Project Context Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def project_get_context(project_path: str) -> Dict[str, Any]:
+    """Get a project summary: schematics, libraries, BOM sketch.
+
+    Args:
+        project_path: Path to the ``.kicad_pro`` project file or project
+                      directory.
+
+    Returns:
+        Dict with lists of schematic symbols, library paths, and whether a
+        KIASSIST.md memory file exists.
+    """
+    path_obj = Path(project_path)
+    if path_obj.is_file():
+        project_dir = path_obj.parent
+    elif path_obj.is_dir():
+        project_dir = path_obj
+    else:
+        return _err(f"Path not found: {project_path}")
+
+    schematics = list(project_dir.rglob("*.kicad_sch"))
+
+    bom: List[Dict[str, Any]] = []
+    for sch_path in schematics:
+        try:
+            sch = Schematic.load(sch_path)
+            for sym in sch.symbols:
+                bom.append(
+                    {
+                        "reference": sym.reference,
+                        "value": sym.value,
+                        "footprint": sym.footprint,
+                        "schematic": str(sch_path),
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    memory_path = project_dir / "KIASSIST.md"
+
+    return _ok(
+        {
+            "project_dir": str(project_dir),
+            "schematic_count": len(schematics),
+            "bom_entries": bom,
+            "has_memory_file": memory_path.exists(),
+            "memory_file_path": str(memory_path),
+        }
+    )
+
+
+@mcp.tool()
+def project_read_memory(project_path: str) -> Dict[str, Any]:
+    """Read the KIASSIST.md project memory file.
+
+    Args:
+        project_path: Path to the ``.kicad_pro`` project file or project
+                      directory.
+
+    Returns:
+        Dict with ``content`` (the Markdown text) or an error if the file
+        does not exist.
+    """
+    path_obj = Path(project_path)
+    project_dir = path_obj.parent if path_obj.is_file() else path_obj
+    memory_path = project_dir / "KIASSIST.md"
+
+    if not memory_path.exists():
+        return _err("KIASSIST.md not found.  Use project_write_memory to create it.")
+
+    try:
+        content = memory_path.read_text(encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to read KIASSIST.md: {exc}")
+
+    return _ok({"path": str(memory_path), "content": content})
+
+
+@mcp.tool()
+def project_write_memory(project_path: str, content: str) -> Dict[str, Any]:
+    """Write or update the KIASSIST.md project memory file.
+
+    Args:
+        project_path: Path to the ``.kicad_pro`` project file or project
+                      directory.
+        content:      Full Markdown text to write.
+
+    Returns:
+        ``{"written": true, "path": "<path>"}`` on success.
+    """
+    path_obj = Path(project_path)
+    project_dir = path_obj.parent if path_obj.is_file() else path_obj
+
+    if not project_dir.exists():
+        return _err(f"Project directory not found: {project_dir}")
+
+    memory_path = project_dir / "KIASSIST.md"
+    try:
+        memory_path.write_text(content, encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to write KIASSIST.md: {exc}")
+
+    return _ok({"written": True, "path": str(memory_path)})
+
+
+# ===========================================================================
+# In-process call entry point
+# ===========================================================================
+
+
+async def in_process_call(tool_name: str, args: Dict[str, Any]) -> Any:
+    """Call an MCP tool in-process without going through the stdio transport.
+
+    This is useful for integrating MCP tools directly into the KiAssistAPI
+    chat loop without spawning a separate process.
+
+    Args:
+        tool_name: Name of the registered MCP tool (e.g. ``"schematic_open"``).
+        args:      Tool arguments dict.
+
+    Returns:
+        The raw return value of the tool function (typically a dict).
+
+    Raises:
+        KeyError: If *tool_name* is not registered.
+    """
+    raw = await mcp.call_tool(tool_name, args)
+    # FastMCP 1.x returns a (list[ContentBlock], structured_result) tuple.
+    # The structured_result dict contains a ``result`` key with the actual
+    # return value.  Fall back to parsing the first text content block when
+    # the structured result is unavailable.
+    if isinstance(raw, tuple) and len(raw) == 2:
+        content_blocks, structured = raw
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
+        # Fall back: parse first text content block as JSON
+        if content_blocks and hasattr(content_blocks[0], "text"):
+            try:
+                return json.loads(content_blocks[0].text)
+            except (json.JSONDecodeError, AttributeError):
+                return content_blocks[0].text
+    # Sequence of ContentBlock (older FastMCP versions)
+    if raw and hasattr(raw[0], "text"):
+        try:
+            return json.loads(raw[0].text)
+        except (json.JSONDecodeError, AttributeError):
+            return raw[0].text
+    return raw
+
+
+# ===========================================================================
+# Entry point
+# ===========================================================================
+
+
+def main() -> None:
+    """Run the KiAssist MCP server on stdio."""
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

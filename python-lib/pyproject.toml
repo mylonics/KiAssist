@@ -14,6 +14,7 @@ dependencies = [
     "keyring>=24.0.0",
     "kicad-python>=0.6.0",
     "kicad-sch-api>=0.5.6",
+    "mcp>=1.0.0",
 ]
 authors = [
     {name = "KiAssist Contributors"}
@@ -41,3 +42,4 @@ dev = [
 
 [project.scripts]
 kiassist = "kiassist_utils.main:main"
+kiassist-mcp = "kiassist_utils.mcp_server:main"
