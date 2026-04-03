@@ -3,6 +3,7 @@
 import ctypes
 import ctypes.wintypes
 import json
+import logging
 import os
 import platform
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from tempfile import gettempdir
 from typing import List, Dict, Any, Optional
 
+logger = logging.getLogger(__name__)
 
 # Cache the current OS platform
 _CURRENT_PLATFORM = platform.system()
@@ -127,7 +129,7 @@ def discover_socket_files() -> List[Path]:
                     # Reconstruct the path using socket_dir for consistent format
                     sockets.append(socket_dir / filename)
         except Exception as e:
-            print(f"Warning: Could not enumerate Windows named pipes: {e}")
+            logger.warning("Could not enumerate Windows named pipes: %s", e)
         
         return sockets
     
@@ -149,7 +151,7 @@ def discover_socket_files() -> List[Path]:
                     ):
                         sockets.append(entry)
     except Exception as e:
-        print(f"Warning: Could not scan socket directory: {e}")
+        logger.warning("Could not scan socket directory: %s", e)
     
     # Sort sockets by name to ensure consistent ordering
     sockets.sort()
@@ -434,7 +436,7 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
             from kipy import KiCad
             from kipy.proto.common.types import base_types_pb2
         except ImportError:
-            print("Warning: kicad-python package not available. KiCad detection disabled.")
+            logger.warning("kicad-python package not available. KiCad detection disabled.")
             return None
         
         # Create KiCad connection with required parameters
@@ -489,11 +491,11 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
                     elif hasattr(doc, 'file_path'):
                         pcb_path = doc.file_path
                 except Exception as e:
-                    print(f"Could not get PCB path from document: {e}")
+                    logger.debug("Could not get PCB path from document: %s", e)
         except Exception as e:
             # "no handler available" is expected when KiCad PCB editor isn't open yet
             if "no handler" not in str(e).lower():
-                print(f"Could not get PCB documents: {e}")
+                logger.warning("Could not get PCB documents: %s", e)
         
         try:
             # Get schematic documents
@@ -512,11 +514,11 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
                     elif hasattr(doc, 'file_path'):
                         schematic_path = doc.file_path
                 except Exception as e:
-                    print(f"Could not get schematic path from document: {e}")
+                    logger.debug("Could not get schematic path from document: %s", e)
         except Exception as e:
             # "no handler available" is expected when KiCad schematic editor isn't open yet
             if "no handler" not in str(e).lower():
-                print(f"Could not get schematic documents: {e}")
+                logger.warning("Could not get schematic documents: %s", e)
         
         # Fallback: if IPC didn't give us a project, try process window title
         if not project_path:
@@ -549,7 +551,7 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
                             if sch_files:
                                 schematic_path = str(sch_files[0])
             except Exception as e:
-                print(f"Could not search project directory: {e}")
+                logger.debug("Could not search project directory: %s", e)
         
         display_name = project_name if project_name != "No Project Open" else "KiCad (No Project)"
         
@@ -565,7 +567,7 @@ def probe_kicad_instance(socket_path: str) -> Optional[KiCadInstance]:
             schematic_open=schematic_open
         )
     except Exception as e:
-        print(f"Warning: Could not probe KiCad instance at {socket_path}: {e}")
+        logger.warning("Could not probe KiCad instance at %s: %s", socket_path, e)
         return None
 
 

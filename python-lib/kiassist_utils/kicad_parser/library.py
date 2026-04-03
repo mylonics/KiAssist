@@ -29,21 +29,11 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .sexpr import parse, SExpr
+from ._helpers import _find, _find_all
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Module-local helper utilities
 # ---------------------------------------------------------------------------
-
-
-def _find(tree: List[SExpr], tag: str) -> Optional[List[SExpr]]:
-    for item in tree:
-        if isinstance(item, list) and item and item[0] == tag:
-            return item
-    return None
-
-
-def _find_all(tree: List[SExpr], tag: str) -> List[List[SExpr]]:
-    return [item for item in tree if isinstance(item, list) and item and item[0] == tag]
 
 
 def _atom(tree: List[SExpr], tag: str, default: str = "") -> str:

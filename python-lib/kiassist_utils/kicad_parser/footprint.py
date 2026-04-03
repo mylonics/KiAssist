@@ -20,28 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .models import Effects, Position, Property, KiUUID, Stroke
 from .sexpr import QStr, SExpr, parse, serialize
+from ._helpers import _find, _find_all, _parse_position
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Module-local helper utilities
 # ---------------------------------------------------------------------------
-
-
-def _find(tree: List[SExpr], tag: str) -> Optional[List[SExpr]]:
-    for item in tree:
-        if isinstance(item, list) and item and item[0] == tag:
-            return item
-    return None
-
-
-def _find_all(tree: List[SExpr], tag: str) -> List[List[SExpr]]:
-    return [item for item in tree if isinstance(item, list) and item and item[0] == tag]
-
-
-def _parse_position(tree: List[SExpr]) -> Position:
-    x = float(tree[1]) if len(tree) > 1 else 0.0
-    y = float(tree[2]) if len(tree) > 2 else 0.0
-    angle = float(tree[3]) if len(tree) > 3 else 0.0
-    return Position(x, y, angle)
 
 
 def _parse_size(tree: List[SExpr]) -> Tuple[float, float]:
