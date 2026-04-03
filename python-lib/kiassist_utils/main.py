@@ -12,6 +12,7 @@ import webview
 from .api_key import ApiKeyStore
 from .ai.base import AIProvider, AIMessage
 from .ai.gemini import GeminiProvider
+from .ai.ollama import OllamaProvider
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path
 from .requirements_wizard import (
@@ -150,9 +151,11 @@ class KiAssistAPI:
         for info in _PROVIDER_REGISTRY:
             entry = dict(info)
             if info["id"] == "local":
-                # For local models, "has_key" indicates the server is reachable
-                # (we optimistically report True so the UI doesn't show a ⚠).
-                # The base URL is returned so the frontend can display/edit it.
+                # Local models do not require an API key, so we report
+                # has_key as True to indicate the provider is considered
+                # configured for UI purposes. This does not imply the local
+                # server is reachable. The base URL is returned so the
+                # frontend can display/edit it.
                 entry["has_key"] = True
                 entry["base_url"] = self._get_local_base_url()
             else:
@@ -205,9 +208,14 @@ class KiAssistAPI:
         Local providers always return an instance (they require no API key).
         """
         if provider_name == "local":
-            from .ai.ollama import OllamaProvider
             base_url = self._get_local_base_url()
-            return OllamaProvider(model=model, base_url=base_url)
+            try:
+                return OllamaProvider(model=model, base_url=base_url)
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'openai' package is required to use local models. "
+                    "Install it with: pip install openai"
+                ) from exc
 
         api_key = self.api_key_store.get_api_key(provider_name)
         if not api_key:
@@ -230,11 +238,12 @@ class KiAssistAPI:
         """Return the configured local model server base URL.
 
         Delegates to :meth:`~kiassist_utils.api_key.ApiKeyStore.get_api_key`
-        with provider ``"local"``, which checks (in order):
+        with provider ``"local"``.  The ``local`` provider is file-only
+        (keyring intentionally skipped), so the lookup order is:
 
         1. ``LOCAL_BASE_URL`` environment variable.
-        2. In-memory cache (set via :meth:`set_local_base_url`).
-        3. File-based config (``~/.kiassist/config.json``).
+        2. In-memory cache (populated by :meth:`set_local_base_url`).
+        3. ``~/.kiassist/config.json`` (``local_base_url`` field).
 
         Falls back to the Ollama default ``http://localhost:11434/v1`` when
         none of the above sources yield a value.
@@ -381,28 +390,56 @@ class KiAssistAPI:
             return {"success": False, "error": str(exc)}
 
     def get_local_models(self) -> Dict[str, Any]:
-        """Detect models available on the local Ollama server.
+        """Detect models available on the local model server.
 
-        Queries the ``/api/tags`` endpoint of the configured Ollama server.
-        Returns an error (not an exception) if the server is unreachable so
-        the caller can degrade gracefully.
+        Tries the OpenAI-compatible ``GET /v1/models`` endpoint first
+        (works with both Ollama ≥0.1.24 and LM Studio).  If that fails,
+        falls back to Ollama's native ``GET /api/tags`` endpoint.
+
+        Returns an error dict (not an exception) if the server is unreachable
+        so the caller can degrade gracefully.
 
         Returns:
-            Dictionary with ``models`` list or ``error`` string.
+            Dictionary with ``models`` list, ``base_url`` string, or an
+            ``error`` string on failure.
         """
+        import json as _json
         import urllib.request
-        import urllib.error
 
         base_url = self._get_local_base_url()
-        # Strip the OpenAI-compat /v1 suffix to get the Ollama root URL
         root_url = base_url.rstrip("/")
+        # Ensure the /v1 suffix is present for the OpenAI-compat endpoint
+        if not root_url.endswith("/v1"):
+            v1_url = root_url + "/v1"
+        else:
+            v1_url = root_url
+        openai_models_url = f"{v1_url}/models"
+
+        # -- Attempt 1: OpenAI-compatible /v1/models (Ollama ≥0.1.24, LM Studio) --
+        try:
+            with urllib.request.urlopen(openai_models_url, timeout=5) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            raw_models = data.get("data", [])
+            models = [
+                {"id": m.get("id", ""), "name": m.get("id", "")}
+                for m in raw_models
+                if m.get("id")
+            ]
+            if models:
+                return {"success": True, "models": models, "base_url": base_url}
+        except Exception:
+            pass  # fall through to Ollama-native endpoint
+
+        # -- Attempt 2: Ollama-native /api/tags --
+        # Strip /v1 suffix to reach the Ollama root
         if root_url.endswith("/v1"):
-            root_url = root_url[:-3]
-        tags_url = f"{root_url}/api/tags"
+            ollama_root = root_url[:-3]
+        else:
+            ollama_root = root_url
+        tags_url = f"{ollama_root}/api/tags"
 
         try:
             with urllib.request.urlopen(tags_url, timeout=5) as resp:
-                import json as _json
                 data = _json.loads(resp.read().decode("utf-8"))
             raw_models = data.get("models", [])
             models = [
@@ -415,8 +452,8 @@ class KiAssistAPI:
             return {
                 "success": False,
                 "error": (
-                    f"Could not reach local model server at {tags_url}: {exc}. "
-                    "Make sure Ollama (or your local server) is running."
+                    f"Could not reach local model server at {base_url}: {exc}. "
+                    "Make sure Ollama or LM Studio is running."
                 ),
                 "models": [],
                 "base_url": base_url,

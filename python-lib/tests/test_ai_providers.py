@@ -47,6 +47,12 @@ from kiassist_utils.ai.openai import (
 )
 from kiassist_utils.ai.tool_executor import ToolExecutor
 from kiassist_utils.api_key import ApiKeyStore
+from kiassist_utils.ai.ollama import (
+    OllamaProvider,
+    _DEFAULT_CONTEXT_WINDOW,
+    _DEFAULT_MAX_OUTPUT_TOKENS,
+    _DEFAULT_BASE_URL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -866,8 +872,6 @@ class TestApiKeyStoreMultiProvider:
 # OllamaProvider tests
 # ---------------------------------------------------------------------------
 
-from kiassist_utils.ai.ollama import OllamaProvider, _DEFAULT_CONTEXT_WINDOW, _DEFAULT_MAX_OUTPUT_TOKENS
-
 
 class TestOllamaProvider:
     def _make_provider(self, model="llama3.2", base_url="http://localhost:11434/v1"):
@@ -909,7 +913,6 @@ class TestOllamaProvider:
         p._delegate.chat.assert_called_once_with(msgs, None, None)
 
     def test_default_base_url_is_ollama(self):
-        from kiassist_utils.ai.ollama import _DEFAULT_BASE_URL
         assert "11434" in _DEFAULT_BASE_URL  # Ollama default port
 
     def test_exported_from_package(self):

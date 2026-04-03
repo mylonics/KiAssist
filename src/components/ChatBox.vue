@@ -171,7 +171,12 @@ async function onProviderChange() {
   localStorage.setItem(MODEL_KEY, selectedModel.value);
 
   if (window.pywebview?.api) {
-    await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+    const result = await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+    if (!result.success) {
+      console.error('[UI] set_provider failed:', result.error);
+    } else if (result.warning) {
+      console.warn('[UI] set_provider warning:', result.warning);
+    }
   }
   // Derive hasApiKey from the in-memory providers list (no extra IPC call)
   hasApiKey.value = selectedProvider.value === 'local'
@@ -194,20 +199,30 @@ async function onSecondaryProviderChange() {
   localStorage.setItem(SECONDARY_PROVIDER_KEY, selectedSecondaryProvider.value);
   localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
   if (window.pywebview?.api) {
-    await window.pywebview.api.set_secondary_model(
+    const result = await window.pywebview.api.set_secondary_model(
       selectedSecondaryProvider.value,
       selectedSecondaryModel.value,
     );
+    if (!result.success) {
+      console.error('[UI] set_secondary_model failed:', result.error);
+    } else if (result.warning) {
+      console.warn('[UI] set_secondary_model warning:', result.warning);
+    }
   }
 }
 
 async function onSecondaryModelChange() {
   localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
   if (window.pywebview?.api) {
-    await window.pywebview.api.set_secondary_model(
+    const result = await window.pywebview.api.set_secondary_model(
       selectedSecondaryProvider.value,
       selectedSecondaryModel.value,
     );
+    if (!result.success) {
+      console.error('[UI] set_secondary_model failed:', result.error);
+    } else if (result.warning) {
+      console.warn('[UI] set_secondary_model warning:', result.warning);
+    }
   }
 }
 
@@ -445,7 +460,8 @@ async function detectLocalModels() {
       localBaseUrlError.value = result.error || 'Could not connect to local server.';
     }
   } catch (e) {
-    localBaseUrlError.value = `Error: ${e}`;
+    const errorMessage = e instanceof Error ? e.message : String(e);
+    localBaseUrlError.value = `Error: ${errorMessage}`;
   } finally {
     isLoadingLocalModels.value = false;
   }
@@ -744,7 +760,9 @@ onMounted(() => {
             Configure the URL of your local OpenAI-compatible server.
             Supported servers: <strong>Ollama</strong> (default <code>http://localhost:11434/v1</code>)
             and <strong>LM Studio</strong> (default <code>http://localhost:1234/v1</code>).
-            No API key is required.
+            No API key is required. Model detection uses the OpenAI-compatible
+            <code>/v1/models</code> endpoint (works with both servers) and falls back
+            to Ollama's <code>/api/tags</code> endpoint.
           </p>
           <div class="local-url-row">
             <input

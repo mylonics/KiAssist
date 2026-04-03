@@ -6,14 +6,18 @@ methods accept an optional *provider* parameter.  When omitted the default is
 
 Supported provider names and their environment variable mappings:
 
-=========  =====================  ====================
-Provider   Keyring key name       Environment variable
-=========  =====================  ====================
-gemini     kiassist-gemini        GEMINI_API_KEY
-claude     kiassist-claude        ANTHROPIC_API_KEY
-openai     kiassist-openai        OPENAI_API_KEY
-local      (file only)            LOCAL_BASE_URL
-=========  =====================  ====================
+=========  =====================  ====================  =============
+Provider   Keyring key name       Environment variable  Keyring used?
+=========  =====================  ====================  =============
+gemini     kiassist-gemini        GEMINI_API_KEY        yes
+claude     kiassist-claude        ANTHROPIC_API_KEY     yes
+openai     kiassist-openai        OPENAI_API_KEY        yes
+local      (n/a)                  LOCAL_BASE_URL        **no**
+=========  =====================  ====================  =============
+
+The ``local`` provider stores a server base URL rather than an API key.
+It is intentionally kept out of the OS keyring (base URLs are not
+sensitive credentials) and persisted only to the config file.
 """
 
 import os
@@ -34,6 +38,9 @@ _PROVIDER_META: Dict[str, Tuple[str, str, str]] = {
     # "local" stores the server base URL, not an API key; keyring not used.
     "local": ("kiassist-local", "LOCAL_BASE_URL", "local_base_url"),
 }
+
+#: Providers that should never touch the OS keyring (base URLs are not secrets).
+_FILE_ONLY_PROVIDERS = frozenset({"local"})
 
 _DEFAULT_PROVIDER = "gemini"
 
@@ -267,20 +274,25 @@ class ApiKeyStore:
         return self.get_api_key(provider) is not None
 
     def get_api_key(self, provider: Optional[str] = None) -> Optional[str]:
-        """Get the stored API key for *provider*.
+        """Get the stored API key (or base URL) for *provider*.
 
-        Priority:
+        Priority for cloud providers (gemini, claude, openai):
         1. Environment variable (e.g. ``GEMINI_API_KEY``)
         2. Memory cache
         3. OS keyring (if available)
         4. File-based config
 
+        The ``local`` provider is file-only (no keyring):
+        1. ``LOCAL_BASE_URL`` environment variable
+        2. Memory cache
+        3. File-based config
+
         Args:
-            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
-                      (defaults to ``"gemini"``).
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, ``"local"``,
+                      or ``None`` (defaults to ``"gemini"``).
 
         Returns:
-            The API key if available, ``None`` otherwise.
+            The API key / base URL if available, ``None`` otherwise.
         """
         p = self._resolve_provider(provider)
         env_var = self._get_env_var(p)
@@ -296,8 +308,8 @@ class ApiKeyStore:
         if cached:
             return cached
 
-        # 3. OS keyring
-        if self._is_keyring_available():
+        # 3. OS keyring (skipped for file-only providers such as "local")
+        if p not in _FILE_ONLY_PROVIDERS and self._is_keyring_available():
             try:
                 stored_key = keyring.get_password(self.SERVICE_NAME, keyring_key)
                 if stored_key:
@@ -319,16 +331,21 @@ class ApiKeyStore:
         api_key: str,
         provider: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
-        """Store an API key for *provider*.
+        """Store an API key (or base URL) for *provider*.
+
+        For cloud providers this tries the OS keyring first and falls back to
+        the config file.  For the ``local`` provider (which stores a base URL,
+        not a secret) the keyring is skipped entirely and the value is written
+        directly to ``~/.kiassist/config.json``.
 
         Args:
-            api_key:  The API key to store.
-            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
-                      (defaults to ``"gemini"``).
+            api_key:  The API key / base URL to store.
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, ``"local"``,
+                      or ``None`` (defaults to ``"gemini"``).
 
         Returns:
             Tuple of ``(success, warning_message)`` where *success* is
-            ``True`` if the key was stored (at least in memory) and
+            ``True`` if the value was stored (at least in memory) and
             *warning_message* is a non-fatal advisory string or ``None``.
 
         Raises:
@@ -347,36 +364,36 @@ class ApiKeyStore:
         persisted = False
         warning = None
 
-        # Try keyring
-        if self._is_keyring_available():
+        # Try keyring — skipped for file-only providers (e.g. "local")
+        if p not in _FILE_ONLY_PROVIDERS and self._is_keyring_available():
             try:
                 keyring.set_password(self.SERVICE_NAME, keyring_key, api_key)
                 persisted = True
             except (keyring.errors.KeyringError, keyring.errors.PasswordSetError, OSError):
                 pass
 
-        # Fallback to file
+        # Fallback to file (always used for file-only providers)
         if not persisted:
             if self._save_to_file(api_key, p):
                 persisted = True
             else:
-                warning = "API key saved to memory only. It will not persist after restart."
+                warning = "Value saved to memory only. It will not persist after restart."
 
         return (True, warning)
 
     def clear_api_key(self, provider: Optional[str] = None) -> None:
-        """Clear the stored API key for *provider*.
+        """Clear the stored API key (or base URL) for *provider*.
 
         Args:
-            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
-                      (defaults to ``"gemini"``).
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, ``"local"``,
+                      or ``None`` (defaults to ``"gemini"``).
         """
         p = self._resolve_provider(provider)
         keyring_key = self._get_keyring_key(p)
 
         self._memory_keys[p] = None
 
-        if self._is_keyring_available():
+        if p not in _FILE_ONLY_PROVIDERS and self._is_keyring_available():
             try:
                 keyring.delete_password(self.SERVICE_NAME, keyring_key)
             except (keyring.errors.KeyringError, keyring.errors.PasswordDeleteError, OSError):

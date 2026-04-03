@@ -466,31 +466,22 @@ class TestLocalProvider:
         assert "empty" in result["error"].lower()
 
     def test_set_provider_local_creates_ollama_provider(self, api, monkeypatch):
+        local_base_url = "http://127.0.0.1:11434/v1"
+        api.api_key_store.get_api_key.side_effect = lambda p=None: (
+            local_base_url if p == "local" else None
+        )
+
         fake_ollama = _FakeProvider("local AI response")
-        monkeypatch.setattr(
-            _main_mod,
-            "_PROVIDER_REGISTRY",
-            [p for p in _main_mod._PROVIDER_REGISTRY],  # keep existing
-        )
-        from kiassist_utils.ai import ollama as ollama_mod
-        monkeypatch.setattr(
-            ollama_mod,
-            "OpenAIProvider",
-            lambda api_key, model, base_url: fake_ollama,  # type: ignore[misc]
-        )
-        # Monkey-patch _create_provider to use OllamaProvider stub
-        original_create = api._create_provider
+        with patch.object(_main_mod, "OllamaProvider", autospec=True) as mock_ollama_cls:
+            mock_ollama_cls.return_value = fake_ollama
+            result = api.set_provider("local", "llama3.2")
 
-        def _patched_create(provider_name, model):
-            if provider_name == "local":
-                from kiassist_utils.ai.ollama import OllamaProvider
-                return OllamaProvider.__new__(OllamaProvider)
-            return original_create(provider_name, model)
-
-        monkeypatch.setattr(api, "_create_provider", _patched_create)
-        result = api.set_provider("local", "llama3.2")
         assert result["success"] is True
         assert api.current_provider_name == "local"
+        mock_ollama_cls.assert_called_once()
+        call_kwargs = mock_ollama_cls.call_args[1]
+        assert call_kwargs.get("model") == "llama3.2"
+        assert call_kwargs.get("base_url") == local_base_url
 
     def test_get_local_models_server_unreachable(self, api):
         """When Ollama is not running, get_local_models returns an error dict."""
