@@ -140,8 +140,8 @@ class ToolExecutor:
             response = await asyncio.to_thread(
                 self.provider.chat,
                 conversation,
-                schemas if self.provider.supports_tool_calling() else None,
-                system_prompt,
+                tools=schemas if self.provider.supports_tool_calling() else None,
+                system_prompt=system_prompt,
             )
 
             # If no tool calls → we have the final answer

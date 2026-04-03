@@ -20,7 +20,6 @@ Shortcut       Actual model ID
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
