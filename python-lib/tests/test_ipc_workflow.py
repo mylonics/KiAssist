@@ -288,6 +288,57 @@ class TestSchematicEditPipeline:
         assert result["pipeline"]["reload_triggered"] is False
         assert "kicad_reload_schematic" not in calls
 
+    def test_save_triggered_false_when_save_returns_error(self, tmp_sch: Path):
+        """save_triggered must be False when kicad_save_schematic returns status=error."""
+        calls: list = []
+
+        async def fake_ipc(tool_name: str, args: dict) -> Any:
+            calls.append(tool_name)
+            if tool_name == "kicad_save_schematic":
+                return {"status": "error", "message": "xdotool not found"}
+            return {"status": "ok", "data": {}}
+
+        async def _run():
+            pipeline = SchematicEditPipeline(
+                str(tmp_sch),
+                save_before_edit=True,
+                reload_after_edit=True,
+                save_wait=0,
+                reload_wait=0,
+            )
+            with mock.patch.object(wf, "is_file_open_in_kicad", return_value=True):
+                with mock.patch.object(wf, "in_process_call", fake_ipc):
+                    return await pipeline.run("my_edit_tool", {})
+
+        result = asyncio.run(_run())
+        # Save was attempted but returned error → save_triggered must be False
+        assert "kicad_save_schematic" in calls
+        assert result["pipeline"]["save_triggered"] is False
+        # The edit itself succeeded
+        assert result["status"] == "ok"
+
+    def test_reload_triggered_false_when_reload_returns_error(self, tmp_sch: Path):
+        """reload_triggered must be False when kicad_reload_schematic returns status=error."""
+        async def fake_ipc(tool_name: str, args: dict) -> Any:
+            if tool_name == "kicad_reload_schematic":
+                return {"status": "error", "message": "xdotool not found"}
+            return {"status": "ok", "data": {}}
+
+        async def _run():
+            pipeline = SchematicEditPipeline(
+                str(tmp_sch),
+                save_before_edit=False,
+                reload_after_edit=True,
+                save_wait=0,
+                reload_wait=0,
+            )
+            with mock.patch.object(wf, "is_file_open_in_kicad", return_value=True):
+                with mock.patch.object(wf, "in_process_call", fake_ipc):
+                    return await pipeline.run("my_edit_tool", {})
+
+        result = asyncio.run(_run())
+        assert result["pipeline"]["reload_triggered"] is False
+
     def test_exception_in_tool_results_in_error(self, tmp_sch: Path):
         """An exception raised by the tool returns an error result."""
 

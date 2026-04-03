@@ -257,12 +257,33 @@ _RELOAD_WAIT_SECONDS = 0.5
 
 
 class SchematicEditPipeline:
-    """Orchestrate the KiCad IPC save → edit → reload workflow.
+    """Orchestrate the KiCad keyboard-save → direct-file-edit → keyboard-reload workflow.
 
-    This class implements Phase 5.3: before modifying a KiCad file it
-    optionally saves the live KiCad editor (to avoid clobbering unsaved work),
-    then runs the requested MCP tool, then optionally reloads the editor so
-    the user sees the AI's changes immediately.
+    **Architecture note — IPC vs direct file edits:**
+
+    KiCad exposes a native IPC API (via kipy over a Unix socket / named pipe)
+    that KiAssist uses **only for detection** (determining which files are
+    currently open in a live KiCad instance, via
+    :func:`is_file_open_in_kicad`).  The IPC API does *not* expose save or
+    reload commands, so those operations fall back to keyboard automation:
+
+    * **Save** — sends Ctrl+S to the focused KiCad window via
+      ``kicad_save_schematic`` (ctypes on Windows, xdotool on Linux, osascript
+      on macOS).
+    * **Reload** — sends Ctrl+Shift+R via ``kicad_reload_schematic``.
+
+    This is a necessary workaround and is intentional per the Phase 5 design.
+    The actual *file modifications* are always performed by our custom parsers
+    writing directly to disk — never through the KiCad IPC API.
+
+    The pipeline therefore follows this sequence:
+
+    1. **IPC detection** — check if the target file is open in KiCad.
+    2. **Keyboard save** (if open) — flush any unsaved KiCad changes to disk.
+    3. **Direct file edit** — invoke the requested MCP tool (parser-based).
+    4. **Rollback** — restore the ``.bak`` backup if the edit fails.
+    5. **Keyboard reload** (if open and edit succeeded) — KiCad re-reads the
+       new file from disk.
 
     Args:
         file_path:        Path to the ``.kicad_sch`` (or ``.kicad_pcb``) file.
@@ -387,11 +408,17 @@ class SchematicEditPipeline:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("kicad_reload_schematic failed: %s", exc)
 
-        # Annotate the result with pipeline metadata
+        # Annotate the result with pipeline metadata.
+        # save_triggered / reload_triggered are True only when the respective
+        # keyboard-automation call succeeded (status == "ok"), not merely when
+        # the call was attempted.
+        def _call_succeeded(r: Optional[Dict[str, Any]]) -> bool:
+            return isinstance(r, dict) and r.get("status") == "ok"
+
         pipeline_meta: Dict[str, Any] = {
             "file_was_open_in_kicad": file_open,
-            "save_triggered": save_result is not None,
-            "reload_triggered": reload_result is not None,
+            "save_triggered": _call_succeeded(save_result),
+            "reload_triggered": _call_succeeded(reload_result),
         }
         if isinstance(edit_result, dict):
             edit_result["pipeline"] = pipeline_meta
@@ -438,15 +465,17 @@ async def run_edit_pipeline(
     norm = os.path.normpath(os.path.abspath(file_path))
     file_open = is_file_open_in_kicad(file_path)
 
-    # Save before the batch
+    # Save before the batch; capture the result to accurately report success.
     save_triggered = False
     if save_before_first and file_open:
         try:
-            await ipc(
+            save_res = await ipc(
                 "kicad_save_schematic",
                 {"window_title_hint": window_title_hint},
             )
-            save_triggered = True
+            save_triggered = isinstance(save_res, dict) and save_res.get("status") == "ok"
+            if not save_triggered:
+                logger.warning("kicad_save_schematic returned non-ok result: %s", save_res)
         except Exception as exc:  # noqa: BLE001
             logger.warning("kicad_save_schematic failed: %s", exc)
         if save_wait > 0:
@@ -502,17 +531,19 @@ async def run_edit_pipeline(
                     edit_result["pipeline"] = meta
                 results.append(edit_result)
 
-    # Reload after the batch
+    # Reload after the batch; capture result to accurately report success.
     reload_triggered = False
     if reload_after_last and file_open and all_ok:
         if reload_wait > 0:
             await asyncio.sleep(reload_wait)
         try:
-            await ipc(
+            reload_res = await ipc(
                 "kicad_reload_schematic",
                 {"window_title_hint": window_title_hint},
             )
-            reload_triggered = True
+            reload_triggered = isinstance(reload_res, dict) and reload_res.get("status") == "ok"
+            if not reload_triggered:
+                logger.warning("kicad_reload_schematic returned non-ok result: %s", reload_res)
         except Exception as exc:  # noqa: BLE001
             logger.warning("kicad_reload_schematic failed: %s", exc)
 

@@ -1589,20 +1589,32 @@ async def kicad_edit_file_pipeline(
     save_before_edit: bool = True,
     reload_after_edit: bool = True,
 ) -> Dict[str, Any]:
-    """Orchestrate the KiCad IPC save → edit → reload pipeline (Phase 5.3).
+    """Orchestrate the full keyboard-save → direct-file-edit → keyboard-reload pipeline (Phase 5.3).
 
-    This tool wraps a single file-editing MCP tool call with the full
-    Phase 5 workflow:
+    **When to use this tool:**  call it whenever you want to edit a KiCad file
+    (``.kicad_sch`` or ``.kicad_pcb``) that may be open in a live KiCad
+    instance.  It handles the three-phase workflow automatically:
 
-    1. If the file is open in KiCad and *save_before_edit* is ``true``,
-       trigger ``kicad_save_schematic`` so any unsaved KiCad changes are
-       flushed to disk first.
-    2. Acquire an advisory file lock to prevent concurrent modifications.
-    3. Execute *tool_name* with *tool_args*.
-    4. On failure, automatically restore the ``.bak`` backup (rollback).
-    5. Release the lock.
-    6. If the file is still open in KiCad and *reload_after_edit* is ``true``,
-       trigger ``kicad_reload_schematic`` so the editor shows the new content.
+    1. **IPC detection** — checks via KiCad's IPC socket whether the file is
+       currently open.  If it is not open, steps 2 and 6 are skipped.
+    2. **Keyboard save** (if open) — sends Ctrl+S to the focused KiCad window
+       via ``kicad_save_schematic`` so any unsaved KiCad changes are flushed to
+       disk before the edit overwrites the file.
+    3. **Advisory file lock** — acquires an OS-level lock to prevent concurrent
+       modifications from other processes.
+    4. **Direct file edit** — invokes *tool_name* with *tool_args*; KiAssist's
+       custom parsers write directly to the ``.kicad_sch`` / ``.kicad_pcb`` file
+       on disk (this never goes through KiCad's IPC API).
+    5. **Rollback** — if the edit fails, the ``.bak`` backup created by
+       ``_safe_save`` is restored automatically.
+    6. **Keyboard reload** (if open and edit succeeded) — sends Ctrl+Shift+R via
+       ``kicad_reload_schematic`` so KiCad re-reads the updated file from disk.
+
+    .. note::
+        KiCad's IPC API does not expose save or reload commands, so steps 2 and
+        6 use keyboard automation as a workaround.  The ``window_title_hint``
+        parameter is reserved for future targeted-window support; currently the
+        keyboard shortcut is sent to the globally focused window.
 
     Args:
         file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
@@ -1610,18 +1622,18 @@ async def kicad_edit_file_pipeline(
         tool_name:         Name of the MCP tool that performs the actual edit
                            (e.g. ``"schematic_add_symbol"``).
         tool_args:         JSON-encoded dict of arguments for *tool_name*.
-        window_title_hint: Optional KiCad window title fragment used to target
-                           a specific instance for save/reload.
-        save_before_edit:  Trigger KiCad save before the edit (default ``true``).
-        reload_after_edit: Trigger KiCad reload after the edit (default ``true``).
+        window_title_hint: Optional KiCad window title fragment reserved for
+                           future targeted-window automation.
+        save_before_edit:  Trigger keyboard save before the edit (default ``true``).
+        reload_after_edit: Trigger keyboard reload after the edit (default ``true``).
 
     Returns:
         The return value of *tool_name* annotated with a ``pipeline`` dict
         containing:
 
-        * ``file_was_open_in_kicad``
-        * ``save_triggered``
-        * ``reload_triggered``
+        * ``file_was_open_in_kicad`` — ``true`` if the file was detected open.
+        * ``save_triggered`` — ``true`` if the keyboard save succeeded.
+        * ``reload_triggered`` — ``true`` if the keyboard reload succeeded.
     """
     try:
         from .ipc_workflow import SchematicEditPipeline
