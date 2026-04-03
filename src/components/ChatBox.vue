@@ -623,11 +623,12 @@ onMounted(() => {
       <div class="header-controls">
         <!-- Provider selector — always visible so users can switch/configure providers -->
         <template v-if="providers.length > 0">
-          <label for="provider-select" class="model-label">Provider:</label>
           <select
             id="provider-select"
             v-model="selectedProvider"
             class="model-select"
+            title="Select AI Provider"
+            aria-label="AI Provider"
             @change="onProviderChange"
           >
             <option v-for="p in providers" :key="p.id" :value="p.id">
@@ -636,8 +637,14 @@ onMounted(() => {
           </select>
 
           <!-- Model selector (provider-specific) -->
-          <label for="model-select" class="model-label">Model:</label>
-          <select id="model-select" v-model="selectedModel" class="model-select" @change="onModelChange">
+          <select
+            id="model-select"
+            v-model="selectedModel"
+            class="model-select"
+            title="Select Model"
+            aria-label="AI Model"
+            @change="onModelChange"
+          >
             <option v-for="model in availableModels" :key="model.id" :value="model.id">
               {{ model.name }}
             </option>
@@ -777,12 +784,6 @@ onMounted(() => {
   flex: 1;
 }
 
-.model-label {
-  font-size: 0.8125rem;
-  color: var(--text-secondary);
-  font-weight: 500;
-}
-
 .model-select {
   padding: 0.375rem 0.625rem;
   background-color: var(--bg-input);
@@ -807,10 +808,7 @@ onMounted(() => {
 .icon-btn {
   padding: 0.375rem;
   background: transparent;
-  border: none;
   border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: all 0.15s ease;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1185,25 +1183,13 @@ textarea:focus {
 }
 
 button {
-  padding: 0.625rem 1.25rem;
-  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
-  color: white;
+  cursor: pointer;
   border: none;
   border-radius: var(--radius-md);
+  font-family: inherit;
   font-size: 0.9375rem;
   font-weight: 500;
-  cursor: pointer;
   transition: all 0.15s ease;
-  box-shadow: var(--shadow-sm);
-}
-
-button:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-md);
-}
-
-button:active:not(:disabled) {
-  transform: translateY(0);
 }
 
 button:disabled {
@@ -1213,9 +1199,21 @@ button:disabled {
 
 .send-btn {
   padding: 0.625rem;
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
+  color: white;
+  box-shadow: var(--shadow-sm);
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.send-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+.send-btn:active:not(:disabled) {
+  transform: translateY(0);
 }
 
 .send-btn .material-icons {
