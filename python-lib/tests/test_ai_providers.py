@@ -530,7 +530,7 @@ class TestToolExecutor:
         )
         assert result.content == "Final answer"
 
-    def test_run_with_one_tool_call(self):
+    def test_run_with_one_tool_call(self, monkeypatch):
         """Executor dispatches tool, then returns final text."""
         tool_call = AIToolCall(
             id="c1", name="schematic_open", arguments={"path": "test.kicad_sch"}
@@ -544,23 +544,20 @@ class TestToolExecutor:
 
         mock_in_process = AsyncMock(return_value={"status": "ok", "data": {}})
 
-        executor = ToolExecutor(provider, tool_schemas=[SAMPLE_TOOL])
-
         import kiassist_utils.ai.tool_executor as te_mod
-        te_mod.in_process_call = mock_in_process
-        try:
-            result = asyncio.run(
-                executor.run([AIMessage(role="user", content="open it")])
-            )
-        finally:
-            te_mod.in_process_call = None
+        monkeypatch.setattr(te_mod, "in_process_call", mock_in_process)
+
+        executor = ToolExecutor(provider, tool_schemas=[SAMPLE_TOOL])
+        result = asyncio.run(
+            executor.run([AIMessage(role="user", content="open it")])
+        )
 
         assert result.content == "Schematic opened"
         mock_in_process.assert_called_once_with(
             "schematic_open", {"path": "test.kicad_sch"}
         )
 
-    def test_run_max_iterations_exceeded(self):
+    def test_run_max_iterations_exceeded(self, monkeypatch):
         """Executor raises RuntimeError when max_iterations is exceeded."""
         tool_call = AIToolCall(id="c1", name="loop_tool", arguments={})
         # Always returns tool calls → infinite loop
@@ -570,19 +567,17 @@ class TestToolExecutor:
 
         mock_in_process = AsyncMock(return_value={"status": "ok", "data": {}})
 
+        import kiassist_utils.ai.tool_executor as te_mod
+        monkeypatch.setattr(te_mod, "in_process_call", mock_in_process)
+
         executor = ToolExecutor(provider, max_iterations=3, tool_schemas=[SAMPLE_TOOL])
 
-        import kiassist_utils.ai.tool_executor as te_mod
-        te_mod.in_process_call = mock_in_process
-        try:
-            with pytest.raises(RuntimeError, match="max_iterations"):
-                asyncio.run(
-                    executor.run([AIMessage(role="user", content="loop")])
-                )
-        finally:
-            te_mod.in_process_call = None
+        with pytest.raises(RuntimeError, match="max_iterations"):
+            asyncio.run(
+                executor.run([AIMessage(role="user", content="loop")])
+            )
 
-    def test_run_callbacks_invoked(self):
+    def test_run_callbacks_invoked(self, monkeypatch):
         """on_tool_call and on_tool_result callbacks are invoked."""
         tool_call = AIToolCall(id="c1", name="my_tool", arguments={})
         provider = self._make_mock_provider(
@@ -601,24 +596,22 @@ class TestToolExecutor:
             call_log.append(f"result:{tc.name}:{tr.is_error}")
 
         mock_in_process = AsyncMock(return_value={"status": "ok"})
+
+        import kiassist_utils.ai.tool_executor as te_mod
+        monkeypatch.setattr(te_mod, "in_process_call", mock_in_process)
+
         executor = ToolExecutor(
             provider,
             tool_schemas=[SAMPLE_TOOL],
             on_tool_call=on_call,
             on_tool_result=on_result,
         )
-
-        import kiassist_utils.ai.tool_executor as te_mod
-        te_mod.in_process_call = mock_in_process
-        try:
-            asyncio.run(executor.run([AIMessage(role="user", content="go")]))
-        finally:
-            te_mod.in_process_call = None
+        asyncio.run(executor.run([AIMessage(role="user", content="go")]))
 
         assert "call:my_tool" in call_log
         assert "result:my_tool:False" in call_log
 
-    def test_run_tool_error_captured(self):
+    def test_run_tool_error_captured(self, monkeypatch):
         """Tool execution errors are captured as AIToolResult with is_error=True."""
         tool_call = AIToolCall(id="c1", name="broken_tool", arguments={})
         provider = self._make_mock_provider(
@@ -631,20 +624,17 @@ class TestToolExecutor:
         async def _fail(*args, **kwargs):
             raise RuntimeError("Tool exploded")
 
-        executor = ToolExecutor(provider, tool_schemas=[SAMPLE_TOOL])
-
         import kiassist_utils.ai.tool_executor as te_mod
-        te_mod.in_process_call = _fail
-        try:
-            result = asyncio.run(
-                executor.run([AIMessage(role="user", content="break it")])
-            )
-        finally:
-            te_mod.in_process_call = None
+        monkeypatch.setattr(te_mod, "in_process_call", _fail)
+
+        executor = ToolExecutor(provider, tool_schemas=[SAMPLE_TOOL])
+        result = asyncio.run(
+            executor.run([AIMessage(role="user", content="break it")])
+        )
 
         assert result.content == "handled error"
 
-    def test_run_parallel_tool_calls(self):
+    def test_run_parallel_tool_calls(self, monkeypatch):
         """Multiple tool calls in one iteration are executed concurrently."""
         tc1 = AIToolCall(id="c1", name="tool_one", arguments={})
         tc2 = AIToolCall(id="c2", name="tool_two", arguments={})
@@ -662,15 +652,11 @@ class TestToolExecutor:
             called.append(name)
             return {"status": "ok"}
 
-        executor = ToolExecutor(provider, tool_schemas=[SAMPLE_TOOL])
-
         import kiassist_utils.ai.tool_executor as te_mod
-        te_mod.in_process_call = _mock_call
-        try:
-            asyncio.run(executor.run([AIMessage(role="user", content="parallel")]))
-        finally:
-            te_mod.in_process_call = None
+        monkeypatch.setattr(te_mod, "in_process_call", _mock_call)
 
+        executor = ToolExecutor(provider, tool_schemas=[SAMPLE_TOOL])
+        asyncio.run(executor.run([AIMessage(role="user", content="parallel")]))
         assert set(called) == {"tool_one", "tool_two"}
 
 

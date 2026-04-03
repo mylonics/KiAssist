@@ -160,11 +160,12 @@ def _messages_to_gemini(
             # Tool results become "user" messages with function_response parts
             parts = []
             for tr in msg.tool_results:
-                # Find matching tool call name from previous messages for Gemini
+                # For Gemini, AIToolCall.id is set to the function name
+                # (see _extract_tool_calls), so tool_call_id == function name here.
                 parts.append(
                     types.Part(
                         function_response=types.FunctionResponse(
-                            name=tr.tool_call_id,  # used as function name key
+                            name=tr.tool_call_id,
                             response={
                                 "content": tr.content,
                                 "is_error": tr.is_error,
@@ -398,7 +399,7 @@ class GeminiProvider(AIProvider):
 
         async def _collect():
             chunks = []
-            async for chunk in await self.chat_stream(
+            async for chunk in self.chat_stream(
                 [AIMessage(role="user", content=message)]
             ):
                 chunks.append(chunk)
