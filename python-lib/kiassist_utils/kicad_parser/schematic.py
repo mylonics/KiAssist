@@ -508,9 +508,9 @@ class Sheet:
         uuid_node = _find(tree, "uuid")
         if uuid_node and len(uuid_node) > 1:
             sh.uuid = KiUUID(str(uuid_node[1]))
-        _KNOWN_SHEET = {"at", "size", "property", "uuid", "stroke", "fill", "fields_autoplaced"}
+        _KNOWN_SHEET_TAGS = {"at", "size", "property", "uuid", "stroke", "fill", "fields_autoplaced"}
         for item in tree[1:]:
-            if isinstance(item, list) and item and str(item[0]) not in _KNOWN_SHEET:
+            if isinstance(item, list) and len(item) > 0 and str(item[0]) not in _KNOWN_SHEET_TAGS:
                 sh._extra.append(item)
         return sh
 

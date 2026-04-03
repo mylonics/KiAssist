@@ -368,9 +368,11 @@ class Footprint:
             fp.attributes = [str(a) for a in attr_node[1:] if isinstance(a, (str, QStr))]
 
         _KNOWN = {
-            "footprint", "layer", "version", "generator", "generator_version",
-            "descr", "tags", "attr", "pad", "model", "property",
-        } | _GRAPHIC_TAGS
+            "attr", "descr", "footprint", "fp_arc", "fp_circle",
+            "fp_curve", "fp_line", "fp_poly", "fp_rect", "fp_text",
+            "generator", "generator_version", "layer",
+            "model", "pad", "property", "tags", "version", "zone",
+        }
 
         for item in tree[2:]:
             if not isinstance(item, list) or not item:
