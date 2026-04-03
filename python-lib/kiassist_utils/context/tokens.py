@@ -37,7 +37,39 @@ from ..ai.base import AIMessage, AIResponse, AIProvider
 logger = logging.getLogger(__name__)
 
 # Sentinel appended to truncated tool results so the AI knows there is more.
-_TRUNCATION_SUFFIX = "\n...[truncated — full result saved to disk]"
+_TRUNCATION_SUFFIX = "\n...[truncated]"
+
+
+def usage_to_tokens(usage: Dict[str, int]) -> int:
+    """Derive a single token count from a provider usage dict.
+
+    Handles all three naming schemes used by supported providers:
+
+    * ``total_tokens`` (preferred explicit total)
+    * ``input_tokens`` / ``output_tokens`` (Anthropic / Gemini)
+    * ``prompt_tokens`` / ``completion_tokens`` (OpenAI)
+
+    When multiple schemes are present (but no explicit ``total_tokens``), the
+    maximum candidate total is returned to avoid double-counting.
+
+    Args:
+        usage: Provider-reported usage dict from :attr:`AIResponse.usage`.
+
+    Returns:
+        Best-effort total token count.
+    """
+    if "total_tokens" in usage:
+        return int(usage["total_tokens"])
+    candidates: List[int] = []
+    if "input_tokens" in usage or "output_tokens" in usage:
+        candidates.append(
+            int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+        )
+    if "prompt_tokens" in usage or "completion_tokens" in usage:
+        candidates.append(
+            int(usage.get("prompt_tokens", 0)) + int(usage.get("completion_tokens", 0))
+        )
+    return max(candidates, default=0)
 
 
 class ContextWindowManager:
@@ -122,24 +154,13 @@ class ContextWindowManager:
 
         The *usage* dict may contain any of the provider-specific keys such as
         ``input_tokens``, ``output_tokens``, ``total_tokens``, ``prompt_tokens``,
-        ``completion_tokens``, etc.  The method adds the largest plausible total
-        it can derive from the dict.
+        ``completion_tokens``, etc.  Delegates to :func:`usage_to_tokens` to
+        derive the best-effort total without double-counting.
 
         Args:
             usage: Token-usage dict from :attr:`AIResponse.usage`.
         """
-        # Prefer an explicit total if present
-        if "total_tokens" in usage:
-            self._total_tokens += int(usage["total_tokens"])
-            return
-        # Otherwise sum input + output
-        self._total_tokens += int(usage.get("input_tokens", 0)) + int(
-            usage.get("output_tokens", 0)
-        )
-        # OpenAI naming
-        self._total_tokens += int(usage.get("prompt_tokens", 0)) + int(
-            usage.get("completion_tokens", 0)
-        )
+        self._total_tokens += usage_to_tokens(usage)
 
     def reset(self) -> None:
         """Reset cumulative token counter to zero."""

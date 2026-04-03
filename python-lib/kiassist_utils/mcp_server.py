@@ -2153,7 +2153,10 @@ def project_read_memory(project_path: str) -> Dict[str, Any]:
         does not exist.
     """
     mem = ProjectMemory(project_path)
-    content = mem.read()
+    try:
+        content = mem.read()
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to read KIASSIST.md: {exc}")
     if content is None:
         return _err("KIASSIST.md not found.  Use project_write_memory to create it.")
     return _ok({"path": str(mem.path), "content": content})

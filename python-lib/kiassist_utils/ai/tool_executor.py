@@ -51,6 +51,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..context.history import ConversationStore
     from ..context.tokens import ContextWindowManager
 
+# Import the shared token-counting helper at module level.
+# context.tokens only depends on ai.base so there is no circular import.
+from ..context.tokens import usage_to_tokens as _usage_to_tokens  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 # Default maximum number of agentic loop iterations before giving up.
@@ -141,17 +145,25 @@ class ToolExecutor:
             system_prompt: Optional system instruction forwarded to the provider.
             tool_schemas:  Override the executor's tool schemas for this run.
             session_id:    Session identifier used when persisting messages via
-                           *history_store*.  Ignored if *history_store* is
-                           ``None``.
+                           *history_store*.  Required when *history_store* is
+                           set; a ``ValueError`` is raised otherwise.
 
         Returns:
             The final :class:`~kiassist_utils.ai.base.AIResponse` from the
             AI once it has no more tool calls to make.
 
         Raises:
+            ValueError:   If *history_store* is provided but *session_id* is
+                          ``None``.
             RuntimeError: If ``max_iterations`` is exceeded without a final
                           text response.
         """
+        if self.history_store is not None and session_id is None:
+            raise ValueError(
+                "session_id is required when history_store is provided. "
+                "Generate one with history_store.new_session()."
+            )
+
         # Resolve tool schemas: argument > instance-level > fetch from MCP
         schemas = tool_schemas or self._tool_schemas
         if schemas is None:
@@ -187,9 +199,19 @@ class ToolExecutor:
             if self.context_manager is not None and response.usage:
                 self.context_manager.track_usage(response.usage)
 
+            # Derive per-turn token count for history persistence.
+            turn_tokens = _usage_to_tokens(response.usage) if response.usage else 0
+
             # If no tool calls → we have the final answer
             if not response.tool_calls:
                 logger.debug("No tool calls; returning final response.")
+                # Persist the final assistant message before returning.
+                if self.history_store is not None and session_id is not None:
+                    final_msg = AIMessage(
+                        role="assistant",
+                        content=response.content,
+                    )
+                    self.history_store.append(session_id, final_msg, token_count=turn_tokens)
                 return response
 
             # Append assistant message (with tool calls) to conversation
@@ -200,7 +222,7 @@ class ToolExecutor:
             )
             conversation.append(assistant_msg)
             if self.history_store is not None and session_id is not None:
-                self.history_store.append(session_id, assistant_msg)
+                self.history_store.append(session_id, assistant_msg, token_count=turn_tokens)
 
             # Execute tool calls (parallel where possible)
             tool_results = await self._execute_tool_calls(response.tool_calls)

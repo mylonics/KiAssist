@@ -110,8 +110,10 @@ class ConversationStore:
                       The store is created at
                       ``{project_dir}/.kiassist/history.jsonl``.
 
-    The store is thread-safe for single-process usage (uses ``os.open`` with
-    ``O_APPEND`` on POSIX / line-by-line writes on Windows).
+    Entries are appended to the history file in JSON Lines format using a
+    standard ``open(..., "a")`` call.  The class provides no additional
+    cross-process or multi-thread safety guarantees beyond normal file-system
+    semantics.
     """
 
     def __init__(self, project_path: str | Path) -> None:

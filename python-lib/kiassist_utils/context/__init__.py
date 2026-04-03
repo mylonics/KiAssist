@@ -18,7 +18,7 @@ from .file_cache import FileStateCache
 from .history import ConversationStore
 from .memory import ProjectMemory
 from .prompts import SystemPromptBuilder
-from .tokens import ContextWindowManager
+from .tokens import ContextWindowManager, usage_to_tokens
 
 __all__ = [
     "ConversationStore",
@@ -26,4 +26,5 @@ __all__ = [
     "FileStateCache",
     "ProjectMemory",
     "SystemPromptBuilder",
+    "usage_to_tokens",
 ]

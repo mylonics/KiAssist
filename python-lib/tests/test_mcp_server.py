@@ -688,6 +688,26 @@ class TestProjectReadWriteMemory:
         )
         assert result["status"] == "error"
 
+    def test_read_io_error_returns_error_status(self, tmp_path: Path):
+        """If KIASSIST.md exists but can't be read, a structured error is returned."""
+        import stat
+        from unittest.mock import patch
+        from kiassist_utils.context.memory import ProjectMemory
+
+        # Write a valid file first, then patch ProjectMemory.read to raise
+        mem_path = tmp_path / "KIASSIST.md"
+        mem_path.write_text("# memory")
+
+        with patch.object(
+            ProjectMemory,
+            "read",
+            side_effect=OSError("permission denied"),
+        ):
+            result = _call("project_read_memory", project_path=str(tmp_path))
+
+        assert result["status"] == "error"
+        assert "permission denied" in result["message"]
+
 
 # ===========================================================================
 # PCB Editor tools

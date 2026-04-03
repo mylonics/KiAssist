@@ -370,6 +370,23 @@ class TestContextWindowManager:
         mgr.track_usage({"prompt_tokens": 80, "completion_tokens": 20})
         assert mgr.total_tokens == 100
 
+    def test_track_usage_no_double_count_mixed_keys(self):
+        """When both naming schemes are present, only the max should be added."""
+        mgr = ContextWindowManager(context_window=10_000)
+        # Hypothetical provider that includes both schemes in the same dict.
+        # input+output = 150; prompt+completion = 100.  Max is 150.
+        mgr.track_usage({
+            "input_tokens": 100, "output_tokens": 50,
+            "prompt_tokens": 80, "completion_tokens": 20,
+        })
+        assert mgr.total_tokens == 150
+
+    def test_track_usage_empty_dict(self):
+        """An empty usage dict should contribute 0 tokens."""
+        mgr = ContextWindowManager(context_window=10_000)
+        mgr.track_usage({})
+        assert mgr.total_tokens == 0
+
     def test_track_usage_cumulative(self):
         mgr = ContextWindowManager(context_window=10_000)
         mgr.track_usage({"total_tokens": 100})
@@ -1021,11 +1038,98 @@ class TestToolExecutorContextIntegration:
             )
         )
 
-        # The user seed message should have been persisted
+        # Both the user seed message and the final assistant response are persisted.
         messages = store.load_session(session_id)
-        assert len(messages) >= 1
+        assert len(messages) == 2
         assert messages[0].role == "user"
         assert messages[0].content == "hi"
+        assert messages[1].role == "assistant"
+        assert messages[1].content == "Hello!"
+
+    def test_final_assistant_response_persisted(self, tmp_path: Path):
+        """The final (no-tool-calls) assistant response must be stored in history."""
+        import asyncio
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.history import ConversationStore
+
+        provider = _StubProvider(reply="Final answer.")
+        store = ConversationStore(tmp_path)
+        session_id = store.new_session()
+
+        executor = ToolExecutor(
+            provider=provider,
+            tool_schemas=[],
+            history_store=store,
+        )
+
+        asyncio.run(
+            executor.run(
+                [AIMessage(role="user", content="question")],
+                session_id=session_id,
+            )
+        )
+
+        messages = store.load_session(session_id)
+        roles = [m.role for m in messages]
+        assert "assistant" in roles
+        assistant_msgs = [m for m in messages if m.role == "assistant"]
+        assert assistant_msgs[-1].content == "Final answer."
+
+    def test_token_count_stored_for_assistant_turn(self, tmp_path: Path):
+        """Token count from response.usage should be stored with the assistant message."""
+        import asyncio
+        import json
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.history import ConversationStore
+
+        class _UsageProvider(_StubProvider):
+            def chat(self, messages, tools=None, system_prompt=None):
+                return AIResponse(content="reply", usage={"total_tokens": 77})
+
+        store = ConversationStore(tmp_path)
+        session_id = store.new_session()
+
+        executor = ToolExecutor(
+            provider=_UsageProvider(),
+            tool_schemas=[],
+            history_store=store,
+        )
+
+        asyncio.run(
+            executor.run(
+                [AIMessage(role="user", content="hi")],
+                session_id=session_id,
+            )
+        )
+
+        # Read the raw JSONL to check token_count
+        entries = [
+            json.loads(line)
+            for line in store.history_path.read_text().splitlines()
+            if line.strip()
+        ]
+        assistant_entries = [e for e in entries if e["role"] == "assistant"]
+        assert assistant_entries, "No assistant entry found in history"
+        assert assistant_entries[-1]["token_count"] == 77
+
+    def test_value_error_when_history_store_without_session_id(self, tmp_path: Path):
+        """Providing history_store without session_id must raise ValueError."""
+        import asyncio
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.history import ConversationStore
+
+        store = ConversationStore(tmp_path)
+        executor = ToolExecutor(
+            provider=_StubProvider(),
+            tool_schemas=[],
+            history_store=store,
+        )
+
+        with pytest.raises(ValueError, match="session_id"):
+            asyncio.run(
+                executor.run([AIMessage(role="user", content="hi")])
+                # no session_id passed
+            )
 
     def test_no_context_manager_no_error(self, tmp_path: Path):
         """Executor without context_manager should still work normally."""
