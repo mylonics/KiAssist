@@ -268,34 +268,26 @@ class SchematicEditPipeline:
        to determine whether the target file is open in a running KiCad
        instance.
 
-    2. **IPC save (preferred)** — if ``kicad-python`` (kipy) is installed,
-       ``kicad_save_schematic`` calls the native ``SaveDocument`` IPC command
-       to flush KiCad's in-memory state to disk before the edit.
+    2. **IPC save** — ``kicad_save_schematic`` calls the native
+       ``SaveDocument`` IPC command to flush KiCad's in-memory state to disk
+       before the edit.
 
-    3. **IPC reload (preferred)** — if kipy is available,
-       ``kicad_reload_schematic`` calls ``RevertDocument`` + ``RefreshEditor``
-       via IPC so KiCad re-reads the new file from disk and refreshes its UI.
-
-    **Keyboard-automation fallback:**  when kipy is not installed or no
-    running KiCad instance has the file open via IPC, save and reload fall
-    back to sending Ctrl+S / Ctrl+Shift+R to the focused window (ctypes on
-    Windows, xdotool on Linux, osascript on macOS).
+    3. **IPC reload** — ``kicad_reload_schematic`` calls ``RevertDocument`` +
+       ``RefreshEditor`` via IPC so KiCad re-reads the new file from disk and
+       refreshes its UI.
 
     The actual *file modifications* are always performed by our custom parsers
     writing directly to disk — never through the KiCad IPC API.
 
     Args:
         file_path:        Path to the ``.kicad_sch`` (or ``.kicad_pcb``) file.
-        window_title_hint: Forwarded to the keyboard-automation fallback helpers
-                          (used to target a specific KiCad window on platforms
-                          that support it).
         save_before_edit: When ``True`` (default), trigger a save in KiCad
                           before modifying the file.
         reload_after_edit: When ``True`` (default), trigger a reload in KiCad
                            after modifying the file.
-        save_wait:        Seconds to wait after triggering save (only applied
-                          on the keyboard-automation fallback path; IPC save is
-                          synchronous).  Default 1 s.
+        save_wait:        Seconds to wait after triggering save (IPC save is
+                          synchronous; this is an extra settle delay).
+                          Default 1 s.
         reload_wait:      Seconds to wait before triggering reload (default
                           0.5 s).
     """
@@ -304,14 +296,12 @@ class SchematicEditPipeline:
         self,
         file_path: str,
         *,
-        window_title_hint: str = "",
         save_before_edit: bool = True,
         reload_after_edit: bool = True,
         save_wait: float = _SAVE_WAIT_SECONDS,
         reload_wait: float = _RELOAD_WAIT_SECONDS,
     ) -> None:
         self.file_path = file_path
-        self.window_title_hint = window_title_hint
         self.save_before_edit = save_before_edit
         self.reload_after_edit = reload_after_edit
         self.save_wait = save_wait
@@ -357,11 +347,10 @@ class SchematicEditPipeline:
             try:
                 save_result = await ipc(
                     "kicad_save_schematic",
-                    {"file_path": self.file_path, "window_title_hint": self.window_title_hint},
+                    {"file_path": self.file_path},
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("kicad_save_schematic failed: %s", exc)
-            # Wait for KiCad to flush the file to disk (only needed for keyboard path)
             if self.save_wait > 0:
                 await asyncio.sleep(self.save_wait)
 
@@ -405,15 +394,15 @@ class SchematicEditPipeline:
             try:
                 reload_result = await ipc(
                     "kicad_reload_schematic",
-                    {"file_path": self.file_path, "window_title_hint": self.window_title_hint},
+                    {"file_path": self.file_path},
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("kicad_reload_schematic failed: %s", exc)
 
         # Annotate the result with pipeline metadata.
         # save_triggered / reload_triggered are True only when the respective
-        # keyboard-automation call succeeded (status == "ok"), not merely when
-        # the call was attempted.
+        # IPC call succeeded (status == "ok"), not merely when the call was
+        # attempted.
         def _call_succeeded(r: Optional[Dict[str, Any]]) -> bool:
             return isinstance(r, dict) and r.get("status") == "ok"
 
@@ -431,12 +420,10 @@ class SchematicEditPipeline:
 # Convenience helper: pipeline for a list of sequential edits
 # ---------------------------------------------------------------------------
 
-
 async def run_edit_pipeline(
     file_path: str,
     edits: List[Dict[str, Any]],
     *,
-    window_title_hint: str = "",
     save_before_first: bool = True,
     reload_after_last: bool = True,
     save_wait: float = _SAVE_WAIT_SECONDS,
@@ -452,7 +439,6 @@ async def run_edit_pipeline(
         file_path:         Path to the KiCad file being edited.
         edits:             List of dicts, each with ``tool`` (str) and
                            ``args`` (dict) keys.
-        window_title_hint: Forwarded to the save/reload helpers.
         save_before_first: Trigger KiCad save before the first edit.
         reload_after_last: Trigger KiCad reload after the last successful edit.
         save_wait:         Seconds to wait after triggering save.
@@ -473,7 +459,7 @@ async def run_edit_pipeline(
         try:
             save_res = await ipc(
                 "kicad_save_schematic",
-                {"file_path": file_path, "window_title_hint": window_title_hint},
+                {"file_path": file_path},
             )
             save_triggered = isinstance(save_res, dict) and save_res.get("status") == "ok"
             if not save_triggered:
@@ -541,7 +527,7 @@ async def run_edit_pipeline(
         try:
             reload_res = await ipc(
                 "kicad_reload_schematic",
-                {"file_path": file_path, "window_title_hint": window_title_hint},
+                {"file_path": file_path},
             )
             reload_triggered = isinstance(reload_res, dict) and reload_res.get("status") == "ok"
             if not reload_triggered:

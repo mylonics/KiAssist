@@ -21,9 +21,7 @@ import json
 import logging
 import math
 import os
-import platform
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -1396,173 +1394,61 @@ def kicad_get_project_info(project_path: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def kicad_save_schematic(file_path: str = "", window_title_hint: str = "") -> Dict[str, Any]:
-    """Trigger a save in the KiCad schematic/PCB editor.
+def kicad_save_schematic(file_path: str) -> Dict[str, Any]:
+    """Save an open KiCad schematic or PCB file via the IPC API (``SaveDocument``).
 
-    Preferred path: when ``kicad-python`` (kipy) is installed and a running
-    KiCad instance has *file_path* open, this calls the native IPC
-    ``SaveDocument`` command — no keyboard automation required.
-
-    Fallback path: when kipy is unavailable or the file is not found in any
-    IPC socket, sends Ctrl+S to the focused KiCad window via the platform's
-    keyboard automation facility (ctypes on Windows, xdotool on Linux,
-    osascript on macOS).
+    Requires ``kicad-python`` (kipy) to be installed and a running KiCad 9+
+    instance with the IPC API server enabled (Preferences → Plugins → Enable
+    API server).
 
     Args:
-        file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
-                           that should be saved.  When provided and kipy is
-                           available the IPC path is used; when omitted only
-                           keyboard automation is attempted.
-        window_title_hint: Optional substring of the KiCad window title used
-                           by the keyboard-automation fallback to target a
-                           specific instance (currently unused on non-Windows
-                           platforms; reserved for future use).
+        file_path: Path to the ``.kicad_sch`` or ``.kicad_pcb`` file to save.
 
     Returns:
-        ``{"triggered": true, "method": "<ipc|xdotool|osascript|ctypes_keybd_event>"}``
-        on success, or an error dict.
+        ``{"triggered": true, "method": "ipc", "socket": "<path>"}`` on success,
+        or an error dict if kipy is unavailable or the file is not currently
+        open in any running KiCad instance.
     """
-    # ── IPC path ─────────────────────────────────────────────────────────────
-    if file_path:
-        try:
-            from .kicad_ipc import ipc_save_document
-            ipc_result = ipc_save_document(file_path)
-            if ipc_result.get("success"):
-                return _ok({"triggered": True, "method": "ipc", "socket": ipc_result.get("socket", "")})
-            # IPC not available or document not found; fall through to keyboard.
-            logger.debug("IPC save failed (%s), falling back to keyboard.", ipc_result.get("error"))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("IPC save raised %s, falling back to keyboard.", exc)
+    from .kicad_ipc import ipc_save_document
 
-    # ── Keyboard-automation fallback ─────────────────────────────────────────
-    system = platform.system()
     try:
-        if system == "Windows":
-            import ctypes
-
-            VK_CONTROL = 0x11
-            VK_S = 0x53
-            KEYEVENTF_KEYUP = 0x0002
-
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_S, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_S, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            return _ok({"triggered": True, "method": "ctypes_keybd_event"})
-
-        elif system in ("Linux", "Darwin"):
-            # Try xdotool on Linux, osascript on macOS
-            if system == "Linux":
-                if shutil.which("xdotool"):
-                    result = subprocess.run(
-                        ["xdotool", "key", "--clearmodifiers", "ctrl+s"],
-                        check=False,
-                    )
-                    if result.returncode != 0:
-                        return _err(f"xdotool exited with code {result.returncode}")
-                    return _ok({"triggered": True, "method": "xdotool"})
-                return _err("xdotool not found; install xdotool for keyboard automation")
-            else:
-                result = subprocess.run(
-                    [
-                        "osascript",
-                        "-e",
-                        'tell application "System Events" to keystroke "s" using command down',
-                    ],
-                    check=False,
-                )
-                if result.returncode != 0:
-                    return _err(f"osascript exited with code {result.returncode}")
-                return _ok({"triggered": True, "method": "osascript"})
-        else:
-            return _err(f"Keyboard automation not supported on platform: {system}")
+        result = ipc_save_document(file_path)
     except Exception as exc:  # noqa: BLE001
-        return _err(f"Failed to send save shortcut: {exc}")
+        return _err(f"ipc_save_document raised: {exc}")
+
+    if result.get("success"):
+        return _ok({"triggered": True, "method": "ipc", "socket": result.get("socket", "")})
+    return _err(result.get("error", "Unknown IPC save error"))
 
 
 @mcp.tool()
-def kicad_reload_schematic(file_path: str = "", window_title_hint: str = "") -> Dict[str, Any]:
-    """Reload a KiCad schematic/PCB from disk into the live editor.
+def kicad_reload_schematic(file_path: str) -> Dict[str, Any]:
+    """Reload a KiCad schematic or PCB from disk via the IPC API (``RevertDocument`` + ``RefreshEditor``).
 
-    Preferred path: when ``kicad-python`` (kipy) is installed and a running
-    KiCad instance has *file_path* open, this calls the native IPC
-    ``RevertDocument`` command (discard in-memory state, re-read from disk)
-    followed by ``RefreshEditor`` (force a UI redraw).
+    Calls ``RevertDocument`` to discard any unsaved in-memory changes and
+    re-read the file from disk, then ``RefreshEditor`` to force a UI redraw.
 
-    Fallback path: when kipy is unavailable or the file is not found in any
-    IPC socket, sends Ctrl+Shift+R to the focused KiCad window via the
-    platform's keyboard automation facility.
+    Requires ``kicad-python`` (kipy) to be installed and a running KiCad 9+
+    instance with the IPC API server enabled.
 
     Args:
-        file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
-                           that should be reloaded.  When provided and kipy
-                           is available the IPC path is used; when omitted
-                           only keyboard automation is attempted.
-        window_title_hint: Optional window title hint used by the keyboard
-                           fallback (reserved for future use).
+        file_path: Path to the ``.kicad_sch`` or ``.kicad_pcb`` file to reload.
 
     Returns:
-        ``{"triggered": true, "method": "<ipc|xdotool|osascript|ctypes_keybd_event>"}``
-        on success, or an error dict.
+        ``{"triggered": true, "method": "ipc", "socket": "<path>"}`` on success,
+        or an error dict if kipy is unavailable or the file is not currently
+        open in any running KiCad instance.
     """
-    # ── IPC path ─────────────────────────────────────────────────────────────
-    if file_path:
-        try:
-            from .kicad_ipc import ipc_revert_document
-            ipc_result = ipc_revert_document(file_path)
-            if ipc_result.get("success"):
-                return _ok({"triggered": True, "method": "ipc", "socket": ipc_result.get("socket", "")})
-            logger.debug("IPC reload failed (%s), falling back to keyboard.", ipc_result.get("error"))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("IPC reload raised %s, falling back to keyboard.", exc)
+    from .kicad_ipc import ipc_revert_document
 
-    # ── Keyboard-automation fallback ─────────────────────────────────────────
-    system = platform.system()
     try:
-        if system == "Windows":
-            import ctypes
-
-            VK_CONTROL = 0x11
-            VK_SHIFT = 0x10
-            VK_R = 0x52
-            KEYEVENTF_KEYUP = 0x0002
-
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_R, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(VK_R, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0)
-            ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
-            return _ok({"triggered": True, "method": "ctypes_keybd_event"})
-
-        elif system in ("Linux", "Darwin"):
-            if system == "Linux":
-                if shutil.which("xdotool"):
-                    result = subprocess.run(
-                        ["xdotool", "key", "--clearmodifiers", "ctrl+shift+r"],
-                        check=False,
-                    )
-                    if result.returncode != 0:
-                        return _err(f"xdotool exited with code {result.returncode}")
-                    return _ok({"triggered": True, "method": "xdotool"})
-                return _err("xdotool not found; install xdotool for keyboard automation")
-            else:
-                result = subprocess.run(
-                    [
-                        "osascript",
-                        "-e",
-                        'tell application "System Events" to keystroke "r" '
-                        "using {command down, shift down}",
-                    ],
-                    check=False,
-                )
-                if result.returncode != 0:
-                    return _err(f"osascript exited with code {result.returncode}")
-                return _ok({"triggered": True, "method": "osascript"})
-        else:
-            return _err(f"Keyboard automation not supported on platform: {system}")
+        result = ipc_revert_document(file_path)
     except Exception as exc:  # noqa: BLE001
-        return _err(f"Failed to send reload shortcut: {exc}")
+        return _err(f"ipc_revert_document raised: {exc}")
+
+    if result.get("success"):
+        return _ok({"triggered": True, "method": "ipc", "socket": result.get("socket", "")})
+    return _err(result.get("error", "Unknown IPC reload error"))
 
 
 @mcp.tool()
@@ -1637,7 +1523,6 @@ async def kicad_edit_file_pipeline(
     file_path: str,
     tool_name: str,
     tool_args: str = "{}",
-    window_title_hint: str = "",
     save_before_edit: bool = True,
     reload_after_edit: bool = True,
 ) -> Dict[str, Any]:
@@ -1650,8 +1535,7 @@ async def kicad_edit_file_pipeline(
     1. **IPC detection** — checks via KiCad's IPC socket whether the file is
        currently open.  If it is not open, steps 2 and 6 are skipped.
     2. **IPC save** (if open) — calls ``SaveDocument`` via the kipy IPC API so
-       any unsaved KiCad changes are flushed to disk.  Falls back to sending
-       Ctrl+S via keyboard automation when kipy is unavailable.
+       any unsaved KiCad changes are flushed to disk before the edit.
     3. **Advisory file lock** — acquires an OS-level lock to prevent concurrent
        modifications from other processes.
     4. **Direct file edit** — invokes *tool_name* with *tool_args*; KiAssist's
@@ -1661,8 +1545,7 @@ async def kicad_edit_file_pipeline(
        ``_safe_save`` is restored automatically.
     6. **IPC reload** (if open and edit succeeded) — calls ``RevertDocument`` +
        ``RefreshEditor`` via kipy so KiCad re-reads the updated file from disk
-       and refreshes its UI.  Falls back to Ctrl+Shift+R keyboard automation
-       when kipy is unavailable.
+       and refreshes its UI.
 
     Args:
         file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
@@ -1670,9 +1553,6 @@ async def kicad_edit_file_pipeline(
         tool_name:         Name of the MCP tool that performs the actual edit
                            (e.g. ``"schematic_add_symbol"``).
         tool_args:         JSON-encoded dict of arguments for *tool_name*.
-        window_title_hint: Optional KiCad window title fragment used by the
-                           keyboard-automation fallback to target a specific
-                           window.
         save_before_edit:  Trigger save before the edit (default ``true``).
         reload_after_edit: Trigger reload after the edit (default ``true``).
 
@@ -1681,8 +1561,8 @@ async def kicad_edit_file_pipeline(
         containing:
 
         * ``file_was_open_in_kicad`` — ``true`` if the file was detected open.
-        * ``save_triggered`` — ``true`` if save succeeded (via IPC or keyboard).
-        * ``reload_triggered`` — ``true`` if reload succeeded (via IPC or keyboard).
+        * ``save_triggered`` — ``true`` if the IPC save succeeded.
+        * ``reload_triggered`` — ``true`` if the IPC reload succeeded.
     """
     try:
         from .ipc_workflow import SchematicEditPipeline
@@ -1697,7 +1577,6 @@ async def kicad_edit_file_pipeline(
     try:
         pipeline = SchematicEditPipeline(
             file_path,
-            window_title_hint=window_title_hint,
             save_before_edit=save_before_edit,
             reload_after_edit=reload_after_edit,
         )
