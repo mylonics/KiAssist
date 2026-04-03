@@ -352,6 +352,8 @@ class SchematicEditPipeline:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("kicad_save_schematic failed: %s", exc)
             if self.save_wait > 0:
+                # Extra settle delay to allow KiCad to finish flushing disk I/O
+                # after the synchronous IPC save before we write to the file.
                 await asyncio.sleep(self.save_wait)
 
         # Step 2 & 3 — acquire lock and run the edit tool
@@ -416,9 +418,11 @@ class SchematicEditPipeline:
         return edit_result  # type: ignore[return-value]
 
 
+
 # ---------------------------------------------------------------------------
 # Convenience helper: pipeline for a list of sequential edits
 # ---------------------------------------------------------------------------
+
 
 async def run_edit_pipeline(
     file_path: str,
