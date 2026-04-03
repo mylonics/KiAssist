@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "TestSymLib") (type "KiCad") (uri "${KIPRJMOD}/test_symbol_lib.kicad_sym") (options "") (descr "Test symbol library"))
+)
