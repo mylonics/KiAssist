@@ -589,6 +589,155 @@ def detect_kicad_instances() -> List[Dict[str, str]]:
     return instances
 
 
+def _get_doc_path(doc: Any) -> str:
+    """Extract the file path from a kipy document specifier.
+
+    Different kipy versions expose the path via different attribute names;
+    this helper tries them all in the same order the probe code uses.
+
+    Args:
+        doc: A document specifier returned by ``KiCad.get_open_documents()``.
+
+    Returns:
+        The file path string, or an empty string if none could be found.
+    """
+    for attr in ("path", "file_path", "board_filename"):
+        try:
+            val = getattr(doc, attr, None)
+            if val:
+                return str(val)
+        except Exception:
+            pass
+    return ""
+
+
+def ipc_save_document(file_path: str) -> Dict[str, Any]:
+    """Save an open KiCad document via the IPC API (``SaveDocument``).
+
+    Iterates over all discovered KiCad IPC sockets, locates the document
+    whose path matches *file_path*, and calls ``kicad.save_document()`` on
+    it.  This is the programmatic equivalent of the user pressing Ctrl+S in
+    the KiCad editor.
+
+    Args:
+        file_path: Path to the ``.kicad_sch`` or ``.kicad_pcb`` file to save.
+
+    Returns:
+        Dict with:
+
+        * ``success`` — ``True`` if the document was saved via IPC.
+        * ``method``  — ``"ipc"`` on success.
+        * ``socket``  — the socket path used on success.
+        * ``error``   — description of the failure when ``success`` is
+          ``False``.
+    """
+    try:
+        from kipy import KiCad
+        from kipy.proto.common.types import base_types_pb2
+    except ImportError:
+        return {"success": False, "error": "kicad-python package not available"}
+
+    norm = os.path.normpath(os.path.abspath(file_path))
+    socket_files = discover_socket_files()
+
+    if not socket_files:
+        return {"success": False, "error": "No KiCad IPC sockets found"}
+
+    _DOC_TYPES = [
+        base_types_pb2.DocumentType.DOCTYPE_PCB,
+        base_types_pb2.DocumentType.DOCTYPE_SCHEMATIC,
+    ]
+
+    for socket_file in socket_files:
+        socket_uri = socket_path_to_uri(socket_file)
+        try:
+            kicad = KiCad(socket_path=socket_uri, client_name="kiassist-save", timeout_ms=5000)
+            for doc_type in _DOC_TYPES:
+                try:
+                    docs = kicad.get_open_documents(doc_type)
+                except Exception:
+                    continue
+                for doc in docs or []:
+                    doc_path = _get_doc_path(doc)
+                    if doc_path and os.path.normpath(os.path.abspath(doc_path)) == norm:
+                        kicad.save_document(doc)
+                        return {"success": True, "socket": str(socket_file), "method": "ipc"}
+        except Exception:
+            continue
+
+    return {
+        "success": False,
+        "error": f"No open KiCad document found matching {file_path}",
+    }
+
+
+def ipc_revert_document(file_path: str) -> Dict[str, Any]:
+    """Reload an open KiCad document from disk via the IPC API (``RevertDocument``).
+
+    Locates the document whose path matches *file_path* in all running KiCad
+    instances and calls ``kicad.revert_document()`` (discard in-memory
+    changes, re-read from disk) followed by ``kicad.refresh_editor()``
+    (force the editor UI to redraw).
+
+    Args:
+        file_path: Path to the ``.kicad_sch`` or ``.kicad_pcb`` file to
+                   reload.
+
+    Returns:
+        Dict with:
+
+        * ``success`` — ``True`` if the document was reverted via IPC.
+        * ``method``  — ``"ipc"`` on success.
+        * ``socket``  — the socket path used on success.
+        * ``error``   — description of the failure when ``success`` is
+          ``False``.
+    """
+    try:
+        from kipy import KiCad
+        from kipy.proto.common.types import base_types_pb2
+    except ImportError:
+        return {"success": False, "error": "kicad-python package not available"}
+
+    norm = os.path.normpath(os.path.abspath(file_path))
+    socket_files = discover_socket_files()
+
+    if not socket_files:
+        return {"success": False, "error": "No KiCad IPC sockets found"}
+
+    _DOC_TYPES = [
+        base_types_pb2.DocumentType.DOCTYPE_PCB,
+        base_types_pb2.DocumentType.DOCTYPE_SCHEMATIC,
+    ]
+
+    for socket_file in socket_files:
+        socket_uri = socket_path_to_uri(socket_file)
+        try:
+            kicad = KiCad(
+                socket_path=socket_uri, client_name="kiassist-reload", timeout_ms=5000
+            )
+            for doc_type in _DOC_TYPES:
+                try:
+                    docs = kicad.get_open_documents(doc_type)
+                except Exception:
+                    continue
+                for doc in docs or []:
+                    doc_path = _get_doc_path(doc)
+                    if doc_path and os.path.normpath(os.path.abspath(doc_path)) == norm:
+                        kicad.revert_document(doc)
+                        try:
+                            kicad.refresh_editor(doc)
+                        except Exception:
+                            pass  # refresh_editor is best-effort
+                        return {"success": True, "socket": str(socket_file), "method": "ipc"}
+        except Exception:
+            continue
+
+    return {
+        "success": False,
+        "error": f"No open KiCad document found matching {file_path}",
+    }
+
+
 def get_open_project_paths() -> List[str]:
     """Get list of project paths from currently open KiCad instances.
     
