@@ -257,45 +257,47 @@ _RELOAD_WAIT_SECONDS = 0.5
 
 
 class SchematicEditPipeline:
-    """Orchestrate the KiCad keyboard-save → direct-file-edit → keyboard-reload workflow.
+    """Orchestrate the KiCad IPC save → direct-file-edit → IPC reload workflow.
 
-    **Architecture note — IPC vs direct file edits:**
+    **Architecture — IPC vs direct file edits:**
 
-    KiCad exposes a native IPC API (via kipy over a Unix socket / named pipe)
-    that KiAssist uses **only for detection** (determining which files are
-    currently open in a live KiCad instance, via
-    :func:`is_file_open_in_kicad`).  The IPC API does *not* expose save or
-    reload commands, so those operations fall back to keyboard automation:
+    KiCad exposes a native IPC API (via kipy over a Unix socket / named pipe).
+    KiAssist uses it at three points in this pipeline:
 
-    * **Save** — sends Ctrl+S to the focused KiCad window via
-      ``kicad_save_schematic`` (ctypes on Windows, xdotool on Linux, osascript
-      on macOS).
-    * **Reload** — sends Ctrl+Shift+R via ``kicad_reload_schematic``.
+    1. **IPC detection** — :func:`is_file_open_in_kicad` queries IPC sockets
+       to determine whether the target file is open in a running KiCad
+       instance.
 
-    This is a necessary workaround and is intentional per the Phase 5 design.
+    2. **IPC save (preferred)** — if ``kicad-python`` (kipy) is installed,
+       ``kicad_save_schematic`` calls the native ``SaveDocument`` IPC command
+       to flush KiCad's in-memory state to disk before the edit.
+
+    3. **IPC reload (preferred)** — if kipy is available,
+       ``kicad_reload_schematic`` calls ``RevertDocument`` + ``RefreshEditor``
+       via IPC so KiCad re-reads the new file from disk and refreshes its UI.
+
+    **Keyboard-automation fallback:**  when kipy is not installed or no
+    running KiCad instance has the file open via IPC, save and reload fall
+    back to sending Ctrl+S / Ctrl+Shift+R to the focused window (ctypes on
+    Windows, xdotool on Linux, osascript on macOS).
+
     The actual *file modifications* are always performed by our custom parsers
     writing directly to disk — never through the KiCad IPC API.
 
-    The pipeline therefore follows this sequence:
-
-    1. **IPC detection** — check if the target file is open in KiCad.
-    2. **Keyboard save** (if open) — flush any unsaved KiCad changes to disk.
-    3. **Direct file edit** — invoke the requested MCP tool (parser-based).
-    4. **Rollback** — restore the ``.bak`` backup if the edit fails.
-    5. **Keyboard reload** (if open and edit succeeded) — KiCad re-reads the
-       new file from disk.
-
     Args:
         file_path:        Path to the ``.kicad_sch`` (or ``.kicad_pcb``) file.
-        window_title_hint: Forwarded to the save/reload keyboard-automation
-                          helpers (used to target a specific KiCad window on
-                          platforms that support it).
-        save_before_edit: When ``True`` (default), trigger Ctrl+S in KiCad
+        window_title_hint: Forwarded to the keyboard-automation fallback helpers
+                          (used to target a specific KiCad window on platforms
+                          that support it).
+        save_before_edit: When ``True`` (default), trigger a save in KiCad
                           before modifying the file.
-        reload_after_edit: When ``True`` (default), trigger Ctrl+Shift+R in
-                           KiCad after modifying the file.
-        save_wait:        Seconds to wait after triggering save (default 1 s).
-        reload_wait:      Seconds to wait before triggering reload (default 0.5 s).
+        reload_after_edit: When ``True`` (default), trigger a reload in KiCad
+                           after modifying the file.
+        save_wait:        Seconds to wait after triggering save (only applied
+                          on the keyboard-automation fallback path; IPC save is
+                          synchronous).  Default 1 s.
+        reload_wait:      Seconds to wait before triggering reload (default
+                          0.5 s).
     """
 
     def __init__(
@@ -355,11 +357,11 @@ class SchematicEditPipeline:
             try:
                 save_result = await ipc(
                     "kicad_save_schematic",
-                    {"window_title_hint": self.window_title_hint},
+                    {"file_path": self.file_path, "window_title_hint": self.window_title_hint},
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("kicad_save_schematic failed: %s", exc)
-            # Wait for KiCad to flush the file to disk
+            # Wait for KiCad to flush the file to disk (only needed for keyboard path)
             if self.save_wait > 0:
                 await asyncio.sleep(self.save_wait)
 
@@ -403,7 +405,7 @@ class SchematicEditPipeline:
             try:
                 reload_result = await ipc(
                     "kicad_reload_schematic",
-                    {"window_title_hint": self.window_title_hint},
+                    {"file_path": self.file_path, "window_title_hint": self.window_title_hint},
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("kicad_reload_schematic failed: %s", exc)
@@ -471,7 +473,7 @@ async def run_edit_pipeline(
         try:
             save_res = await ipc(
                 "kicad_save_schematic",
-                {"window_title_hint": window_title_hint},
+                {"file_path": file_path, "window_title_hint": window_title_hint},
             )
             save_triggered = isinstance(save_res, dict) and save_res.get("status") == "ok"
             if not save_triggered:
@@ -539,7 +541,7 @@ async def run_edit_pipeline(
         try:
             reload_res = await ipc(
                 "kicad_reload_schematic",
-                {"window_title_hint": window_title_hint},
+                {"file_path": file_path, "window_title_hint": window_title_hint},
             )
             reload_triggered = isinstance(reload_res, dict) and reload_res.get("status") == "ok"
             if not reload_triggered:

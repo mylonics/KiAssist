@@ -141,3 +141,141 @@ class TestIsProjectOpen:
             result = is_project_open('/path/to/project/')
             # Should still match after normalization
             assert result is True
+
+
+# ===========================================================================
+# ipc_save_document / ipc_revert_document
+# ===========================================================================
+
+
+class TestIpcSaveDocument:
+    """Tests for the IPC-based SaveDocument helper."""
+
+    def test_returns_error_when_kipy_not_available(self, tmp_path: Path):
+        """When kipy is not installed, ipc_save_document returns success=False."""
+        from kiassist_utils.kicad_ipc import ipc_save_document
+
+        f = tmp_path / "test.kicad_sch"
+        f.write_text("(kicad_sch)")
+
+        with mock.patch.dict("sys.modules", {"kipy": None, "kipy.proto": None,
+                                              "kipy.proto.common": None,
+                                              "kipy.proto.common.types": None,
+                                              "kipy.proto.common.types.base_types_pb2": None}):
+            result = ipc_save_document(str(f))
+
+        assert result["success"] is False
+        assert "kicad-python" in result["error"]
+
+    def test_returns_error_when_no_sockets(self, tmp_path: Path):
+        """When no KiCad sockets are found, returns success=False."""
+        from kiassist_utils.kicad_ipc import ipc_save_document
+
+        f = tmp_path / "test.kicad_sch"
+        f.write_text("(kicad_sch)")
+
+        FakeKipy = mock.MagicMock()
+        FakeKipy.proto.common.types.base_types_pb2.DocumentType.DOCTYPE_PCB = 1
+        FakeKipy.proto.common.types.base_types_pb2.DocumentType.DOCTYPE_SCHEMATIC = 2
+
+        with mock.patch.dict("sys.modules", {"kipy": FakeKipy,
+                                              "kipy.proto": FakeKipy.proto,
+                                              "kipy.proto.common": FakeKipy.proto.common,
+                                              "kipy.proto.common.types": FakeKipy.proto.common.types,
+                                              "kipy.proto.common.types.base_types_pb2": FakeKipy.proto.common.types.base_types_pb2}):
+            with mock.patch("kiassist_utils.kicad_ipc.discover_socket_files", return_value=[]):
+                result = ipc_save_document(str(f))
+
+        assert result["success"] is False
+        assert "No KiCad IPC sockets found" in result["error"]
+
+    def test_saves_matching_document(self, tmp_path: Path):
+        """When the matching document is found, save_document is called."""
+        from kiassist_utils.kicad_ipc import ipc_save_document
+
+        f = tmp_path / "test.kicad_sch"
+        f.write_text("(kicad_sch)")
+
+        # Build a fake document that will match by path
+        fake_doc = mock.MagicMock()
+        fake_doc.path = str(f)
+
+        fake_kicad = mock.MagicMock()
+        fake_kicad.get_open_documents.return_value = [fake_doc]
+
+        FakeKipy = mock.MagicMock()
+        FakeKipy.KiCad.return_value = fake_kicad
+        FakeProto = mock.MagicMock()
+        FakeProto.DocumentType.DOCTYPE_PCB = 1
+        FakeProto.DocumentType.DOCTYPE_SCHEMATIC = 2
+
+        with mock.patch.dict("sys.modules", {
+            "kipy": FakeKipy,
+            "kipy.proto": mock.MagicMock(),
+            "kipy.proto.common": mock.MagicMock(),
+            "kipy.proto.common.types": mock.MagicMock(),
+            "kipy.proto.common.types.base_types_pb2": FakeProto,
+        }):
+            with mock.patch("kiassist_utils.kicad_ipc.discover_socket_files",
+                            return_value=[Path("/tmp/kicad/api.sock")]):
+                result = ipc_save_document(str(f))
+
+        assert result["success"] is True
+        assert result["method"] == "ipc"
+        fake_kicad.save_document.assert_called_once_with(fake_doc)
+
+
+class TestIpcRevertDocument:
+    """Tests for the IPC-based RevertDocument helper."""
+
+    def test_returns_error_when_kipy_not_available(self, tmp_path: Path):
+        """When kipy is not installed, ipc_revert_document returns success=False."""
+        from kiassist_utils.kicad_ipc import ipc_revert_document
+
+        f = tmp_path / "test.kicad_sch"
+        f.write_text("(kicad_sch)")
+
+        with mock.patch.dict("sys.modules", {"kipy": None, "kipy.proto": None,
+                                              "kipy.proto.common": None,
+                                              "kipy.proto.common.types": None,
+                                              "kipy.proto.common.types.base_types_pb2": None}):
+            result = ipc_revert_document(str(f))
+
+        assert result["success"] is False
+        assert "kicad-python" in result["error"]
+
+    def test_reverts_and_refreshes_matching_document(self, tmp_path: Path):
+        """When the matching document is found, revert_document and refresh_editor are called."""
+        from kiassist_utils.kicad_ipc import ipc_revert_document
+
+        f = tmp_path / "test.kicad_sch"
+        f.write_text("(kicad_sch)")
+
+        fake_doc = mock.MagicMock()
+        fake_doc.path = str(f)
+
+        fake_kicad = mock.MagicMock()
+        fake_kicad.get_open_documents.return_value = [fake_doc]
+
+        FakeKipy = mock.MagicMock()
+        FakeKipy.KiCad.return_value = fake_kicad
+        FakeProto = mock.MagicMock()
+        FakeProto.DocumentType.DOCTYPE_PCB = 1
+        FakeProto.DocumentType.DOCTYPE_SCHEMATIC = 2
+
+        with mock.patch.dict("sys.modules", {
+            "kipy": FakeKipy,
+            "kipy.proto": mock.MagicMock(),
+            "kipy.proto.common": mock.MagicMock(),
+            "kipy.proto.common.types": mock.MagicMock(),
+            "kipy.proto.common.types.base_types_pb2": FakeProto,
+        }):
+            with mock.patch("kiassist_utils.kicad_ipc.discover_socket_files",
+                            return_value=[Path("/tmp/kicad/api.sock")]):
+                result = ipc_revert_document(str(f))
+
+        assert result["success"] is True
+        assert result["method"] == "ipc"
+        fake_kicad.revert_document.assert_called_once_with(fake_doc)
+        fake_kicad.refresh_editor.assert_called_once_with(fake_doc)
+

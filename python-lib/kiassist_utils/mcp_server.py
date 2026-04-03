@@ -18,6 +18,7 @@ In-process usage (no network overhead)::
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import platform
@@ -28,6 +29,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
+
+logger = logging.getLogger(__name__)
 
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .kicad_parser.footprint import Footprint
@@ -1393,21 +1396,45 @@ def kicad_get_project_info(project_path: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def kicad_save_schematic(window_title_hint: str = "") -> Dict[str, Any]:
-    """Trigger a save in the KiCad schematic editor via keyboard automation.
+def kicad_save_schematic(file_path: str = "", window_title_hint: str = "") -> Dict[str, Any]:
+    """Trigger a save in the KiCad schematic/PCB editor.
 
-    Sends Ctrl+S to the focused KiCad window.  This is a best-effort
-    approach because KiCad does not expose a programmatic save command.
+    Preferred path: when ``kicad-python`` (kipy) is installed and a running
+    KiCad instance has *file_path* open, this calls the native IPC
+    ``SaveDocument`` command — no keyboard automation required.
+
+    Fallback path: when kipy is unavailable or the file is not found in any
+    IPC socket, sends Ctrl+S to the focused KiCad window via the platform's
+    keyboard automation facility (ctypes on Windows, xdotool on Linux,
+    osascript on macOS).
 
     Args:
-        window_title_hint: Optional substring of the KiCad window title to
-                           target a specific instance (currently unused on
-                           non-Windows platforms; reserved for future use).
+        file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
+                           that should be saved.  When provided and kipy is
+                           available the IPC path is used; when omitted only
+                           keyboard automation is attempted.
+        window_title_hint: Optional substring of the KiCad window title used
+                           by the keyboard-automation fallback to target a
+                           specific instance (currently unused on non-Windows
+                           platforms; reserved for future use).
 
     Returns:
-        ``{"triggered": true}`` if the keyboard shortcut was sent, or an
-        error if the platform is not supported or automation is unavailable.
+        ``{"triggered": true, "method": "<ipc|xdotool|osascript|ctypes_keybd_event>"}``
+        on success, or an error dict.
     """
+    # ── IPC path ─────────────────────────────────────────────────────────────
+    if file_path:
+        try:
+            from .kicad_ipc import ipc_save_document
+            ipc_result = ipc_save_document(file_path)
+            if ipc_result.get("success"):
+                return _ok({"triggered": True, "method": "ipc", "socket": ipc_result.get("socket", "")})
+            # IPC not available or document not found; fall through to keyboard.
+            logger.debug("IPC save failed (%s), falling back to keyboard.", ipc_result.get("error"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("IPC save raised %s, falling back to keyboard.", exc)
+
+    # ── Keyboard-automation fallback ─────────────────────────────────────────
     system = platform.system()
     try:
         if system == "Windows":
@@ -1454,17 +1481,42 @@ def kicad_save_schematic(window_title_hint: str = "") -> Dict[str, Any]:
 
 
 @mcp.tool()
-def kicad_reload_schematic(window_title_hint: str = "") -> Dict[str, Any]:
-    """Trigger a schematic reload in KiCad via keyboard automation.
+def kicad_reload_schematic(file_path: str = "", window_title_hint: str = "") -> Dict[str, Any]:
+    """Reload a KiCad schematic/PCB from disk into the live editor.
 
-    Sends Ctrl+Shift+R (or equivalent) to the focused KiCad window.
+    Preferred path: when ``kicad-python`` (kipy) is installed and a running
+    KiCad instance has *file_path* open, this calls the native IPC
+    ``RevertDocument`` command (discard in-memory state, re-read from disk)
+    followed by ``RefreshEditor`` (force a UI redraw).
+
+    Fallback path: when kipy is unavailable or the file is not found in any
+    IPC socket, sends Ctrl+Shift+R to the focused KiCad window via the
+    platform's keyboard automation facility.
 
     Args:
-        window_title_hint: Optional window title hint (reserved for future).
+        file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
+                           that should be reloaded.  When provided and kipy
+                           is available the IPC path is used; when omitted
+                           only keyboard automation is attempted.
+        window_title_hint: Optional window title hint used by the keyboard
+                           fallback (reserved for future use).
 
     Returns:
-        ``{"triggered": true}`` on success or an error.
+        ``{"triggered": true, "method": "<ipc|xdotool|osascript|ctypes_keybd_event>"}``
+        on success, or an error dict.
     """
+    # ── IPC path ─────────────────────────────────────────────────────────────
+    if file_path:
+        try:
+            from .kicad_ipc import ipc_revert_document
+            ipc_result = ipc_revert_document(file_path)
+            if ipc_result.get("success"):
+                return _ok({"triggered": True, "method": "ipc", "socket": ipc_result.get("socket", "")})
+            logger.debug("IPC reload failed (%s), falling back to keyboard.", ipc_result.get("error"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("IPC reload raised %s, falling back to keyboard.", exc)
+
+    # ── Keyboard-automation fallback ─────────────────────────────────────────
     system = platform.system()
     try:
         if system == "Windows":
@@ -1589,32 +1641,28 @@ async def kicad_edit_file_pipeline(
     save_before_edit: bool = True,
     reload_after_edit: bool = True,
 ) -> Dict[str, Any]:
-    """Orchestrate the full keyboard-save → direct-file-edit → keyboard-reload pipeline (Phase 5.3).
+    """Orchestrate the full IPC save → direct-file-edit → IPC reload pipeline (Phase 5.3).
 
     **When to use this tool:**  call it whenever you want to edit a KiCad file
     (``.kicad_sch`` or ``.kicad_pcb``) that may be open in a live KiCad
-    instance.  It handles the three-phase workflow automatically:
+    instance.  It handles the full workflow automatically:
 
     1. **IPC detection** — checks via KiCad's IPC socket whether the file is
        currently open.  If it is not open, steps 2 and 6 are skipped.
-    2. **Keyboard save** (if open) — sends Ctrl+S to the focused KiCad window
-       via ``kicad_save_schematic`` so any unsaved KiCad changes are flushed to
-       disk before the edit overwrites the file.
+    2. **IPC save** (if open) — calls ``SaveDocument`` via the kipy IPC API so
+       any unsaved KiCad changes are flushed to disk.  Falls back to sending
+       Ctrl+S via keyboard automation when kipy is unavailable.
     3. **Advisory file lock** — acquires an OS-level lock to prevent concurrent
        modifications from other processes.
     4. **Direct file edit** — invokes *tool_name* with *tool_args*; KiAssist's
        custom parsers write directly to the ``.kicad_sch`` / ``.kicad_pcb`` file
-       on disk (this never goes through KiCad's IPC API).
+       on disk (this never modifies KiCad's in-memory state directly).
     5. **Rollback** — if the edit fails, the ``.bak`` backup created by
        ``_safe_save`` is restored automatically.
-    6. **Keyboard reload** (if open and edit succeeded) — sends Ctrl+Shift+R via
-       ``kicad_reload_schematic`` so KiCad re-reads the updated file from disk.
-
-    .. note::
-        KiCad's IPC API does not expose save or reload commands, so steps 2 and
-        6 use keyboard automation as a workaround.  The ``window_title_hint``
-        parameter is reserved for future targeted-window support; currently the
-        keyboard shortcut is sent to the globally focused window.
+    6. **IPC reload** (if open and edit succeeded) — calls ``RevertDocument`` +
+       ``RefreshEditor`` via kipy so KiCad re-reads the updated file from disk
+       and refreshes its UI.  Falls back to Ctrl+Shift+R keyboard automation
+       when kipy is unavailable.
 
     Args:
         file_path:         Path to the ``.kicad_sch`` or ``.kicad_pcb`` file
@@ -1622,18 +1670,19 @@ async def kicad_edit_file_pipeline(
         tool_name:         Name of the MCP tool that performs the actual edit
                            (e.g. ``"schematic_add_symbol"``).
         tool_args:         JSON-encoded dict of arguments for *tool_name*.
-        window_title_hint: Optional KiCad window title fragment reserved for
-                           future targeted-window automation.
-        save_before_edit:  Trigger keyboard save before the edit (default ``true``).
-        reload_after_edit: Trigger keyboard reload after the edit (default ``true``).
+        window_title_hint: Optional KiCad window title fragment used by the
+                           keyboard-automation fallback to target a specific
+                           window.
+        save_before_edit:  Trigger save before the edit (default ``true``).
+        reload_after_edit: Trigger reload after the edit (default ``true``).
 
     Returns:
         The return value of *tool_name* annotated with a ``pipeline`` dict
         containing:
 
         * ``file_was_open_in_kicad`` — ``true`` if the file was detected open.
-        * ``save_triggered`` — ``true`` if the keyboard save succeeded.
-        * ``reload_triggered`` — ``true`` if the keyboard reload succeeded.
+        * ``save_triggered`` — ``true`` if save succeeded (via IPC or keyboard).
+        * ``reload_triggered`` — ``true`` if reload succeeded (via IPC or keyboard).
     """
     try:
         from .ipc_workflow import SchematicEditPipeline

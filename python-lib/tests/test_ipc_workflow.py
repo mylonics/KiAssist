@@ -555,3 +555,122 @@ class TestKiCadReloadSchematicUsesSubprocess:
         assert not mock_os_system.called, "os.system must NOT be used"
         assert result["status"] == "ok"
         assert result["data"]["method"] == "xdotool"
+
+
+# ===========================================================================
+# IPC path: kicad_save_schematic and kicad_reload_schematic prefer IPC
+# ===========================================================================
+
+
+class TestKiCadSaveSchematicIpcPath:
+    """kicad_save_schematic uses IPC when kipy is available and file is found."""
+
+    def test_uses_ipc_when_available(self, tmp_sch: Path):
+        """When ipc_save_document returns success, the tool returns method=ipc."""
+        import kiassist_utils.mcp_server as ms
+
+        ipc_ok = {"success": True, "socket": "/tmp/kicad/api.sock", "method": "ipc"}
+        with mock.patch("kiassist_utils.mcp_server.kicad_ipc.ipc_save_document" if False else
+                        "kiassist_utils.kicad_ipc.ipc_save_document", ipc_ok):
+            # Patch the import path used inside the function body
+            with mock.patch("kiassist_utils.kicad_ipc.ipc_save_document", return_value=ipc_ok):
+                result = _call("kicad_save_schematic", file_path=str(tmp_sch))
+
+        assert result["status"] == "ok"
+        assert result["data"]["method"] == "ipc"
+
+    def test_falls_back_to_keyboard_when_ipc_fails(self, tmp_sch: Path):
+        """When ipc_save_document returns success=False, falls back to keyboard."""
+        import kiassist_utils.mcp_server as ms
+
+        ipc_fail = {"success": False, "error": "kicad-python package not available"}
+        with mock.patch("kiassist_utils.kicad_ipc.ipc_save_document", return_value=ipc_fail):
+            with mock.patch.object(ms.platform, "system", return_value="Linux"):
+                with mock.patch.object(ms.shutil, "which", return_value="/usr/bin/xdotool"):
+                    with mock.patch.object(
+                        ms.subprocess, "run", return_value=mock.Mock(returncode=0)
+                    ):
+                        result = _call("kicad_save_schematic", file_path=str(tmp_sch))
+
+        assert result["status"] == "ok"
+        assert result["data"]["method"] == "xdotool"
+
+    def test_no_file_path_goes_direct_to_keyboard(self, tmp_sch: Path):
+        """Without file_path, IPC is skipped and keyboard automation is used."""
+        import kiassist_utils.mcp_server as ms
+
+        with mock.patch.object(ms.platform, "system", return_value="Linux"):
+            with mock.patch.object(ms.shutil, "which", return_value="/usr/bin/xdotool"):
+                with mock.patch.object(
+                    ms.subprocess, "run", return_value=mock.Mock(returncode=0)
+                ) as mock_run:
+                    result = _call("kicad_save_schematic")  # no file_path
+
+        assert result["status"] == "ok"
+        assert result["data"]["method"] == "xdotool"
+        assert mock_run.called
+
+
+class TestKiCadReloadSchematicIpcPath:
+    """kicad_reload_schematic uses IPC when kipy is available and file is found."""
+
+    def test_uses_ipc_when_available(self, tmp_sch: Path):
+        """When ipc_revert_document returns success, the tool returns method=ipc."""
+        ipc_ok = {"success": True, "socket": "/tmp/kicad/api.sock", "method": "ipc"}
+        with mock.patch("kiassist_utils.kicad_ipc.ipc_revert_document", return_value=ipc_ok):
+            result = _call("kicad_reload_schematic", file_path=str(tmp_sch))
+
+        assert result["status"] == "ok"
+        assert result["data"]["method"] == "ipc"
+
+    def test_falls_back_to_keyboard_when_ipc_fails(self, tmp_sch: Path):
+        """When ipc_revert_document returns success=False, falls back to keyboard."""
+        import kiassist_utils.mcp_server as ms
+
+        ipc_fail = {"success": False, "error": "kicad-python package not available"}
+        with mock.patch("kiassist_utils.kicad_ipc.ipc_revert_document", return_value=ipc_fail):
+            with mock.patch.object(ms.platform, "system", return_value="Linux"):
+                with mock.patch.object(ms.shutil, "which", return_value="/usr/bin/xdotool"):
+                    with mock.patch.object(
+                        ms.subprocess, "run", return_value=mock.Mock(returncode=0)
+                    ):
+                        result = _call("kicad_reload_schematic", file_path=str(tmp_sch))
+
+        assert result["status"] == "ok"
+        assert result["data"]["method"] == "xdotool"
+
+
+class TestPipelineForwardsFilePath:
+    """Pipeline must pass file_path to kicad_save_schematic and kicad_reload_schematic."""
+
+    def test_save_receives_file_path(self, tmp_sch: Path):
+        """kicad_save_schematic is called with file_path matching the pipeline's file."""
+        received_args: list = []
+
+        async def fake_ipc(tool_name: str, args: dict) -> Any:
+            received_args.append((tool_name, args.copy()))
+            return {"status": "ok", "data": {}}
+
+        async def _run():
+            pipeline = SchematicEditPipeline(
+                str(tmp_sch),
+                save_before_edit=True,
+                reload_after_edit=True,
+                save_wait=0,
+                reload_wait=0,
+            )
+            with mock.patch.object(wf, "is_file_open_in_kicad", return_value=True):
+                with mock.patch.object(wf, "in_process_call", fake_ipc):
+                    return await pipeline.run("my_edit_tool", {})
+
+        asyncio.run(_run())
+
+        save_calls = [(n, a) for n, a in received_args if n == "kicad_save_schematic"]
+        reload_calls = [(n, a) for n, a in received_args if n == "kicad_reload_schematic"]
+
+        assert save_calls, "kicad_save_schematic must be called"
+        assert save_calls[0][1]["file_path"] == str(tmp_sch)
+
+        assert reload_calls, "kicad_reload_schematic must be called"
+        assert reload_calls[0][1]["file_path"] == str(tmp_sch)
+
