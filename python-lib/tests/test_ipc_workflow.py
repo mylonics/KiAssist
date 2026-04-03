@@ -369,6 +369,7 @@ class TestRunEditPipeline:
         results = asyncio.run(_run())
         assert len(results) == 2  # ok_tool + fail_tool; never_called is skipped
         assert results[1]["status"] == "error"
+        assert "pipeline" in results[1], "failed result must include pipeline metadata"
         assert "never_called" not in called
 
     def test_save_before_and_reload_after(self, tmp_sch: Path):

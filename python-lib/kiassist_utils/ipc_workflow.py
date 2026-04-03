@@ -478,6 +478,11 @@ async def run_edit_pipeline(
                     rolled_back = rollback_from_backup(path)
                     if isinstance(edit_result, dict):
                         edit_result["rolled_back"] = rolled_back
+                        edit_result["pipeline"] = {
+                            "file_was_open_in_kicad": file_open,
+                            "save_triggered": save_triggered,
+                            "reload_triggered": False,
+                        }
                     logger.warning(
                         "Edit tool %r failed for %s; rolled_back=%s. "
                         "Aborting remaining edits in batch.",
