@@ -15,6 +15,7 @@ Modules:
 
 from .sexpr import parse, serialize, SExpr
 from .models import Position, Stroke, Effects, Property, KiUUID, Pts
+from .schematic import TitleBlock
 
 __all__ = [
     "parse",
@@ -26,4 +27,5 @@ __all__ = [
     "Property",
     "KiUUID",
     "Pts",
+    "TitleBlock",
 ]

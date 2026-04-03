@@ -13,10 +13,11 @@ Typical usage::
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .models import Effects, Position, Property, KiUUID, Pts, Stroke
 from .sexpr import QStr, SExpr, parse, serialize
@@ -97,6 +98,69 @@ def _parse_property(tree: List[SExpr]) -> Property:
     if effects:
         eff = _parse_effects(effects)
     return Property(key=key, value=value, position=pos, effects=eff)
+
+
+# ---------------------------------------------------------------------------
+# Title block
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TitleBlock:
+    """The title block / drawing header of a schematic sheet.
+
+    Attributes:
+        title:    Drawing title string.
+        date:     Date string (e.g. ``"2026-04-03"``).
+        revision: Revision string (e.g. ``"1.0"``).
+        company:  Company / author name.
+        comments: Mapping of comment number (1–4) to comment text.
+    """
+
+    title: str = ""
+    date: str = ""
+    revision: str = ""
+    company: str = ""
+    comments: Dict[int, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_tree(cls, tree: List[SExpr]) -> "TitleBlock":
+        tb = cls()
+        title_node = _find(tree, "title")
+        if title_node and len(title_node) > 1:
+            tb.title = str(title_node[1])
+        date_node = _find(tree, "date")
+        if date_node and len(date_node) > 1:
+            tb.date = str(date_node[1])
+        rev_node = _find(tree, "rev")
+        if rev_node and len(rev_node) > 1:
+            tb.revision = str(rev_node[1])
+        company_node = _find(tree, "company")
+        if company_node and len(company_node) > 1:
+            tb.company = str(company_node[1])
+        for comment_node in _find_all(tree, "comment"):
+            if len(comment_node) >= 3:
+                try:
+                    num = int(comment_node[1])
+                    text = str(comment_node[2])
+                    tb.comments[num] = text
+                except (ValueError, IndexError):
+                    pass
+        return tb
+
+    def to_tree(self) -> List[SExpr]:
+        tree: List[SExpr] = ["title_block"]
+        if self.title:
+            tree.append(["title", QStr(self.title)])
+        if self.date:
+            tree.append(["date", QStr(self.date)])
+        if self.revision:
+            tree.append(["rev", QStr(self.revision)])
+        if self.company:
+            tree.append(["company", QStr(self.company)])
+        for num in sorted(self.comments):
+            tree.append(["comment", num, QStr(self.comments[num])])
+        return tree
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +539,7 @@ class SchematicSymbol:
     in_bom: bool = True
     on_board: bool = True
     properties: List[Property] = field(default_factory=list)
+    pin_uuids: Dict[str, KiUUID] = field(default_factory=dict)
     uuid: KiUUID = field(default_factory=KiUUID)
     raw_tree: Optional[List[SExpr]] = field(default=None, repr=False)
 
@@ -523,6 +588,13 @@ class SchematicSymbol:
             sym.on_board = str(on_board_node[1]) == "yes"
         for prop in _find_all(tree, "property"):
             sym.properties.append(_parse_property(prop))
+        # Parse pin UUIDs: (pin "N" (uuid "..."))
+        for pin_node in _find_all(tree, "pin"):
+            if len(pin_node) >= 2:
+                pin_num = str(pin_node[1])
+                pin_uuid_node = _find(pin_node, "uuid")
+                if pin_uuid_node and len(pin_uuid_node) > 1:
+                    sym.pin_uuids[pin_num] = KiUUID(str(pin_uuid_node[1]))
         uuid_node = _find(tree, "uuid")
         if uuid_node and len(uuid_node) > 1:
             sym.uuid = KiUUID(str(uuid_node[1]))
@@ -571,28 +643,30 @@ class Schematic:
     """Model for a KiCad schematic file (.kicad_sch).
 
     Attributes:
-        version:      File format version integer (e.g. ``20231120``).
-        generator:    Name of the tool that last wrote the file.
-        uuid:         Schematic UUID.
-        paper:        Paper size string (e.g. ``"A4"``).
-        lib_symbols:  Embedded library symbol definitions.
-        wires:        Wire segments on this sheet.
-        buses:        Bus segments on this sheet.
-        junctions:    Junction markers.
-        no_connects:  No-connect markers.
-        bus_entries:  Bus-entry diagonal segments.
-        labels:       Net labels.
-        global_labels: Global labels.
+        version:             File format version integer (e.g. ``20231120``).
+        generator:           Name of the tool that last wrote the file.
+        uuid:                Schematic UUID.
+        paper:               Paper size string (e.g. ``"A4"``).
+        title_block:         Drawing title block (title, date, revision, …).
+        lib_symbols:         Embedded library symbol definitions.
+        wires:               Wire segments on this sheet.
+        buses:               Bus segments on this sheet.
+        junctions:           Junction markers.
+        no_connects:         No-connect markers.
+        bus_entries:         Bus-entry diagonal segments.
+        labels:              Net labels.
+        global_labels:       Global labels.
         hierarchical_labels: Hierarchical labels.
-        sheets:       Sub-sheet references.
-        symbols:      Placed component instances.
-        _extra:       Unrecognised top-level items preserved for round-trips.
+        sheets:              Sub-sheet references.
+        symbols:             Placed component instances.
+        _extra:              Unrecognised top-level items preserved for round-trips.
     """
 
     version: int = 0
     generator: str = ""
     uuid: KiUUID = field(default_factory=KiUUID)
     paper: str = "A4"
+    title_block: Optional[TitleBlock] = None
     lib_symbols: List[LibSymbol] = field(default_factory=list)
     wires: List[Wire] = field(default_factory=list)
     buses: List[Bus] = field(default_factory=list)
@@ -837,12 +911,88 @@ class Schematic:
         """Return a mapping of net name to list of connected pin references.
 
         Nets are identified by :class:`Label` and :class:`GlobalLabel` text.
-        Connections are inferred from wire endpoints that coincide with
-        label and symbol pin positions.
+        Wire topology is traced using a union-find algorithm: all wire segments
+        are merged into connected components, then labels and symbol pins whose
+        positions coincide with a wire endpoint (within 0.001 mm) are assigned
+        to the same net.
 
         Returns:
             Dict mapping net name to list of ``"RefDes:PinNum"`` strings.
         """
+        _EPS = 0.001  # mm coordinate snap tolerance
+
+        # ------------------------------------------------------------------
+        # 1. Collect every distinct point that appears on a wire endpoint.
+        # ------------------------------------------------------------------
+        all_pts: List[Tuple[float, float]] = []
+        pt_index: Dict[Tuple[float, float], int] = {}
+
+        def _snap(x: float, y: float) -> Tuple[float, float]:
+            return (round(x / _EPS) * _EPS, round(y / _EPS) * _EPS)
+
+        def _get_or_add(x: float, y: float) -> int:
+            key = _snap(x, y)
+            if key not in pt_index:
+                pt_index[key] = len(all_pts)
+                all_pts.append(key)
+            return pt_index[key]
+
+        # ------------------------------------------------------------------
+        # 2. Union-find helpers.
+        # ------------------------------------------------------------------
+        parent: List[int] = []
+
+        def _root(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _root(a), _root(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        # ------------------------------------------------------------------
+        # 3. Add all wire endpoints and union consecutive points on each wire.
+        # ------------------------------------------------------------------
+        for w in self.wires:
+            pts_list = list(w.pts)
+            if not pts_list:
+                continue
+            ids = [_get_or_add(p.x, p.y) for p in pts_list]
+            # Grow parent array to accommodate new points
+            while len(parent) < len(all_pts):
+                parent.append(len(parent))
+            for i in range(len(ids) - 1):
+                _union(ids[i], ids[i + 1])
+
+        # Ensure parent covers all current points
+        while len(parent) < len(all_pts):
+            parent.append(len(parent))
+
+        # ------------------------------------------------------------------
+        # 4. Map each wire-connected component to the net names that touch it
+        #    (via labels / global labels at matching positions).
+        # ------------------------------------------------------------------
+        component_nets: Dict[int, str] = {}
+
+        def _assign_net(x: float, y: float, net_name: str) -> None:
+            key = _snap(x, y)
+            if key in pt_index:
+                root = _root(pt_index[key])
+                if root not in component_nets:
+                    component_nets[root] = net_name
+
+        for lbl in self.labels:
+            _assign_net(lbl.position.x, lbl.position.y, lbl.text)
+
+        for gl in self.global_labels:
+            _assign_net(gl.position.x, gl.position.y, gl.text)
+
+        # ------------------------------------------------------------------
+        # 5. Map symbol pins to nets by matching pin positions to wire components.
+        # ------------------------------------------------------------------
         nets: Dict[str, List[str]] = {}
 
         def _add(net: str, pin_ref: str) -> None:
@@ -850,22 +1000,21 @@ class Schematic:
             if pin_ref not in nets[net]:
                 nets[net].append(pin_ref)
 
-        # Build wire graph: collect all points
-        wire_points: list[Tuple[float, float]] = []
-        for w in self.wires:
-            for pt in w.pts:
-                wire_points.append((pt.x, pt.y))
+        for sym in self.symbols:
+            pin_positions = self.get_pin_positions(sym.reference)
+            for pin_num, pos in pin_positions.items():
+                key = _snap(pos.x, pos.y)
+                if key in pt_index:
+                    root = _root(pt_index[key])
+                    net_name = component_nets.get(root)
+                    if net_name:
+                        _add(net_name, f"{sym.reference}:{pin_num}")
 
-        # Simple association: labels at wire endpoints → net names
+        # Also include labels that are not connected to any wire as standalone entries
         for lbl in self.labels:
-            net_name = lbl.text
-            pt = (lbl.position.x, lbl.position.y)
-            _add(net_name, f"label@{pt[0]},{pt[1]}")
-
+            nets.setdefault(lbl.text, [])
         for gl in self.global_labels:
-            net_name = gl.text
-            pt = (gl.position.x, gl.position.y)
-            _add(net_name, f"global@{pt[0]},{pt[1]}")
+            nets.setdefault(gl.text, [])
 
         return nets
 
@@ -891,6 +1040,10 @@ class Schematic:
         paper_node = _find(tree, "paper")
         if paper_node and len(paper_node) > 1:
             sch.paper = str(paper_node[1])
+
+        title_block_node = _find(tree, "title_block")
+        if title_block_node:
+            sch.title_block = TitleBlock.from_tree(title_block_node)
 
         lib_syms_node = _find(tree, "lib_symbols")
         if lib_syms_node:
@@ -941,6 +1094,8 @@ class Schematic:
         if self.uuid:
             tree.append(["uuid", QStr(self.uuid.value)])
         tree.append(["paper", QStr(self.paper)])
+        if self.title_block is not None:
+            tree.append(self.title_block.to_tree())
 
         # Lib symbols
         lib_syms_node: List[SExpr] = ["lib_symbols"]

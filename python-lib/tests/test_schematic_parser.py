@@ -10,6 +10,7 @@ import pytest
 from kiassist_utils.kicad_parser.schematic import (
     Schematic,
     SchematicSymbol,
+    TitleBlock,
     Wire,
     Bus,
     Junction,
@@ -346,3 +347,172 @@ class TestSchematicAddJunctionAndNoConnect:
         lbl = sch.add_label("NET1", 0.0, 0.0)
         assert len(sch.labels) == 1
         assert lbl.text == "NET1"
+
+
+class TestSchematicTitleBlock:
+    """Tests for TitleBlock parsing and round-trip."""
+
+    def test_title_block_parsed(self):
+        """title_block attribute is populated when present in the file."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.title_block is not None
+
+    def test_title_block_title(self):
+        """Title is parsed."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.title_block.title == "Test Schematic"
+
+    def test_title_block_date(self):
+        """Date is parsed."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.title_block.date == "2026-04-03"
+
+    def test_title_block_revision(self):
+        """Revision is parsed."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.title_block.revision == "1.0"
+
+    def test_title_block_company(self):
+        """Company is parsed."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.title_block.company == "KiAssist"
+
+    def test_title_block_comments(self):
+        """Comments dict is parsed."""
+        sch = Schematic.load(FIXTURE_SCH)
+        assert sch.title_block.comments.get(1) == "Top-level comment"
+
+    def test_title_block_round_trip_title(self):
+        """Title survives a save → reload round-trip."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        assert sch2.title_block is not None
+        assert sch2.title_block.title == "Test Schematic"
+
+    def test_no_title_block_when_absent(self):
+        """title_block is None when not present in the file."""
+        sch = Schematic()
+        assert sch.title_block is None
+
+    def test_title_block_not_in_extra(self):
+        """title_block content does not appear in _extra."""
+        sch = Schematic.load(FIXTURE_SCH)
+        tags = [item[0] for item in sch._extra if isinstance(item, list) and item]
+        assert "title_block" not in tags
+
+    def test_title_block_to_tree_round_trip(self):
+        """TitleBlock.to_tree() round-trips correctly."""
+        tb = TitleBlock(
+            title="My Project",
+            date="2026-01-01",
+            revision="2.0",
+            company="ACME",
+            comments={1: "first comment"},
+        )
+        from kiassist_utils.kicad_parser.sexpr import parse, serialize
+        tree = tb.to_tree()
+        text = serialize(tree)
+        parsed = parse(text)
+        tb2 = TitleBlock.from_tree(parsed)
+        assert tb2.title == "My Project"
+        assert tb2.revision == "2.0"
+        assert tb2.comments[1] == "first comment"
+
+
+class TestSchematicPinUUIDs:
+    """Tests for SchematicSymbol.pin_uuids."""
+
+    def test_pin_uuids_parsed(self):
+        """pin_uuids is populated for symbols that have pin uuid entries."""
+        sch = Schematic.load(FIXTURE_SCH)
+        r1 = next(s for s in sch.symbols if s.reference == "R1")
+        assert len(r1.pin_uuids) == 2
+
+    def test_pin_uuid_values(self):
+        """Pin UUIDs have the expected values from the fixture."""
+        sch = Schematic.load(FIXTURE_SCH)
+        r1 = next(s for s in sch.symbols if s.reference == "R1")
+        assert r1.pin_uuids["1"].value == "00000000-0000-0000-0000-000000000061"
+        assert r1.pin_uuids["2"].value == "00000000-0000-0000-0000-000000000062"
+
+    def test_pin_uuid_round_trip(self):
+        """pin_uuids survive a save → reload round-trip (raw_tree preserves them)."""
+        sch = Schematic.load(FIXTURE_SCH)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "out.kicad_sch"
+            sch.save(out)
+            sch2 = Schematic.load(out)
+        r1 = next(s for s in sch2.symbols if s.reference == "R1")
+        assert r1.pin_uuids["1"].value == "00000000-0000-0000-0000-000000000061"
+
+
+class TestGetConnectedNets:
+    """Tests for Schematic.get_connected_nets() wire topology."""
+
+    def _build_sch(self) -> Schematic:
+        """Build a minimal schematic with wires, a label, and a symbol."""
+        sch = Schematic()
+        # Wire from (0,0) to (10,0)
+        sch.add_wire(0.0, 0.0, 10.0, 0.0)
+        # Label "VCC" attached at the left end (0,0)
+        sch.add_label("VCC", 0.0, 0.0)
+        return sch
+
+    def test_returns_dict(self):
+        """get_connected_nets() returns a dict."""
+        sch = Schematic.load(FIXTURE_SCH)
+        result = sch.get_connected_nets()
+        assert isinstance(result, dict)
+
+    def test_label_nets_present(self):
+        """Labels appear as keys in the result."""
+        sch = Schematic.load(FIXTURE_SCH)
+        result = sch.get_connected_nets()
+        assert "VCC" in result
+        assert "GND" in result
+
+    def test_unconnected_label_has_empty_pins(self):
+        """A label with no wires or pins still appears with an empty list."""
+        sch = Schematic()
+        sch.add_label("FLOATING", 100.0, 100.0)
+        result = sch.get_connected_nets()
+        assert "FLOATING" in result
+        assert result["FLOATING"] == []
+
+    def test_wire_topology_connects_label_to_pin(self):
+        """A label connected by wire to a pin endpoint is mapped correctly."""
+        sch = self._build_sch()
+        # Add a lib symbol that has a pin at (0, 3.81) relative to origin.
+        # We embed a minimal lib_symbols entry so get_pin_positions works.
+        from kiassist_utils.kicad_parser.sexpr import parse
+        lib_sym_text = (
+            '(symbol "TestLib:LED" '
+            '  (symbol "LED_1_1"'
+            '    (pin passive line (at 0.0 0.0 270) (length 0)'
+            '      (name "A" (effects (font (size 1.27 1.27))))'
+            '      (number "1" (effects (font (size 1.27 1.27))))'
+            '    )'
+            '  )'
+            ')'
+        )
+        from kiassist_utils.kicad_parser.schematic import LibSymbol
+        lib_sym = LibSymbol.from_tree(parse(lib_sym_text))
+        sch.lib_symbols.append(lib_sym)
+        # Place symbol so pin "1" lands exactly at (0.0, 0.0)
+        from kiassist_utils.kicad_parser.schematic import SchematicSymbol
+        from kiassist_utils.kicad_parser.models import Position, Property
+        sym = SchematicSymbol()
+        sym.lib_id = "TestLib:LED"
+        sym.position = Position(0.0, 0.0, 0.0)
+        sym.properties = [
+            Property("Reference", "D1", Position(0, 0)),
+            Property("Value", "LED", Position(0, 0)),
+        ]
+        sch.symbols.append(sym)
+        result = sch.get_connected_nets()
+        # D1 pin 1 is at (0,0) which is the same as the VCC label — should be connected
+        assert "VCC" in result
+        assert "D1:1" in result["VCC"]
