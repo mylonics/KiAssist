@@ -1,26 +1,77 @@
-"""API key storage and management using OS keyring with file fallback."""
+"""API key storage and management using OS keyring with file fallback.
+
+Supports multiple AI providers (Gemini, Claude, OpenAI).  All public methods
+accept an optional *provider* parameter.  When omitted the default is
+``"gemini"`` for backward compatibility.
+
+Supported provider names and their environment variable mappings:
+
+=========  =====================  ====================
+Provider   Keyring key name       Environment variable
+=========  =====================  ====================
+gemini     kiassist-gemini        GEMINI_API_KEY
+claude     kiassist-claude        ANTHROPIC_API_KEY
+openai     kiassist-openai        OPENAI_API_KEY
+=========  =====================  ====================
+"""
 
 import os
 import json
 import keyring
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
+
+# ---------------------------------------------------------------------------
+# Provider metadata
+# ---------------------------------------------------------------------------
+
+#: Map provider name → (keyring_key_name, env_variable_name, config_field_name)
+_PROVIDER_META: Dict[str, Tuple[str, str, str]] = {
+    "gemini": ("kiassist-gemini", "GEMINI_API_KEY", "api_key"),
+    "claude": ("kiassist-claude", "ANTHROPIC_API_KEY", "claude_api_key"),
+    "openai": ("kiassist-openai", "OPENAI_API_KEY", "openai_api_key"),
+}
+
+_DEFAULT_PROVIDER = "gemini"
 
 
 class ApiKeyStore:
-    """Manage API key storage using OS credential store with file fallback."""
+    """Manage API key storage using OS credential store with file fallback.
+
+    Supports multiple AI providers.  All public methods accept an optional
+    *provider* keyword argument (``"gemini"``, ``"claude"``, or ``"openai"``).
+    Omitting the argument defaults to ``"gemini"`` for backward compatibility.
+    """
     
     SERVICE_NAME = "KiAssist"
+    # Kept for backward compatibility; new code uses per-provider key names.
     KEY_NAME = "gemini_api_key"
     CONFIG_DIR_NAME = ".kiassist"
     CONFIG_FILE_NAME = "config.json"
     
     def __init__(self):
         """Initialize API key store."""
-        self._memory_key: Optional[str] = None
+        self._memory_keys: Dict[str, Optional[str]] = {p: None for p in _PROVIDER_META}
         self._keyring_available: Optional[bool] = None
-        # Try to load from environment variable first
-        self._memory_key = os.environ.get("GEMINI_API_KEY")
+        # Pre-load from environment variables
+        for provider, (_key_name, env_var, _field) in _PROVIDER_META.items():
+            env_val = os.environ.get(env_var)
+            if env_val:
+                self._memory_keys[provider] = env_val
+
+    # ------------------------------------------------------------------
+    # Backward-compat single-key shims (Gemini only)
+    # ------------------------------------------------------------------
+
+    @property
+    def _memory_key(self) -> Optional[str]:
+        """Backward-compatible single-key property (Gemini)."""
+        return self._memory_keys.get("gemini")
+
+    @_memory_key.setter
+    def _memory_key(self, value: Optional[str]) -> None:
+        """Backward-compatible single-key setter (Gemini)."""
+        self._memory_keys["gemini"] = value
     
     def _get_config_path(self) -> Path:
         """Get the path to the config file.
@@ -74,185 +125,257 @@ class ApiKeyStore:
         
         return self._keyring_available
     
-    def _load_from_file(self) -> Optional[str]:
-        """Load API key from file-based storage.
-        
+    # ------------------------------------------------------------------
+    # Provider helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_provider(self, provider: Optional[str]) -> str:
+        """Normalise and validate a provider name.
+
+        Args:
+            provider: Provider name string or ``None`` (defaults to gemini).
+
         Returns:
-            The API key if found, None otherwise
+            Validated lower-case provider name.
+
+        Raises:
+            ValueError: If the provider name is not supported.
         """
+        p = (provider or _DEFAULT_PROVIDER).lower().strip()
+        if p not in _PROVIDER_META:
+            raise ValueError(
+                f"Unknown provider {p!r}. "
+                f"Supported providers: {list(_PROVIDER_META)}"
+            )
+        return p
+
+    def _get_keyring_key(self, provider: str) -> str:
+        """Return the keyring *username* for the given provider."""
+        return _PROVIDER_META[provider][0]
+
+    def _get_env_var(self, provider: str) -> str:
+        """Return the environment variable name for the given provider."""
+        return _PROVIDER_META[provider][1]
+
+    def _get_config_field(self, provider: str) -> str:
+        """Return the config.json field name for the given provider."""
+        return _PROVIDER_META[provider][2]
+
+    # ------------------------------------------------------------------
+    # File-based storage (provider-aware)
+    # ------------------------------------------------------------------
+
+    def _load_from_file(self, provider: str = _DEFAULT_PROVIDER) -> Optional[str]:
+        """Load an API key from file-based storage.
+
+        Args:
+            provider: Provider name (default: ``"gemini"``).
+
+        Returns:
+            The API key if found, ``None`` otherwise.
+        """
+        field = self._get_config_field(provider)
         try:
             config_path = self._get_config_path()
             if config_path.exists():
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                    return config.get('api_key')
-        except (OSError, IOError) as e:
-            # File system errors
+                    return config.get(field)
+        except (OSError, IOError):
             pass
         except json.JSONDecodeError:
-            # Invalid JSON in config file
             pass
         except (TypeError, KeyError):
-            # Unexpected config structure
             pass
         return None
-    
-    def _save_to_file(self, api_key: str) -> bool:
-        """Save API key to file-based storage.
-        
+
+    def _save_to_file(self, api_key: str, provider: str = _DEFAULT_PROVIDER) -> bool:
+        """Save an API key to file-based storage.
+
         Args:
-            api_key: The API key to save
-            
+            api_key:  The API key to save.
+            provider: Provider name (default: ``"gemini"``).
+
         Returns:
-            True if successful, False otherwise
+            ``True`` if successful, ``False`` otherwise.
         """
+        field = self._get_config_field(provider)
         try:
             config_path = self._ensure_config_dir()
-            config = {}
-            
-            # Load existing config if present
+            config: Dict[str, str] = {}
+
             if config_path.exists():
                 try:
                     with open(config_path, 'r', encoding='utf-8') as f:
                         config = json.load(f)
                 except (json.JSONDecodeError, OSError, IOError):
-                    # Start fresh if existing config is invalid
                     config = {}
-            
-            config['api_key'] = api_key
-            
+
+            config[field] = api_key
+
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2)
-            
-            # Set restrictive permissions on the file (owner read/write only)
+
             try:
                 os.chmod(config_path, 0o600)
             except OSError:
                 pass  # Ignore permission errors on Windows
-            
+
             return True
         except (OSError, IOError):
-            # File system errors (permissions, disk full, etc.)
             return False
-    
-    def _delete_from_file(self) -> None:
-        """Delete API key from file-based storage."""
+
+    def _delete_from_file(self, provider: str = _DEFAULT_PROVIDER) -> None:
+        """Delete an API key from file-based storage.
+
+        Args:
+            provider: Provider name (default: ``"gemini"``).
+        """
+        field = self._get_config_field(provider)
         try:
             config_path = self._get_config_path()
             if config_path.exists():
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                
-                if 'api_key' in config:
-                    del config['api_key']
-                
+
+                if field in config:
+                    del config[field]
+
                 with open(config_path, 'w', encoding='utf-8') as f:
                     json.dump(config, f, indent=2)
         except (OSError, IOError, json.JSONDecodeError):
-            pass  # Ignore errors when deleting
-    
-    def has_api_key(self) -> bool:
-        """Check if an API key is available.
-        
+            pass
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def has_api_key(self, provider: Optional[str] = None) -> bool:
+        """Check if an API key is available for *provider*.
+
+        Args:
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
+                      (defaults to ``"gemini"``).
+
         Returns:
-            True if API key is available, False otherwise
+            ``True`` if an API key is available, ``False`` otherwise.
         """
-        return self.get_api_key() is not None
-    
-    def get_api_key(self) -> Optional[str]:
-        """Get the stored API key.
-        
+        return self.get_api_key(provider) is not None
+
+    def get_api_key(self, provider: Optional[str] = None) -> Optional[str]:
+        """Get the stored API key for *provider*.
+
         Priority:
-        1. Environment variable (GEMINI_API_KEY)
+        1. Environment variable (e.g. ``GEMINI_API_KEY``)
         2. Memory cache
         3. OS keyring (if available)
         4. File-based config
-        
+
+        Args:
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
+                      (defaults to ``"gemini"``).
+
         Returns:
-            The API key if available, None otherwise
+            The API key if available, ``None`` otherwise.
         """
-        # Check environment variable first
-        env_key = os.environ.get("GEMINI_API_KEY")
+        p = self._resolve_provider(provider)
+        env_var = self._get_env_var(p)
+        keyring_key = self._get_keyring_key(p)
+
+        # 1. Environment variable
+        env_key = os.environ.get(env_var)
         if env_key:
             return env_key
-        
-        # Check memory cache
-        if self._memory_key:
-            return self._memory_key
-        
-        # Try to load from keyring
+
+        # 2. Memory cache
+        cached = self._memory_keys.get(p)
+        if cached:
+            return cached
+
+        # 3. OS keyring
         if self._is_keyring_available():
             try:
-                stored_key = keyring.get_password(self.SERVICE_NAME, self.KEY_NAME)
+                stored_key = keyring.get_password(self.SERVICE_NAME, keyring_key)
                 if stored_key:
-                    self._memory_key = stored_key
+                    self._memory_keys[p] = stored_key
                     return stored_key
             except (keyring.errors.KeyringError, OSError):
-                # Keyring access failed, will fall back to file
                 pass
-        
-        # Fallback to file-based storage
-        file_key = self._load_from_file()
+
+        # 4. File-based storage
+        file_key = self._load_from_file(p)
         if file_key:
-            self._memory_key = file_key
+            self._memory_keys[p] = file_key
             return file_key
-        
+
         return None
-    
-    def set_api_key(self, api_key: str) -> Tuple[bool, Optional[str]]:
-        """Store an API key.
-        
+
+    def set_api_key(
+        self,
+        api_key: str,
+        provider: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Store an API key for *provider*.
+
         Args:
-            api_key: The API key to store
-            
+            api_key:  The API key to store.
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
+                      (defaults to ``"gemini"``).
+
         Returns:
-            Tuple of (success, warning_message)
-            success is True if key was stored (at least in memory)
-            warning_message contains any non-fatal warnings
-            
+            Tuple of ``(success, warning_message)`` where *success* is
+            ``True`` if the key was stored (at least in memory) and
+            *warning_message* is a non-fatal advisory string or ``None``.
+
         Raises:
-            ValueError: If API key is empty
+            ValueError: If *api_key* is empty or *provider* is unknown.
         """
         if not api_key or not api_key.strip():
             raise ValueError("API key cannot be empty")
-        
+
+        p = self._resolve_provider(provider)
+        keyring_key = self._get_keyring_key(p)
         api_key = api_key.strip()
-        
+
         # Store in memory
-        self._memory_key = api_key
-        
-        # Track if we successfully persisted
+        self._memory_keys[p] = api_key
+
         persisted = False
         warning = None
-        
-        # Try to persist to keyring first
+
+        # Try keyring
         if self._is_keyring_available():
             try:
-                keyring.set_password(self.SERVICE_NAME, self.KEY_NAME, api_key)
+                keyring.set_password(self.SERVICE_NAME, keyring_key, api_key)
                 persisted = True
             except (keyring.errors.KeyringError, keyring.errors.PasswordSetError, OSError):
-                # Keyring save failed, will fall back to file
                 pass
-        
-        # If keyring failed or unavailable, try file-based storage
+
+        # Fallback to file
         if not persisted:
-            if self._save_to_file(api_key):
+            if self._save_to_file(api_key, p):
                 persisted = True
             else:
                 warning = "API key saved to memory only. It will not persist after restart."
-        
+
         return (True, warning)
-    
-    def clear_api_key(self) -> None:
-        """Clear the stored API key."""
-        self._memory_key = None
-        
-        # Clear from keyring
+
+    def clear_api_key(self, provider: Optional[str] = None) -> None:
+        """Clear the stored API key for *provider*.
+
+        Args:
+            provider: ``"gemini"``, ``"claude"``, ``"openai"``, or ``None``
+                      (defaults to ``"gemini"``).
+        """
+        p = self._resolve_provider(provider)
+        keyring_key = self._get_keyring_key(p)
+
+        self._memory_keys[p] = None
+
         if self._is_keyring_available():
             try:
-                keyring.delete_password(self.SERVICE_NAME, self.KEY_NAME)
+                keyring.delete_password(self.SERVICE_NAME, keyring_key)
             except (keyring.errors.KeyringError, keyring.errors.PasswordDeleteError, OSError):
-                pass  # Ignore errors when clearing
-        
-        # Clear from file
-        self._delete_from_file()
+                pass
+
+        self._delete_from_file(p)
