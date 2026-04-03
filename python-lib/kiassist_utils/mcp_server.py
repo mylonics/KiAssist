@@ -42,6 +42,7 @@ from .kicad_parser.schematic import (
     _parse_position,
 )
 from .kicad_parser.symbol_lib import Pin, SymbolDef, SymbolLibrary, SymbolUnit
+from .context.memory import ProjectMemory
 
 # ---------------------------------------------------------------------------
 # Server instance
@@ -2151,19 +2152,11 @@ def project_read_memory(project_path: str) -> Dict[str, Any]:
         Dict with ``content`` (the Markdown text) or an error if the file
         does not exist.
     """
-    path_obj = Path(project_path)
-    project_dir = path_obj.parent if path_obj.is_file() else path_obj
-    memory_path = project_dir / "KIASSIST.md"
-
-    if not memory_path.exists():
+    mem = ProjectMemory(project_path)
+    content = mem.read()
+    if content is None:
         return _err("KIASSIST.md not found.  Use project_write_memory to create it.")
-
-    try:
-        content = memory_path.read_text(encoding="utf-8")
-    except Exception as exc:  # noqa: BLE001
-        return _err(f"Failed to read KIASSIST.md: {exc}")
-
-    return _ok({"path": str(memory_path), "content": content})
+    return _ok({"path": str(mem.path), "content": content})
 
 
 @mcp.tool()
@@ -2178,19 +2171,14 @@ def project_write_memory(project_path: str, content: str) -> Dict[str, Any]:
     Returns:
         ``{"written": true, "path": "<path>"}`` on success.
     """
-    path_obj = Path(project_path)
-    project_dir = path_obj.parent if path_obj.is_file() else path_obj
-
-    if not project_dir.exists():
-        return _err(f"Project directory not found: {project_dir}")
-
-    memory_path = project_dir / "KIASSIST.md"
+    mem = ProjectMemory(project_path)
+    if not mem.project_dir.exists():
+        return _err(f"Project directory not found: {mem.project_dir}")
     try:
-        memory_path.write_text(content, encoding="utf-8")
+        mem.write(content)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to write KIASSIST.md: {exc}")
-
-    return _ok({"written": True, "path": str(memory_path)})
+    return _ok({"written": True, "path": str(mem.path)})
 
 
 # ===========================================================================

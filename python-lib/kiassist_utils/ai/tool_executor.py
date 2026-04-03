@@ -12,6 +12,12 @@
 Tool calls within a single iteration that are *independent* (no data
 dependency) are executed in parallel using :mod:`asyncio`.
 
+Optionally accepts a :class:`~kiassist_utils.context.tokens.ContextWindowManager`
+to automatically trim tool results and summarise the conversation when approaching
+the model's context limit, and a
+:class:`~kiassist_utils.context.history.ConversationStore` to persist every turn
+to disk for later session resume.
+
 Example::
 
     import asyncio
@@ -30,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from .base import (
     AIMessage,
@@ -40,6 +46,10 @@ from .base import (
     AIToolResult,
     ToolSchema,
 )
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ..context.history import ConversationStore
+    from ..context.tokens import ContextWindowManager
 
 logger = logging.getLogger(__name__)
 
@@ -70,18 +80,27 @@ class ToolExecutor:
     """Runs the AI ↔ MCP tool agentic loop.
 
     Args:
-        provider:       An :class:`~kiassist_utils.ai.base.AIProvider`
-                        instance (Gemini, Claude, or OpenAI).
-        max_iterations: Maximum number of AI↔tool round-trips.  Prevents
-                        runaway loops.  Defaults to
-                        :data:`DEFAULT_MAX_ITERATIONS`.
-        tool_schemas:   Pre-fetched list of MCP tool schemas.  If ``None``,
-                        the executor will fetch them at the start of each
-                        :meth:`run` call via the MCP server.
-        on_tool_call:   Optional callback invoked *before* each tool is
-                        executed: ``on_tool_call(tool_call: AIToolCall)``.
-        on_tool_result: Optional callback invoked *after* each tool returns:
-                        ``on_tool_result(tool_call: AIToolCall, result: AIToolResult)``.
+        provider:         An :class:`~kiassist_utils.ai.base.AIProvider`
+                          instance (Gemini, Claude, or OpenAI).
+        max_iterations:   Maximum number of AI↔tool round-trips.  Prevents
+                          runaway loops.  Defaults to
+                          :data:`DEFAULT_MAX_ITERATIONS`.
+        tool_schemas:     Pre-fetched list of MCP tool schemas.  If ``None``,
+                          the executor will fetch them at the start of each
+                          :meth:`run` call via the MCP server.
+        on_tool_call:     Optional callback invoked *before* each tool is
+                          executed: ``on_tool_call(tool_call: AIToolCall)``.
+        on_tool_result:   Optional callback invoked *after* each tool returns:
+                          ``on_tool_result(tool_call: AIToolCall, result: AIToolResult)``.
+        context_manager:  Optional :class:`~kiassist_utils.context.tokens.ContextWindowManager`.
+                          When provided, token usage is tracked after every AI
+                          response, tool results are trimmed to the configured
+                          character budget, and the conversation is automatically
+                          summarised when approaching the context-window limit.
+        history_store:    Optional :class:`~kiassist_utils.context.history.ConversationStore`.
+                          When provided, every message added to the conversation
+                          is persisted to the JSONL history file.  Requires
+                          *session_id* to be passed to :meth:`run`.
     """
 
     def __init__(
@@ -93,12 +112,16 @@ class ToolExecutor:
         on_tool_result: Optional[
             Callable[[AIToolCall, AIToolResult], None]
         ] = None,
+        context_manager: Optional["ContextWindowManager"] = None,
+        history_store: Optional["ConversationStore"] = None,
     ) -> None:
         self.provider = provider
         self.max_iterations = max_iterations
         self._tool_schemas = tool_schemas
         self.on_tool_call = on_tool_call
         self.on_tool_result = on_tool_result
+        self.context_manager = context_manager
+        self.history_store = history_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -109,6 +132,7 @@ class ToolExecutor:
         messages: List[AIMessage],
         system_prompt: Optional[str] = None,
         tool_schemas: Optional[List[ToolSchema]] = None,
+        session_id: Optional[str] = None,
     ) -> AIResponse:
         """Run the agentic loop until a final text response is produced.
 
@@ -116,6 +140,9 @@ class ToolExecutor:
             messages:      Seed conversation (typically a single user message).
             system_prompt: Optional system instruction forwarded to the provider.
             tool_schemas:  Override the executor's tool schemas for this run.
+            session_id:    Session identifier used when persisting messages via
+                           *history_store*.  Ignored if *history_store* is
+                           ``None``.
 
         Returns:
             The final :class:`~kiassist_utils.ai.base.AIResponse` from the
@@ -132,8 +159,20 @@ class ToolExecutor:
 
         conversation: List[AIMessage] = list(messages)
 
+        # Persist the seed messages (e.g. the initial user turn)
+        if self.history_store is not None and session_id is not None:
+            for msg in conversation:
+                self.history_store.append(session_id, msg)
+
         for iteration in range(self.max_iterations):
             logger.debug("ToolExecutor iteration %d/%d", iteration + 1, self.max_iterations)
+
+            # Apply context-window management before calling the AI:
+            # summarise old messages if we are approaching the token limit.
+            if self.context_manager is not None:
+                conversation = self.context_manager.maybe_summarize(
+                    conversation, self.provider, system_prompt
+                )
 
             # Run the synchronous provider.chat() in a thread pool so it
             # does not block the event loop during network I/O.
@@ -144,27 +183,33 @@ class ToolExecutor:
                 system_prompt=system_prompt,
             )
 
+            # Track token usage reported by the provider.
+            if self.context_manager is not None and response.usage:
+                self.context_manager.track_usage(response.usage)
+
             # If no tool calls → we have the final answer
             if not response.tool_calls:
                 logger.debug("No tool calls; returning final response.")
                 return response
 
             # Append assistant message (with tool calls) to conversation
-            conversation.append(
-                AIMessage(
-                    role="assistant",
-                    content=response.content,
-                    tool_calls=response.tool_calls,
-                )
+            assistant_msg = AIMessage(
+                role="assistant",
+                content=response.content,
+                tool_calls=response.tool_calls,
             )
+            conversation.append(assistant_msg)
+            if self.history_store is not None and session_id is not None:
+                self.history_store.append(session_id, assistant_msg)
 
             # Execute tool calls (parallel where possible)
             tool_results = await self._execute_tool_calls(response.tool_calls)
 
             # Append tool results as a single "tool" message
-            conversation.append(
-                AIMessage(role="tool", tool_results=tool_results)
-            )
+            tool_msg = AIMessage(role="tool", tool_results=tool_results)
+            conversation.append(tool_msg)
+            if self.history_store is not None and session_id is not None:
+                self.history_store.append(session_id, tool_msg)
 
         raise RuntimeError(
             f"ToolExecutor exceeded max_iterations={self.max_iterations} "
@@ -249,6 +294,10 @@ class ToolExecutor:
             logger.warning(
                 "Tool %r failed: %s", tool_call.name, exc, exc_info=True
             )
+
+        # Trim over-long tool results to stay within the context budget.
+        if self.context_manager is not None:
+            content = self.context_manager.trim_tool_result(content)
 
         tool_result = AIToolResult(
             tool_call_id=tool_call.id,

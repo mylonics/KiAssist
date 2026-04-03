@@ -839,6 +839,61 @@ class TestSystemPromptBuilder:
         )
         assert "---" in prompt
 
+    # ------------------------------------------------------------------
+    # FileStateCache integration
+    # ------------------------------------------------------------------
+
+    def test_file_cache_skips_already_seen_schematic(self, tmp_path: Path):
+        """Schematics already in the AI's context should be noted as such."""
+        sch = tmp_path / "board.kicad_sch"
+        sch.write_text("(kicad_sch)")  # minimal non-parseable placeholder
+
+        cache = FileStateCache()
+        cache.mark_seen(sch)
+
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        builder = SystemPromptBuilder(
+            base_prompt_path=bp,
+            cache_project_context=False,
+            file_cache=cache,
+        )
+        prompt = builder.build(project_path=tmp_path)
+        assert "already in context" in prompt
+
+    def test_file_cache_includes_unseen_schematic(self, tmp_path: Path):
+        """A schematic not yet seen by the AI should be fully included."""
+        sch = tmp_path / "board.kicad_sch"
+        sch.write_text("(kicad_sch)")
+
+        cache = FileStateCache()
+        # Don't mark it seen → is_fresh returns False
+
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        builder = SystemPromptBuilder(
+            base_prompt_path=bp,
+            cache_project_context=False,
+            file_cache=cache,
+        )
+        prompt = builder.build(project_path=tmp_path)
+        # Should attempt to parse (parse error for placeholder content), not skip
+        assert "already in context" not in prompt
+
+    def test_no_file_cache_behaves_as_before(self, tmp_path: Path):
+        """Without a file_cache, all schematics are always processed."""
+        sch = tmp_path / "board.kicad_sch"
+        sch.write_text("(kicad_sch)")
+
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        builder = SystemPromptBuilder(
+            base_prompt_path=bp,
+            cache_project_context=False,
+        )
+        prompt = builder.build(project_path=tmp_path)
+        assert "already in context" not in prompt
+
 
 # ===========================================================================
 # Package-level imports
@@ -859,3 +914,127 @@ class TestContextPackageImports:
         assert FileStateCache is not None
         assert ProjectMemory is not None
         assert SystemPromptBuilder is not None
+
+
+# ===========================================================================
+# ToolExecutor integration with context management
+# ===========================================================================
+
+
+class TestToolExecutorContextIntegration:
+    """Tests for ContextWindowManager + ConversationStore wired into ToolExecutor."""
+
+    def _make_executor_with_context(
+        self,
+        provider,
+        tmp_path: Path,
+        result_max_chars: int = 4_000,
+    ):
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.tokens import ContextWindowManager
+        from kiassist_utils.context.history import ConversationStore
+
+        mgr = ContextWindowManager.from_provider(
+            provider, result_max_chars=result_max_chars
+        )
+        store = ConversationStore(tmp_path)
+        return ToolExecutor(
+            provider=provider,
+            context_manager=mgr,
+            history_store=store,
+        ), mgr, store
+
+    def test_tool_result_trimmed_by_context_manager(self):
+        """Tool results longer than result_max_chars must be truncated."""
+        import asyncio
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.tokens import ContextWindowManager
+        from unittest.mock import patch, AsyncMock
+
+        provider = _StubProvider(reply="done")
+        mgr = ContextWindowManager.from_provider(provider, result_max_chars=10)
+
+        # Executor only returns after tool calls stop; make the provider
+        # return no tool calls immediately (no agentic loop needed here)
+        executor = ToolExecutor(provider=provider, context_manager=mgr)
+
+        # Directly exercise _execute_one with a mock in_process_call
+        long_result = "X" * 200
+        mock_ipc = AsyncMock(return_value=long_result)
+        from kiassist_utils.ai.base import AIToolCall
+        tc = AIToolCall(id="c1", name="test_tool", arguments={})
+
+        with patch("kiassist_utils.ai.tool_executor.in_process_call", mock_ipc):
+            result = asyncio.run(executor._execute_one(tc))
+
+        assert len(result.content) < 200
+        assert "truncated" in result.content
+
+    def test_token_usage_tracked_during_run(self, tmp_path: Path):
+        """After a successful run, total_tokens should reflect the response usage."""
+        import asyncio
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.tokens import ContextWindowManager
+        from unittest.mock import patch, AsyncMock
+
+        class _UsageProvider(_StubProvider):
+            def chat(self, messages, tools=None, system_prompt=None):
+                return AIResponse(content="final", usage={"total_tokens": 50})
+
+        provider = _UsageProvider()
+        mgr = ContextWindowManager.from_provider(provider)
+        executor = ToolExecutor(
+            provider=provider,
+            context_manager=mgr,
+            tool_schemas=[],  # no tool calls
+        )
+
+        asyncio.run(
+            executor.run(
+                [AIMessage(role="user", content="hello")],
+                system_prompt="sys",
+            )
+        )
+
+        assert mgr.total_tokens == 50
+
+    def test_messages_persisted_to_history(self, tmp_path: Path):
+        """All conversation turns should be persisted to the ConversationStore."""
+        import asyncio
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+        from kiassist_utils.context.history import ConversationStore
+
+        provider = _StubProvider(reply="Hello!")
+        store = ConversationStore(tmp_path)
+        session_id = store.new_session()
+
+        executor = ToolExecutor(
+            provider=provider,
+            tool_schemas=[],
+            history_store=store,
+        )
+
+        asyncio.run(
+            executor.run(
+                [AIMessage(role="user", content="hi")],
+                session_id=session_id,
+            )
+        )
+
+        # The user seed message should have been persisted
+        messages = store.load_session(session_id)
+        assert len(messages) >= 1
+        assert messages[0].role == "user"
+        assert messages[0].content == "hi"
+
+    def test_no_context_manager_no_error(self, tmp_path: Path):
+        """Executor without context_manager should still work normally."""
+        import asyncio
+        from kiassist_utils.ai.tool_executor import ToolExecutor
+
+        provider = _StubProvider(reply="ok")
+        executor = ToolExecutor(provider=provider, tool_schemas=[])
+        response = asyncio.run(
+            executor.run([AIMessage(role="user", content="hello")])
+        )
+        assert response.content == "ok"

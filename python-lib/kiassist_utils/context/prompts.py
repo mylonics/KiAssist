@@ -34,9 +34,12 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .memory import ProjectMemory
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .file_cache import FileStateCache
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +65,8 @@ def _find_default_base_prompt() -> Optional[Path]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# SystemPromptBuilder
-# ---------------------------------------------------------------------------
+# Message used when a schematic is skipped because the AI already has current content.
+_ALREADY_IN_CONTEXT_MSG = "already in context (unchanged)"
 
 
 class SystemPromptBuilder:
@@ -81,12 +83,18 @@ class SystemPromptBuilder:
                                :meth:`build` and reused on subsequent calls
                                with the same *project_path*.  Call
                                :meth:`clear_cache` to force a refresh.
+        file_cache:       Optional :class:`~kiassist_utils.context.file_cache.FileStateCache`.
+                          When provided, schematic files that the AI has
+                          already seen (via MCP tools) and whose content has
+                          not changed are noted as "already in context" rather
+                          than having their full component list re-injected.
     """
 
     def __init__(
         self,
         base_prompt_path: Optional[str | Path] = None,
         cache_project_context: bool = True,
+        file_cache: Optional["FileStateCache"] = None,
     ) -> None:
         # Resolve base prompt path
         if base_prompt_path is not None:
@@ -99,6 +107,7 @@ class SystemPromptBuilder:
                 self._base_prompt_path = _find_default_base_prompt()
 
         self._cache_project_context = cache_project_context
+        self._file_cache = file_cache
         # Maps project_dir → cached project-context string
         self._project_cache: Dict[str, str] = {}
 
@@ -187,12 +196,17 @@ class SystemPromptBuilder:
         project_dir = p.parent if p.is_file() else p
         return str(project_dir.resolve())
 
-    @staticmethod
-    def _build_project_context(project_path: str | Path) -> str:
+    def _build_project_context(self, project_path: str | Path) -> str:
         """Build the project-context layer from disk.
 
         Reads schematic files for a component summary, discovers library
         paths, lists design-rule files, and includes KIASSIST.md if present.
+
+        When a :class:`~kiassist_utils.context.file_cache.FileStateCache` is
+        attached, schematic files the AI has already read via MCP tools (and
+        whose content is unchanged) are noted as "already in context" rather
+        than having their full component list re-injected.
+
         Errors are silently swallowed so that context injection never breaks
         the chat flow.
         """
@@ -209,6 +223,11 @@ class SystemPromptBuilder:
             lines.append(f"\n**Schematics ({len(schematics)}):**")
             bom_rows: List[str] = []
             for sch_path in schematics:
+                # If the file cache reports the AI already has this file
+                # and it hasn't changed, skip the full component list.
+                if self._file_cache is not None and self._file_cache.is_fresh(sch_path):
+                    lines.append(f"- `{sch_path.name}` — {_ALREADY_IN_CONTEXT_MSG}")
+                    continue
                 try:
                     from ..kicad_parser.schematic import Schematic  # lazy import
 
