@@ -567,14 +567,9 @@ class TestKiCadSaveSchematicIpcPath:
 
     def test_uses_ipc_when_available(self, tmp_sch: Path):
         """When ipc_save_document returns success, the tool returns method=ipc."""
-        import kiassist_utils.mcp_server as ms
-
         ipc_ok = {"success": True, "socket": "/tmp/kicad/api.sock", "method": "ipc"}
-        with mock.patch("kiassist_utils.mcp_server.kicad_ipc.ipc_save_document" if False else
-                        "kiassist_utils.kicad_ipc.ipc_save_document", ipc_ok):
-            # Patch the import path used inside the function body
-            with mock.patch("kiassist_utils.kicad_ipc.ipc_save_document", return_value=ipc_ok):
-                result = _call("kicad_save_schematic", file_path=str(tmp_sch))
+        with mock.patch("kiassist_utils.kicad_ipc.ipc_save_document", return_value=ipc_ok):
+            result = _call("kicad_save_schematic", file_path=str(tmp_sch))
 
         assert result["status"] == "ok"
         assert result["data"]["method"] == "ipc"
