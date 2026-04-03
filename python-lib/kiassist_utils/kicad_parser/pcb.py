@@ -45,8 +45,14 @@ def _parse_position(tree: List[SExpr]) -> Position:
     return Position(x, y, angle)
 
 
+# Default text offsets for Reference/Value properties on newly created footprints.
+# These match KiCad's built-in default text placements (in mm).
+_FP_REF_Y_OFFSET = -1.43
+_FP_VAL_Y_OFFSET = 1.43
+
+
 # ---------------------------------------------------------------------------
-# Lightweight read-only view types
+# Model types
 # ---------------------------------------------------------------------------
 
 
@@ -98,9 +104,9 @@ class PCBFootprint:
             tree.append(["uuid", QStr(self.uuid.value)])
         tree.append(["at", self.position.x, self.position.y, self.position.angle])
         tree.append(["property", QStr("Reference"), QStr(self.reference),
-                     ["at", 0.0, -1.43, 0.0], ["layer", QStr("F.SilkS")]])
+                     ["at", 0.0, _FP_REF_Y_OFFSET, 0.0], ["layer", QStr("F.SilkS")]])
         tree.append(["property", QStr("Value"), QStr(self.value),
-                     ["at", 0.0, 1.43, 0.0], ["layer", QStr("F.Fab")]])
+                     ["at", 0.0, _FP_VAL_Y_OFFSET, 0.0], ["layer", QStr("F.Fab")]])
         return tree
 
 

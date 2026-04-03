@@ -263,12 +263,10 @@ class LibraryDiscovery:
             Absolute :class:`Path` to the ``.kicad_sym`` file, or ``None`` if
             not found or the file does not exist.
         """
-        env = {}
-        if self._project_dir:
-            env["KIPRJMOD"] = str(self._project_dir)
+        env = {"KIPRJMOD": str(self._project_dir)} if self._project_dir else None
         for entry in self.list_symbol_libraries():
             if entry.nickname == nickname:
-                return entry.resolved_path(env=env if env else None)
+                return entry.resolved_path(env=env)
         return None
 
     def resolve_footprint_library(self, nickname: str) -> Optional[Path]:
@@ -281,12 +279,10 @@ class LibraryDiscovery:
             Absolute :class:`Path` to the ``.pretty`` directory, or ``None``
             if not found or the directory does not exist.
         """
-        env = {}
-        if self._project_dir:
-            env["KIPRJMOD"] = str(self._project_dir)
+        env = {"KIPRJMOD": str(self._project_dir)} if self._project_dir else None
         for entry in self.list_footprint_libraries():
             if entry.nickname == nickname:
-                return entry.resolved_path(env=env if env else None)
+                return entry.resolved_path(env=env)
         return None
 
     def invalidate_cache(self) -> None:
