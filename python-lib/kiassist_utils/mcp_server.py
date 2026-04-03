@@ -38,10 +38,8 @@ from .kicad_parser.pcb import PCBBoard
 from .kicad_parser.schematic import (
     GlobalLabel,
     Schematic,
-    _find,
-    _find_all,
-    _parse_position,
 )
+from .kicad_parser._helpers import _find, _find_all, _parse_position
 from .kicad_parser.symbol_lib import Pin, SymbolDef, SymbolLibrary, SymbolUnit
 from .context.memory import ProjectMemory
 

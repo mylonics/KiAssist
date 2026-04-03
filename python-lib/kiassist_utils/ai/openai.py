@@ -41,7 +41,11 @@ from .base import (
 try:
     import openai as _openai
     _OPENAI_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except ImportError:
+    import types as _types
+    _openai = _types.ModuleType("openai")
+    _openai.OpenAI = None  # type: ignore[attr-defined]
+    _openai.AsyncOpenAI = None  # type: ignore[attr-defined]
     _OPENAI_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -223,7 +227,7 @@ class OpenAIProvider(AIProvider):
         model: str = _DEFAULT_MODEL,
         base_url: Optional[str] = None,
     ) -> None:
-        if not _OPENAI_AVAILABLE:
+        if not _OPENAI_AVAILABLE and _openai.OpenAI is None:
             raise ImportError(
                 "The 'openai' package is required for OpenAIProvider. "
                 "Install it with: pip install openai>=1.30.0"

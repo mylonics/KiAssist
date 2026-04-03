@@ -430,7 +430,8 @@ class TestClaudeProvider:
 
 class TestOpenAIProvider:
     def _make_provider(self):
-        with patch("kiassist_utils.ai.openai._openai.OpenAI"):
+        with patch("kiassist_utils.ai.openai._openai.OpenAI"), \
+             patch("kiassist_utils.ai.openai._openai.AsyncOpenAI"):
             return OpenAIProvider(api_key="fake_key", model="gpt-4o")
 
     def test_model_name_resolved(self):
@@ -438,7 +439,8 @@ class TestOpenAIProvider:
         assert p._model_name == "gpt-4o"
 
     def test_unknown_model_passthrough(self):
-        with patch("kiassist_utils.ai.openai._openai.OpenAI"):
+        with patch("kiassist_utils.ai.openai._openai.OpenAI"), \
+             patch("kiassist_utils.ai.openai._openai.AsyncOpenAI"):
             p = OpenAIProvider(api_key="fake", model="my-custom-model")
         assert p._model_name == "my-custom-model"
 
@@ -451,7 +453,8 @@ class TestOpenAIProvider:
         assert p.supports_tool_calling() is True
 
     def test_supports_tool_calling_o1(self):
-        with patch("kiassist_utils.ai.openai._openai.OpenAI"):
+        with patch("kiassist_utils.ai.openai._openai.OpenAI"), \
+             patch("kiassist_utils.ai.openai._openai.AsyncOpenAI"):
             p = OpenAIProvider(api_key="fake", model="o1")
         assert p.supports_tool_calling() is False
 

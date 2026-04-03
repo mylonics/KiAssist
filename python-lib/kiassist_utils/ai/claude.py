@@ -47,7 +47,11 @@ try:
         ToolUseBlockParam,
     )
     _ANTHROPIC_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except ImportError:
+    import types as _types
+    _anthropic = _types.ModuleType("anthropic")
+    _anthropic.Anthropic = None  # type: ignore[attr-defined]
+    _anthropic.AsyncAnthropic = None  # type: ignore[attr-defined]
     _ANTHROPIC_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
@@ -210,7 +214,7 @@ class ClaudeProvider(AIProvider):
         enable_thinking: bool = False,
         thinking_budget: int = 5_000,
     ) -> None:
-        if not _ANTHROPIC_AVAILABLE:
+        if not _ANTHROPIC_AVAILABLE and _anthropic.Anthropic is None:
             raise ImportError(
                 "The 'anthropic' package is required for ClaudeProvider. "
                 "Install it with: pip install anthropic>=0.30.0"

@@ -17,32 +17,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .models import Position, KiUUID
 from .sexpr import QStr, SExpr, parse, serialize
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _find(tree: List[SExpr], tag: str) -> Optional[List[SExpr]]:
-    for item in tree:
-        if isinstance(item, list) and item and item[0] == tag:
-            return item
-    return None
-
-
-def _find_all(tree: List[SExpr], tag: str) -> List[List[SExpr]]:
-    return [item for item in tree if isinstance(item, list) and item and item[0] == tag]
-
-
-def _parse_position(tree: List[SExpr]) -> Position:
-    x = float(tree[1]) if len(tree) > 1 else 0.0
-    y = float(tree[2]) if len(tree) > 2 else 0.0
-    angle = float(tree[3]) if len(tree) > 3 else 0.0
-    return Position(x, y, angle)
+from ._helpers import _find, _find_all, _parse_position
 
 
 # Default text offsets for Reference/Value properties on newly created footprints.

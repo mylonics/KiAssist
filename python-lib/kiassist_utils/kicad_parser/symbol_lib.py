@@ -21,48 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from .models import Effects, Position, Property, KiUUID
 from .sexpr import QStr, SExpr, parse, serialize
-
-# ---------------------------------------------------------------------------
-# Helpers (shared with schematic module)
-# ---------------------------------------------------------------------------
-
-
-def _find(tree: List[SExpr], tag: str) -> Optional[List[SExpr]]:
-    for item in tree:
-        if isinstance(item, list) and item and item[0] == tag:
-            return item
-    return None
-
-
-def _find_all(tree: List[SExpr], tag: str) -> List[List[SExpr]]:
-    return [item for item in tree if isinstance(item, list) and item and item[0] == tag]
-
-
-def _parse_position(tree: List[SExpr]) -> Position:
-    x = float(tree[1]) if len(tree) > 1 else 0.0
-    y = float(tree[2]) if len(tree) > 2 else 0.0
-    angle = float(tree[3]) if len(tree) > 3 else 0.0
-    return Position(x, y, angle)
-
-
-def _parse_effects(tree: List[SExpr]) -> Effects:
-    eff = Effects()
-    font = _find(tree, "font")
-    if font:
-        size = _find(font, "size")
-        if size and len(size) >= 3:
-            eff.font_size = (float(size[1]), float(size[2]))
-        eff.bold = "bold" in font
-        eff.italic = "italic" in font
-    justify = _find(tree, "justify")
-    if justify and len(justify) > 1:
-        eff.justify = " ".join(str(x) for x in justify[1:])
-    hide_node = _find(tree, "hide")
-    if hide_node is not None:
-        eff.hide = len(hide_node) < 2 or str(hide_node[1]).lower() == "yes"
-    else:
-        eff.hide = "hide" in tree
-    return eff
+from ._helpers import _find, _find_all, _parse_position, _parse_effects
 
 
 # ---------------------------------------------------------------------------
