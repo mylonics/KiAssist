@@ -1,7 +1,7 @@
 """API key storage and management using OS keyring with file fallback.
 
-Supports multiple AI providers (Gemini, Claude, OpenAI).  All public methods
-accept an optional *provider* parameter.  When omitted the default is
+Supports multiple AI providers (Gemini, Claude, OpenAI, Local).  All public
+methods accept an optional *provider* parameter.  When omitted the default is
 ``"gemini"`` for backward compatibility.
 
 Supported provider names and their environment variable mappings:
@@ -12,6 +12,7 @@ Provider   Keyring key name       Environment variable
 gemini     kiassist-gemini        GEMINI_API_KEY
 claude     kiassist-claude        ANTHROPIC_API_KEY
 openai     kiassist-openai        OPENAI_API_KEY
+local      (file only)            LOCAL_BASE_URL
 =========  =====================  ====================
 """
 
@@ -30,6 +31,8 @@ _PROVIDER_META: Dict[str, Tuple[str, str, str]] = {
     "gemini": ("kiassist-gemini", "GEMINI_API_KEY", "api_key"),
     "claude": ("kiassist-claude", "ANTHROPIC_API_KEY", "claude_api_key"),
     "openai": ("kiassist-openai", "OPENAI_API_KEY", "openai_api_key"),
+    # "local" stores the server base URL, not an API key; keyring not used.
+    "local": ("kiassist-local", "LOCAL_BASE_URL", "local_base_url"),
 }
 
 _DEFAULT_PROVIDER = "gemini"

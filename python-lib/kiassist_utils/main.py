@@ -73,6 +73,24 @@ _PROVIDER_REGISTRY: List[Dict[str, Any]] = [
         "key_prefix": "sk-",
         "key_min_length": 20,
     },
+    {
+        "id": "local",
+        "name": "Local Model",
+        "models": [
+            {"id": "llama3.2", "name": "Llama 3.2"},
+            {"id": "llama3.1", "name": "Llama 3.1"},
+            {"id": "mistral", "name": "Mistral"},
+            {"id": "codellama", "name": "Code Llama"},
+            {"id": "deepseek-r1", "name": "DeepSeek R1"},
+            {"id": "qwen2.5-coder", "name": "Qwen 2.5 Coder"},
+            {"id": "phi4", "name": "Phi-4"},
+        ],
+        "default_model": "llama3.2",
+        # Local models require no remote key URL – the server runs locally.
+        "key_url": "",
+        "key_prefix": "",
+        "key_min_length": 0,
+    },
 ]
 
 
@@ -85,6 +103,10 @@ class KiAssistAPI:
         self.current_provider: Optional[AIProvider] = None
         self.current_provider_name: str = "gemini"
         self.current_model: str = "3-flash"
+        # Secondary (lightweight/cheap) model used for simple tasks
+        self.secondary_provider: Optional[AIProvider] = None
+        self.secondary_provider_name: str = "gemini"
+        self.secondary_model: str = "3.1-flash-lite"
         self.recent_projects_store = RecentProjectsStore()
         self.current_session_id: Optional[str] = None
         self._current_project_path: Optional[str] = None
@@ -121,18 +143,28 @@ class KiAssistAPI:
         """Return available AI providers, their models, and configuration status.
 
         Returns:
-            Dictionary with providers list, current provider and model.
+            Dictionary with providers list, current provider and model, and
+            secondary provider/model selection.
         """
         providers = []
         for info in _PROVIDER_REGISTRY:
             entry = dict(info)
-            entry["has_key"] = self.api_key_store.has_api_key(info["id"])
+            if info["id"] == "local":
+                # For local models, "has_key" indicates the server is reachable
+                # (we optimistically report True so the UI doesn't show a ⚠).
+                # The base URL is returned so the frontend can display/edit it.
+                entry["has_key"] = True
+                entry["base_url"] = self._get_local_base_url()
+            else:
+                entry["has_key"] = self.api_key_store.has_api_key(info["id"])
             providers.append(entry)
         return {
             "success": True,
             "providers": providers,
             "current_provider": self.current_provider_name,
             "current_model": self.current_model,
+            "secondary_provider": self.secondary_provider_name,
+            "secondary_model": self.secondary_model,
         }
 
     def set_provider(self, provider: str, model: str) -> dict:
@@ -169,8 +201,14 @@ class KiAssistAPI:
     def _create_provider(self, provider_name: str, model: str) -> Optional[AIProvider]:
         """Instantiate and return an :class:`AIProvider` for *provider_name*.
 
-        Returns ``None`` when no API key is available for the provider.
+        Returns ``None`` when no API key is available for cloud providers.
+        Local providers always return an instance (they require no API key).
         """
+        if provider_name == "local":
+            from .ai.ollama import OllamaProvider
+            base_url = self._get_local_base_url()
+            return OllamaProvider(model=model, base_url=base_url)
+
         api_key = self.api_key_store.get_api_key(provider_name)
         if not api_key:
             return None
@@ -187,6 +225,19 @@ class KiAssistAPI:
             return OpenAIProvider(api_key, model)
 
         return None
+
+    def _get_local_base_url(self) -> str:
+        """Return the configured local model server base URL.
+
+        Checks (in order):
+        1. The value stored via :meth:`set_local_base_url`.
+        2. ``LOCAL_BASE_URL`` environment variable.
+        3. Falls back to the Ollama default ``http://localhost:11434/v1``.
+        """
+        stored = self.api_key_store.get_api_key("local")
+        if stored:
+            return stored
+        return "http://localhost:11434/v1"
 
     def _get_or_create_provider(
         self, model: Optional[str] = None
@@ -227,6 +278,144 @@ class KiAssistAPI:
         msgs = [AIMessage(role="user", content=prompt)]
         response = provider.chat(msgs)
         return response.content
+
+    # ------------------------------------------------------------------
+    # Secondary (lightweight) model management
+    # ------------------------------------------------------------------
+
+    def get_model_config(self) -> Dict[str, Any]:
+        """Return the current primary and secondary model configuration.
+
+        The *primary* model is used for complex/high-quality tasks; the
+        *secondary* model is used for simpler/cheaper tasks.
+
+        Returns:
+            Dictionary with ``primary`` and ``secondary`` model info.
+        """
+        return {
+            "success": True,
+            "primary": {
+                "provider": self.current_provider_name,
+                "model": self.current_model,
+            },
+            "secondary": {
+                "provider": self.secondary_provider_name,
+                "model": self.secondary_model,
+            },
+        }
+
+    def set_secondary_model(self, provider: str, model: str) -> dict:
+        """Set the secondary (lightweight/cheap) AI provider and model.
+
+        Args:
+            provider: Provider ID (``gemini``, ``claude``, ``openai``, or
+                      ``local``).
+            model:    Model shortcut string.
+
+        Returns:
+            Result dictionary with success status and optional warning.
+        """
+        valid_ids = {p["id"] for p in _PROVIDER_REGISTRY}
+        if provider not in valid_ids:
+            return {"success": False, "error": f"Unknown provider: {provider}"}
+
+        self.secondary_provider_name = provider
+        self.secondary_model = model
+        self.secondary_provider = None  # force re-creation on next use
+
+        try:
+            new_provider = self._create_provider(provider, model)
+            if new_provider:
+                self.secondary_provider = new_provider
+                return {"success": True}
+            else:
+                return {
+                    "success": True,
+                    "warning": (
+                        f"No API key configured for {provider}. "
+                        "Please add one via Settings."
+                    ),
+                }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Local model management
+    # ------------------------------------------------------------------
+
+    def set_local_base_url(self, base_url: str) -> dict:
+        """Set the base URL of the local OpenAI-compatible model server.
+
+        This URL is persisted to ``~/.kiassist/config.json`` so it survives
+        restarts.  Typical values:
+
+        * Ollama default – ``http://localhost:11434/v1``
+        * LM Studio default – ``http://localhost:1234/v1``
+
+        Args:
+            base_url: Full base URL including the ``/v1`` path suffix.
+
+        Returns:
+            Result dictionary with success status and optional warning.
+        """
+        if not base_url or not base_url.strip():
+            return {"success": False, "error": "Base URL cannot be empty."}
+        base_url = base_url.strip()
+        try:
+            success, warning = self.api_key_store.set_api_key(base_url, "local")
+            # Invalidate cached local provider so the new URL is used next time
+            if self.current_provider_name == "local":
+                self.current_provider = None
+            if self.secondary_provider_name == "local":
+                self.secondary_provider = None
+            result: Dict[str, Any] = {"success": success}
+            if warning:
+                result["warning"] = warning
+            return result
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def get_local_models(self) -> Dict[str, Any]:
+        """Detect models available on the local Ollama server.
+
+        Queries the ``/api/tags`` endpoint of the configured Ollama server.
+        Returns an error (not an exception) if the server is unreachable so
+        the caller can degrade gracefully.
+
+        Returns:
+            Dictionary with ``models`` list or ``error`` string.
+        """
+        import urllib.request
+        import urllib.error
+
+        base_url = self._get_local_base_url()
+        # Strip the OpenAI-compat /v1 suffix to get the Ollama root URL
+        root_url = base_url.rstrip("/")
+        if root_url.endswith("/v1"):
+            root_url = root_url[:-3]
+        tags_url = f"{root_url}/api/tags"
+
+        try:
+            with urllib.request.urlopen(tags_url, timeout=3) as resp:
+                import json as _json
+                data = _json.loads(resp.read().decode("utf-8"))
+            raw_models = data.get("models", [])
+            models = [
+                {"id": m.get("name", ""), "name": m.get("name", "")}
+                for m in raw_models
+                if m.get("name")
+            ]
+            return {"success": True, "models": models, "base_url": base_url}
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": (
+                    f"Could not reach local model server at {tags_url}: {exc}. "
+                    "Make sure Ollama (or your local server) is running."
+                ),
+                "models": [],
+                "base_url": base_url,
+            }
 
     # ------------------------------------------------------------------
     # API key management
