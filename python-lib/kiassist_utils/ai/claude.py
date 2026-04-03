@@ -214,6 +214,8 @@ class ClaudeProvider(AIProvider):
         enable_thinking: bool = False,
         thinking_budget: int = 5_000,
     ) -> None:
+        # Both conditions must be true: flag not set AND stub not patched.
+        # The `and` allows tests to bypass this guard by patching _anthropic.Anthropic.
         if not _ANTHROPIC_AVAILABLE and _anthropic.Anthropic is None:
             raise ImportError(
                 "The 'anthropic' package is required for ClaudeProvider. "

@@ -227,6 +227,8 @@ class OpenAIProvider(AIProvider):
         model: str = _DEFAULT_MODEL,
         base_url: Optional[str] = None,
     ) -> None:
+        # Both conditions must be true: flag not set AND stub not patched.
+        # The `and` allows tests to bypass this guard by patching _openai.OpenAI.
         if not _OPENAI_AVAILABLE and _openai.OpenAI is None:
             raise ImportError(
                 "The 'openai' package is required for OpenAIProvider. "
