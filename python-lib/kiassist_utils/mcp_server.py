@@ -18,22 +18,28 @@ In-process usage (no network overhead)::
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
-from .kicad_parser.footprint import Footprint, Pad
+from .kicad_parser.footprint import Footprint
 from .kicad_parser.library import LibraryDiscovery
-from .kicad_parser.models import Position
+from .kicad_parser.models import KiUUID, Position, Property
 from .kicad_parser.pcb import PCBBoard
-from .kicad_parser.schematic import Schematic
-from .kicad_parser.symbol_lib import Pin, SymbolDef, SymbolLibrary
+from .kicad_parser.schematic import (
+    GlobalLabel,
+    Schematic,
+    _find,
+    _find_all,
+    _parse_position,
+)
+from .kicad_parser.symbol_lib import Pin, SymbolDef, SymbolLibrary, SymbolUnit
 
 # ---------------------------------------------------------------------------
 # Server instance
@@ -65,6 +71,30 @@ def _err(message: str) -> Dict[str, Any]:
 def _pos_dict(pos: Position) -> Dict[str, float]:
     return {"x": pos.x, "y": pos.y, "angle": pos.angle}
 
+
+def _safe_save(obj: Any, path: str | os.PathLike) -> None:
+    """Save *obj* to *path* atomically, creating a ``.bak`` backup first.
+
+    The sequence is:
+    1. If *path* already exists, copy it to ``<path>.bak`` (backup).
+    2. Call ``obj.save(path)`` to write the new content.
+
+    This preserves the original file if the save raises an exception, and
+    leaves a ``.bak`` beside the file so the user can recover the previous
+    version manually.  If the save itself fails the original is untouched
+    because we only copy to ``.bak`` *before* writing.
+
+    Args:
+        obj:  Object with a ``save(path)`` method (Schematic, SymbolLibrary, …).
+        path: Destination file path.
+
+    Raises:
+        Any exception raised by ``obj.save(path)`` is re-raised unchanged.
+    """
+    dest = Path(path)
+    if dest.exists():
+        shutil.copy2(dest, str(dest) + ".bak")
+    obj.save(path)
 
 # ===========================================================================
 # 2.2  Schematic Tools
@@ -146,7 +176,8 @@ def schematic_get_symbol(path: str, reference: str) -> Dict[str, Any]:
 
     Returns:
         Dict with ``reference``, ``value``, ``footprint``, ``lib_id``,
-        ``position``, ``properties``, and ``pin_positions``.
+        ``position``, ``properties``, ``pin_positions``, and
+        ``connections`` (mapping pin number → net name).
     """
     try:
         sch = Schematic.load(path)
@@ -162,6 +193,19 @@ def schematic_get_symbol(path: str, reference: str) -> Dict[str, Any]:
     pin_positions = {
         pin: _pos_dict(pos) for pin, pos in sch.get_pin_positions(reference).items()
     }
+
+    # Build connections: map pin_number → net name using get_connected_nets
+    nets = sch.get_connected_nets()
+    # Invert to: "RefDes:PinNum" → net_name
+    pin_to_net: Dict[str, str] = {}
+    for net_name, pin_refs in nets.items():
+        for pin_ref in pin_refs:
+            pin_to_net[pin_ref] = net_name
+    connections = {
+        pin_num: pin_to_net.get(f"{reference}:{pin_num}", "")
+        for pin_num in pin_positions
+    }
+
     return _ok(
         {
             "reference": sym.reference,
@@ -171,6 +215,7 @@ def schematic_get_symbol(path: str, reference: str) -> Dict[str, Any]:
             "position": _pos_dict(sym.position),
             "properties": props,
             "pin_positions": pin_positions,
+            "connections": connections,
         }
     )
 
@@ -208,7 +253,7 @@ def schematic_add_symbol(
 
     sym = sch.add_symbol(lib_id, x, y, reference, value, footprint, angle)
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -235,7 +280,7 @@ def schematic_remove_symbol(path: str, reference: str) -> Dict[str, Any]:
     if not removed:
         return _err(f"Symbol '{reference}' not found")
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -278,14 +323,12 @@ def schematic_modify_symbol(
         if "Value" in prop_map:
             prop_map["Value"].value = value
         else:
-            from .kicad_parser.models import Property
             sym.properties.append(Property("Value", value, sym.position))
 
     if footprint is not None:
         if "Footprint" in prop_map:
             prop_map["Footprint"].value = footprint
         else:
-            from .kicad_parser.models import Property
             sym.properties.append(Property("Footprint", footprint, sym.position))
 
     if properties:
@@ -293,13 +336,12 @@ def schematic_modify_symbol(
             if k in prop_map:
                 prop_map[k].value = v
             else:
-                from .kicad_parser.models import Property
                 sym.properties.append(Property(k, v, sym.position))
 
     # Clear raw_tree so the symbol is re-serialised from dataclass fields.
     sym.raw_tree = None  # type: ignore[assignment]
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -333,7 +375,7 @@ def schematic_add_wire(
 
     sch.add_wire(x1, y1, x2, y2)
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -391,7 +433,7 @@ def schematic_connect_pins(
         segments = 2
 
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -425,9 +467,6 @@ def schematic_add_label(
         return _err(str(exc))
 
     if global_label:
-        from .kicad_parser.schematic import GlobalLabel
-        from .kicad_parser.models import KiUUID
-
         gl = GlobalLabel()
         gl.text = text
         gl.position = Position(x, y, angle)
@@ -439,7 +478,7 @@ def schematic_add_label(
         label_type = "label"
 
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -498,8 +537,6 @@ def schematic_find_pins(
             ):
                 continue
             if lib_sym.raw_tree:
-                from .kicad_parser.schematic import _find_all, _find, _parse_position
-
                 for unit in _find_all(lib_sym.raw_tree, "symbol"):
                     for pin_tree in _find_all(unit, "pin"):
                         name_node = _find(pin_tree, "name")
@@ -512,8 +549,6 @@ def schematic_find_pins(
                         pin_pos = None
                         if at_node:
                             raw_pos = _parse_position(at_node)
-                            import math
-
                             angle_rad = math.radians(sym.position.angle)
                             rx = raw_pos.x * math.cos(angle_rad) - raw_pos.y * math.sin(angle_rad)
                             ry = raw_pos.x * math.sin(angle_rad) + raw_pos.y * math.cos(angle_rad)
@@ -559,9 +594,6 @@ def schematic_get_power_pins(path: str, reference: str) -> Dict[str, Any]:
         ):
             continue
         if lib_sym.raw_tree:
-            from .kicad_parser.schematic import _find_all, _find, _parse_position
-            import math
-
             for unit in _find_all(lib_sym.raw_tree, "symbol"):
                 for pin_tree in _find_all(unit, "pin"):
                     # Power pins have type "power_in" or "power_out"
@@ -611,7 +643,7 @@ def schematic_add_junction(path: str, x: float, y: float) -> Dict[str, Any]:
 
     sch.add_junction(x, y)
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -637,7 +669,7 @@ def schematic_add_no_connect(path: str, x: float, y: float) -> Dict[str, Any]:
 
     sch.add_no_connect(x, y)
     try:
-        sch.save(path)
+        _safe_save(sch, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save schematic: {exc}")
 
@@ -786,7 +818,6 @@ def symbol_lib_create_symbol(
     sym = SymbolDef(name=name)
 
     if properties:
-        from .kicad_parser.models import Property
         for k, v in properties.items():
             sym.properties.append(Property(k, v, Position(0.0, 0.0)))
 
@@ -804,14 +835,13 @@ def symbol_lib_create_symbol(
                 name=p_dict.get("name", "~"),
                 number=str(p_dict.get("number", "1")),
             )
-            from .kicad_parser.symbol_lib import SymbolUnit
             if not sym.units:
                 sym.units.append(SymbolUnit())
             sym.units[0].pins.append(pin)
 
     lib.add_symbol(sym)
     try:
-        lib.save(path)
+        _safe_save(lib, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save library: {exc}")
 
@@ -847,7 +877,7 @@ def symbol_lib_modify_symbol(
         return _err(f"Symbol '{name}' not found")
 
     try:
-        lib.save(path)
+        _safe_save(lib, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save library: {exc}")
 
@@ -875,7 +905,7 @@ def symbol_lib_delete_symbol(path: str, name: str) -> Dict[str, Any]:
         return _err(f"Symbol '{name}' not found")
 
     try:
-        lib.save(path)
+        _safe_save(lib, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save library: {exc}")
 
@@ -927,7 +957,6 @@ def symbol_lib_add_pin(
         name=pin_name,
         number=pin_number,
     )
-    from .kicad_parser.symbol_lib import SymbolUnit
     if not sym.units:
         sym.units.append(SymbolUnit())
     sym.units[0].pins.append(new_pin)
@@ -935,7 +964,7 @@ def symbol_lib_add_pin(
     sym.raw_tree = None  # type: ignore[assignment]
 
     try:
-        lib.save(path)
+        _safe_save(lib, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save library: {exc}")
 
@@ -967,7 +996,7 @@ def symbol_lib_bulk_update(
         count += 1
 
     try:
-        lib.save(path)
+        _safe_save(lib, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save library: {exc}")
 
@@ -1114,7 +1143,7 @@ def footprint_create(
             )
 
     try:
-        fp.save(path)
+        _safe_save(fp, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save footprint: {exc}")
 
@@ -1150,7 +1179,7 @@ def footprint_modify(
     # Clear raw_tree to force re-serialisation
     fp.raw_tree = None  # type: ignore[assignment]
     try:
-        fp.save(path)
+        _safe_save(fp, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save footprint: {exc}")
 
@@ -1210,7 +1239,7 @@ def footprint_add_pad(
         drill=drill,
     )
     try:
-        fp.save(path)
+        _safe_save(fp, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save footprint: {exc}")
 
@@ -1238,7 +1267,7 @@ def footprint_remove_pad(path: str, number: str) -> Dict[str, Any]:
         return _err(f"Pad '{number}' not found")
 
     try:
-        fp.save(path)
+        _safe_save(fp, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save footprint: {exc}")
 
@@ -1263,7 +1292,7 @@ def footprint_renumber_pads(path: str, start: int = 1) -> Dict[str, Any]:
 
     fp.renumber_pads(start)
     try:
-        fp.save(path)
+        _safe_save(fp, path)
     except Exception as exc:  # noqa: BLE001
         return _err(f"Failed to save footprint: {exc}")
 
@@ -1485,15 +1514,15 @@ def kicad_get_board_info(path: str) -> Dict[str, Any]:
 
 @mcp.tool()
 def project_get_context(project_path: str) -> Dict[str, Any]:
-    """Get a project summary: schematics, libraries, BOM sketch.
+    """Get a project summary: schematics, libraries, BOM, and design rules.
 
     Args:
         project_path: Path to the ``.kicad_pro`` project file or project
                       directory.
 
     Returns:
-        Dict with lists of schematic symbols, library paths, and whether a
-        KIASSIST.md memory file exists.
+        Dict with lists of schematic symbols, symbol/footprint library paths,
+        design-rule files, and whether a KIASSIST.md memory file exists.
     """
     path_obj = Path(project_path)
     if path_obj.is_file():
@@ -1521,6 +1550,32 @@ def project_get_context(project_path: str) -> Dict[str, Any]:
         except Exception:  # noqa: BLE001
             pass
 
+    # Collect design-rule files (.kicad_dru) in the project directory
+    design_rule_files = [str(p) for p in project_dir.rglob("*.kicad_dru")]
+    design_rules: List[Dict[str, str]] = []
+    for dru_path in design_rule_files:
+        try:
+            content = Path(dru_path).read_text(encoding="utf-8")
+            design_rules.append({"path": dru_path, "content": content})
+        except Exception:  # noqa: BLE001
+            design_rules.append({"path": dru_path, "content": ""})
+
+    # Discover project-local symbol and footprint libraries
+    sym_libs: List[Dict[str, str]] = []
+    fp_libs: List[Dict[str, str]] = []
+    try:
+        disc = LibraryDiscovery(project_dir)
+        sym_libs = [
+            {"nickname": e.nickname, "path": str(e.uri)}
+            for e in disc.list_symbol_libraries()
+        ]
+        fp_libs = [
+            {"nickname": e.nickname, "path": str(e.uri)}
+            for e in disc.list_footprint_libraries()
+        ]
+    except Exception:  # noqa: BLE001
+        pass
+
     memory_path = project_dir / "KIASSIST.md"
 
     return _ok(
@@ -1528,6 +1583,10 @@ def project_get_context(project_path: str) -> Dict[str, Any]:
             "project_dir": str(project_dir),
             "schematic_count": len(schematics),
             "bom_entries": bom,
+            "symbol_libraries": sym_libs,
+            "footprint_libraries": fp_libs,
+            "design_rule_files": design_rule_files,
+            "design_rules": design_rules,
             "has_memory_file": memory_path.exists(),
             "memory_file_path": str(memory_path),
         }

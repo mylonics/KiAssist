@@ -64,6 +64,44 @@ class TestInProcessCall:
             asyncio.run(in_process_call("this_tool_does_not_exist", {}))
 
 
+class TestSafeSave:
+    """Verify that mutation tools create a .bak backup before writing."""
+
+    def test_backup_created_on_schematic_mutation(self, tmp_sch: Path):
+        bak = Path(str(tmp_sch) + ".bak")
+        assert not bak.exists()
+        _call("schematic_add_wire", path=str(tmp_sch), x1=0.0, y1=0.0, x2=5.0, y2=0.0)
+        assert bak.exists(), ".bak file should be created by _safe_save"
+
+    def test_backup_created_on_footprint_mutation(self, tmp_fp: Path):
+        bak = Path(str(tmp_fp) + ".bak")
+        assert not bak.exists()
+        _call(
+            "footprint_add_pad",
+            path=str(tmp_fp),
+            number="88",
+            pad_type="smd",
+            shape="rect",
+            x=3.0,
+            y=3.0,
+            width=1.0,
+            height=1.0,
+        )
+        assert bak.exists(), ".bak file should be created by _safe_save"
+
+    def test_backup_created_on_sym_lib_mutation(self, tmp_sym: Path):
+        bak = Path(str(tmp_sym) + ".bak")
+        assert not bak.exists()
+        lib_result = _call("symbol_lib_open", path=str(tmp_sym))
+        name = lib_result["data"]["symbols"][0]
+        _call(
+            "symbol_lib_modify_symbol",
+            path=str(tmp_sym),
+            name=name,
+            properties={"Description": "backup test"},
+        )
+        assert bak.exists(), ".bak file should be created by _safe_save"
+
 # ===========================================================================
 # Schematic tools
 # ===========================================================================
@@ -106,6 +144,9 @@ class TestSchematicGetSymbol:
         assert result["status"] == "ok"
         assert result["data"]["reference"] == ref
         assert "properties" in result["data"]
+        assert "connections" in result["data"]
+        assert isinstance(result["data"]["connections"], dict)
+        assert "pin_positions" in result["data"]
 
     def test_not_found(self):
         result = _call(
@@ -567,6 +608,20 @@ class TestProjectGetContext:
         assert data["schematic_count"] >= 1
         assert "bom_entries" in data
         assert "has_memory_file" in data
+        # Phase 2 plan requires design rules and library lists
+        assert "design_rule_files" in data
+        assert "design_rules" in data
+        assert "symbol_libraries" in data
+        assert "footprint_libraries" in data
+
+    def test_design_rules_parsed(self, tmp_path: Path):
+        # Create a minimal .kicad_dru file and verify it appears in context
+        dru = tmp_path / "test.kicad_dru"
+        dru.write_text("(rules (version 1))", encoding="utf-8")
+        result = _call("project_get_context", project_path=str(tmp_path))
+        assert result["status"] == "ok"
+        assert len(result["data"]["design_rule_files"]) == 1
+        assert result["data"]["design_rules"][0]["content"] == "(rules (version 1))"
 
     def test_not_found(self):
         result = _call("project_get_context", project_path="/totally/fake/path")
