@@ -1,6 +1,6 @@
 """KiCad schematic manipulation module using kicad_parser."""
 
-import uuid as _uuid_mod
+import uuid
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -116,7 +116,7 @@ def _make_text_node(text: str, x: float, y: float, size: float) -> list:
         QStr(text),
         ["at", x, y, 0],
         ["effects", ["font", ["size", size, size]]],
-        ["uuid", QStr(str(_uuid_mod.uuid4()))],
+        ["uuid", QStr(str(uuid.uuid4()))],
     ]
 
 

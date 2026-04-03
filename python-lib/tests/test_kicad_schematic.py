@@ -23,7 +23,7 @@ class TestIsSchematicApiAvailable:
 
     def test_always_available(self):
         """kicad_parser is a built-in module — API is always available."""
-        assert is_schematic_api_available() is True
+        assert is_schematic_api_available()
 
 
 class TestGetSchematicPathForProject:
