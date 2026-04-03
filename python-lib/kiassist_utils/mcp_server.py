@@ -1508,7 +1508,519 @@ def kicad_get_board_info(path: str) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# 2.6  Project Context Tools
+# 2.6  PCB Editor Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def pcb_open(path: str) -> Dict[str, Any]:
+    """Open a PCB file and return a full board summary.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        Dict with ``version``, ``net_count``, ``footprint_count``,
+        ``track_count``, ``via_count``, ``layer_stackup``, ``nets``,
+        and ``footprints`` (reference + value + layer + position for each).
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    return _ok(
+        {
+            "path": str(path),
+            "version": board.version,
+            "net_count": len(board.nets),
+            "footprint_count": len(board.footprints),
+            "track_count": len(board.tracks),
+            "via_count": len(board.vias),
+            "layer_stackup": board.get_layer_stackup(),
+            "nets": [{"number": n.number, "name": n.name} for n in board.nets],
+            "footprints": [
+                {
+                    "reference": fp.reference,
+                    "value": fp.value,
+                    "name": fp.name,
+                    "layer": fp.layer,
+                    "position": _pos_dict(fp.position),
+                }
+                for fp in board.footprints
+            ],
+        }
+    )
+
+
+@mcp.tool()
+def pcb_new(path: str) -> Dict[str, Any]:
+    """Create a new, empty PCB file.
+
+    Args:
+        path: Destination ``.kicad_pcb`` file path (written immediately).
+
+    Returns:
+        ``{"created": true, "path": "<path>"}`` on success.
+    """
+    board = PCBBoard.new()
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to write PCB file: {exc}")
+    return _ok({"created": True, "path": str(path)})
+
+
+@mcp.tool()
+def pcb_get_layer_stackup(path: str) -> Dict[str, Any]:
+    """Get the ordered list of copper layers in a PCB file.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        ``{"layers": [...]}`` — ordered list of copper layer name strings.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+    return _ok({"layers": board.get_layer_stackup()})
+
+
+@mcp.tool()
+def pcb_list_nets(path: str) -> Dict[str, Any]:
+    """List all nets defined in a PCB file.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        List of dicts with ``number`` and ``name`` for each net.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+    return _ok([{"number": n.number, "name": n.name} for n in board.nets])
+
+
+@mcp.tool()
+def pcb_add_net(path: str, name: str) -> Dict[str, Any]:
+    """Add a new net to a PCB file.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file (modified in-place).
+        name: Net name string (e.g. ``"PWR_3V3"``).
+
+    Returns:
+        ``{"added": true, "number": N, "name": "<name>"}`` on success.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if board.get_net(name) is not None:
+        return _err(f"Net '{name}' already exists")
+
+    try:
+        net = board.add_net(name)
+    except ValueError as exc:
+        return _err(str(exc))
+
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save PCB file: {exc}")
+
+    return _ok({"added": True, "number": net.number, "name": net.name})
+
+
+@mcp.tool()
+def pcb_list_footprints(path: str) -> Dict[str, Any]:
+    """List all footprint instances placed on the board.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        List of dicts with ``reference``, ``value``, ``name``, ``layer``,
+        and ``position`` for each footprint.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+    return _ok(
+        [
+            {
+                "reference": fp.reference,
+                "value": fp.value,
+                "name": fp.name,
+                "layer": fp.layer,
+                "position": _pos_dict(fp.position),
+            }
+            for fp in board.footprints
+        ]
+    )
+
+
+@mcp.tool()
+def pcb_get_footprint(path: str, reference: str) -> Dict[str, Any]:
+    """Get detailed information for a specific footprint on the board.
+
+    Args:
+        path:      Path to a ``.kicad_pcb`` file.
+        reference: Reference designator (e.g. ``"R1"``).
+
+    Returns:
+        Dict with ``reference``, ``value``, ``name``, ``layer``,
+        ``position``, ``pad_count``, and ``pads`` (number, type, shape,
+        position, size, net for each pad).
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    fp = board.get_footprint(reference)
+    if fp is None:
+        return _err(f"Footprint '{reference}' not found")
+
+    pads: List[Dict[str, Any]] = []
+    if fp.raw_tree:
+        for pad_node in _find_all(fp.raw_tree, "pad"):
+            num = str(pad_node[1]) if len(pad_node) > 1 else ""
+            pad_type = str(pad_node[2]) if len(pad_node) > 2 else ""
+            pad_shape = str(pad_node[3]) if len(pad_node) > 3 else ""
+            at_node = _find(pad_node, "at")
+            size_node = _find(pad_node, "size")
+            net_node = _find(pad_node, "net")
+            pos = _parse_position(at_node) if at_node else None
+            width = float(size_node[1]) if size_node and len(size_node) > 1 else 0.0
+            height = float(size_node[2]) if size_node and len(size_node) > 2 else 0.0
+            net_name = str(net_node[2]) if net_node and len(net_node) > 2 else ""
+            pads.append(
+                {
+                    "number": num,
+                    "type": pad_type,
+                    "shape": pad_shape,
+                    "position": _pos_dict(pos) if pos else None,
+                    "size": {"width": width, "height": height},
+                    "net": net_name,
+                }
+            )
+
+    return _ok(
+        {
+            "reference": fp.reference,
+            "value": fp.value,
+            "name": fp.name,
+            "layer": fp.layer,
+            "position": _pos_dict(fp.position),
+            "pad_count": len(pads),
+            "pads": pads,
+        }
+    )
+
+
+@mcp.tool()
+def pcb_add_footprint(
+    path: str,
+    name: str,
+    reference: str,
+    value: str,
+    layer: str = "F.Cu",
+    x: float = 0.0,
+    y: float = 0.0,
+    angle: float = 0.0,
+) -> Dict[str, Any]:
+    """Place a footprint on the board.
+
+    Args:
+        path:      Path to a ``.kicad_pcb`` file (modified in-place).
+        name:      Footprint library identifier (e.g.
+                   ``"Resistor_SMD:R_0402_1005Metric"``).
+        reference: Reference designator (e.g. ``"R2"``).
+        value:     Component value string.
+        layer:     Primary copper layer (``"F.Cu"`` or ``"B.Cu"``).
+        x, y:      Position in mm.
+        angle:     Rotation angle in degrees.
+
+    Returns:
+        ``{"added": true, "reference": "<ref>"}`` on success.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    board.add_footprint(name, reference, value, layer, x, y, angle)
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save PCB file: {exc}")
+
+    return _ok({"added": True, "reference": reference})
+
+
+@mcp.tool()
+def pcb_remove_footprint(path: str, reference: str) -> Dict[str, Any]:
+    """Remove a footprint from the board by reference designator.
+
+    Args:
+        path:      Path to a ``.kicad_pcb`` file (modified in-place).
+        reference: Reference designator to remove (e.g. ``"R1"``).
+
+    Returns:
+        ``{"removed": true}`` on success, or an error if not found.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    if not board.remove_footprint(reference):
+        return _err(f"Footprint '{reference}' not found")
+
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save PCB file: {exc}")
+
+    return _ok({"removed": True})
+
+
+@mcp.tool()
+def pcb_move_footprint(
+    path: str,
+    reference: str,
+    x: float,
+    y: float,
+    angle: float = 0.0,
+) -> Dict[str, Any]:
+    """Move and/or rotate a footprint to a new position.
+
+    Pads, graphics, and all other sub-elements of the footprint are
+    preserved because the position is updated in the raw S-expression
+    tree rather than by re-serialising from dataclass fields.
+
+    Args:
+        path:      Path to a ``.kicad_pcb`` file (modified in-place).
+        reference: Reference designator (e.g. ``"R1"``).
+        x, y:      New position in mm.
+        angle:     New rotation angle in degrees (default 0.0).
+
+    Returns:
+        ``{"moved": true, "reference": "<ref>", "x": x, "y": y, "angle": angle}``
+        on success.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    fp = board.get_footprint(reference)
+    if fp is None:
+        return _err(f"Footprint '{reference}' not found")
+
+    # Update position in the raw tree in-place so all pads and sub-elements
+    # are preserved (PCBFootprint.to_tree() only reconstructs a skeleton).
+    if fp.raw_tree is not None:
+        at_node = _find(fp.raw_tree, "at")
+        if at_node is not None:
+            at_node[1] = x
+            at_node[2] = y
+            if len(at_node) > 3:
+                at_node[3] = angle
+            elif angle != 0.0:
+                at_node.append(angle)
+    fp.position = Position(x, y, angle)
+
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save PCB file: {exc}")
+
+    return _ok({"moved": True, "reference": reference, "x": x, "y": y, "angle": angle})
+
+
+@mcp.tool()
+def pcb_list_tracks(path: str) -> Dict[str, Any]:
+    """List all copper track segments in a PCB file.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        List of dicts with ``start``, ``end``, ``layer``, ``width``,
+        and ``net`` (net number) for each track segment.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    # Build a net-number-to-name lookup for richer output
+    net_names: Dict[int, str] = {n.number: n.name for n in board.nets}
+
+    return _ok(
+        [
+            {
+                "start": {"x": t.start.x, "y": t.start.y},
+                "end": {"x": t.end.x, "y": t.end.y},
+                "layer": t.layer,
+                "width": t.width,
+                "net": t.net,
+                "net_name": net_names.get(t.net, ""),
+            }
+            for t in board.tracks
+        ]
+    )
+
+
+@mcp.tool()
+def pcb_add_track(
+    path: str,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    layer: str = "F.Cu",
+    width: float = 0.25,
+    net: str = "",
+) -> Dict[str, Any]:
+    """Add a copper track segment to a PCB file.
+
+    Args:
+        path:   Path to a ``.kicad_pcb`` file (modified in-place).
+        x1, y1: Start coordinate in mm.
+        x2, y2: End coordinate in mm.
+        layer:  Copper layer name (e.g. ``"F.Cu"``).
+        width:  Track width in mm.
+        net:    Net name string (resolved to number) or ``""`` for unconnected.
+
+    Returns:
+        ``{"added": true, "net": <net_number>}`` on success.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    track = board.add_track(x1, y1, x2, y2, layer, width, net if net else 0)
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save PCB file: {exc}")
+
+    return _ok({"added": True, "net": track.net})
+
+
+@mcp.tool()
+def pcb_list_vias(path: str) -> Dict[str, Any]:
+    """List all vias in a PCB file.
+
+    Args:
+        path: Path to a ``.kicad_pcb`` file.
+
+    Returns:
+        List of dicts with ``position``, ``drill``, ``size``,
+        ``layer_from``, ``layer_to``, ``net``, and ``net_name``
+        for each via.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    net_names: Dict[int, str] = {n.number: n.name for n in board.nets}
+
+    return _ok(
+        [
+            {
+                "position": {"x": v.position.x, "y": v.position.y},
+                "drill": v.drill,
+                "size": v.size,
+                "layer_from": v.layer_from,
+                "layer_to": v.layer_to,
+                "net": v.net,
+                "net_name": net_names.get(v.net, ""),
+            }
+            for v in board.vias
+        ]
+    )
+
+
+@mcp.tool()
+def pcb_add_via(
+    path: str,
+    x: float,
+    y: float,
+    net: str = "",
+    drill: float = 0.8,
+    size: float = 1.6,
+    layer_from: str = "F.Cu",
+    layer_to: str = "B.Cu",
+) -> Dict[str, Any]:
+    """Add a copper via to a PCB file.
+
+    Args:
+        path:       Path to a ``.kicad_pcb`` file (modified in-place).
+        x, y:       Via centre position in mm.
+        net:        Net name string (resolved to number) or ``""`` for
+                    unconnected.
+        drill:      Drill diameter in mm (default 0.8).
+        size:       Pad diameter in mm (default 1.6).
+        layer_from: Top copper layer (default ``"F.Cu"``).
+        layer_to:   Bottom copper layer (default ``"B.Cu"``).
+
+    Returns:
+        ``{"added": true, "net": <net_number>}`` on success.
+    """
+    try:
+        board = PCBBoard.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    via = board.add_via(x, y, net if net else 0, drill, size, layer_from, layer_to)
+    try:
+        _safe_save(board, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save PCB file: {exc}")
+
+    return _ok({"added": True, "net": via.net})
+
+
+# ===========================================================================
+# 2.7  Project Context Tools
 # ===========================================================================
 
 

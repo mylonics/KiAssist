@@ -53,6 +53,13 @@ def tmp_fp(tmp_path: Path) -> Path:
     return dst
 
 
+@pytest.fixture()
+def tmp_pcb(tmp_path: Path) -> Path:
+    dst = tmp_path / "pcb.kicad_pcb"
+    shutil.copy(FIXTURE_PCB, dst)
+    return dst
+
+
 # ===========================================================================
 # in_process_call helper
 # ===========================================================================
@@ -677,3 +684,244 @@ class TestProjectReadWriteMemory:
             content="hello",
         )
         assert result["status"] == "error"
+
+
+# ===========================================================================
+# PCB Editor tools
+# ===========================================================================
+
+
+class TestPCBOpen:
+    def test_success(self):
+        result = _call("pcb_open", path=str(FIXTURE_PCB))
+        assert result["status"] == "ok"
+        data = result["data"]
+        assert "version" in data
+        assert "net_count" in data
+        assert "footprint_count" in data
+        assert "track_count" in data
+        assert "via_count" in data
+        assert "layer_stackup" in data
+        assert isinstance(data["nets"], list)
+        assert isinstance(data["footprints"], list)
+        # The fixture has at least one net and one footprint
+        assert data["footprint_count"] >= 1
+        assert data["net_count"] >= 1
+
+    def test_not_found(self):
+        result = _call("pcb_open", path="/no/such/file.kicad_pcb")
+        assert result["status"] == "error"
+
+
+class TestPCBNew:
+    def test_creates_file(self, tmp_path: Path):
+        dest = tmp_path / "new_board.kicad_pcb"
+        result = _call("pcb_new", path=str(dest))
+        assert result["status"] == "ok"
+        assert dest.exists()
+        # Verify the created file is loadable
+        check = _call("pcb_open", path=str(dest))
+        assert check["status"] == "ok"
+
+
+class TestPCBGetLayerStackup:
+    def test_returns_layers(self):
+        result = _call("pcb_get_layer_stackup", path=str(FIXTURE_PCB))
+        assert result["status"] == "ok"
+        assert isinstance(result["data"]["layers"], list)
+        assert len(result["data"]["layers"]) >= 2
+
+    def test_not_found(self):
+        result = _call("pcb_get_layer_stackup", path="/no/such/file.kicad_pcb")
+        assert result["status"] == "error"
+
+
+class TestPCBNets:
+    def test_list_nets(self):
+        result = _call("pcb_list_nets", path=str(FIXTURE_PCB))
+        assert result["status"] == "ok"
+        nets = result["data"]
+        assert isinstance(nets, list)
+        # Fixture has VCC and GND
+        names = [n["name"] for n in nets]
+        assert "VCC" in names
+        assert "GND" in names
+
+    def test_add_net(self, tmp_pcb: Path):
+        result = _call("pcb_add_net", path=str(tmp_pcb), name="PWR_3V3")
+        assert result["status"] == "ok"
+        assert result["data"]["name"] == "PWR_3V3"
+        assert result["data"]["added"] is True
+        # Verify persisted
+        check = _call("pcb_list_nets", path=str(tmp_pcb))
+        names = [n["name"] for n in check["data"]]
+        assert "PWR_3V3" in names
+
+    def test_add_duplicate_net(self, tmp_pcb: Path):
+        result = _call("pcb_add_net", path=str(tmp_pcb), name="VCC")
+        assert result["status"] == "error"
+
+    def test_list_not_found(self):
+        result = _call("pcb_list_nets", path="/no/such/file.kicad_pcb")
+        assert result["status"] == "error"
+
+
+class TestPCBFootprints:
+    def test_list_footprints(self):
+        result = _call("pcb_list_footprints", path=str(FIXTURE_PCB))
+        assert result["status"] == "ok"
+        fps = result["data"]
+        assert isinstance(fps, list)
+        assert len(fps) >= 1
+        # Check fields
+        fp = fps[0]
+        assert "reference" in fp
+        assert "value" in fp
+        assert "layer" in fp
+        assert "position" in fp
+
+    def test_get_footprint(self):
+        result = _call("pcb_get_footprint", path=str(FIXTURE_PCB), reference="R1")
+        assert result["status"] == "ok"
+        data = result["data"]
+        assert data["reference"] == "R1"
+        assert "pads" in data
+        assert "pad_count" in data
+        assert data["pad_count"] >= 1
+        # Pads should have net names from the fixture
+        pad_nets = [p["net"] for p in data["pads"]]
+        assert "VCC" in pad_nets or "GND" in pad_nets
+
+    def test_get_footprint_not_found(self):
+        result = _call("pcb_get_footprint", path=str(FIXTURE_PCB), reference="ZZZZ")
+        assert result["status"] == "error"
+
+    def test_add_footprint(self, tmp_pcb: Path):
+        before = _call("pcb_list_footprints", path=str(tmp_pcb))["data"]
+        result = _call(
+            "pcb_add_footprint",
+            path=str(tmp_pcb),
+            name="Resistor_SMD:R_0402_1005Metric",
+            reference="R99",
+            value="100R",
+            layer="F.Cu",
+            x=50.0,
+            y=50.0,
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["reference"] == "R99"
+        after = _call("pcb_list_footprints", path=str(tmp_pcb))["data"]
+        assert len(after) == len(before) + 1
+
+    def test_remove_footprint(self, tmp_pcb: Path):
+        result = _call("pcb_remove_footprint", path=str(tmp_pcb), reference="R1")
+        assert result["status"] == "ok"
+        assert result["data"]["removed"] is True
+        check = _call("pcb_list_footprints", path=str(tmp_pcb))["data"]
+        refs = [fp["reference"] for fp in check]
+        assert "R1" not in refs
+
+    def test_remove_footprint_not_found(self, tmp_pcb: Path):
+        result = _call("pcb_remove_footprint", path=str(tmp_pcb), reference="ZZZZ")
+        assert result["status"] == "error"
+
+    def test_move_footprint(self, tmp_pcb: Path):
+        result = _call(
+            "pcb_move_footprint",
+            path=str(tmp_pcb),
+            reference="R1",
+            x=120.0,
+            y=80.0,
+            angle=90.0,
+        )
+        assert result["status"] == "ok"
+        data = result["data"]
+        assert data["x"] == 120.0
+        assert data["y"] == 80.0
+        assert data["angle"] == 90.0
+        # Verify the position is persisted
+        check = _call("pcb_get_footprint", path=str(tmp_pcb), reference="R1")
+        pos = check["data"]["position"]
+        assert abs(pos["x"] - 120.0) < 0.001
+        assert abs(pos["y"] - 80.0) < 0.001
+        # Pads must still be present after move
+        assert check["data"]["pad_count"] >= 1
+
+    def test_move_footprint_not_found(self, tmp_pcb: Path):
+        result = _call(
+            "pcb_move_footprint", path=str(tmp_pcb), reference="ZZZZ", x=0.0, y=0.0
+        )
+        assert result["status"] == "error"
+
+
+class TestPCBTracks:
+    def test_list_tracks(self):
+        result = _call("pcb_list_tracks", path=str(FIXTURE_PCB))
+        assert result["status"] == "ok"
+        tracks = result["data"]
+        assert isinstance(tracks, list)
+        assert len(tracks) >= 1
+        t = tracks[0]
+        assert "start" in t
+        assert "end" in t
+        assert "layer" in t
+        assert "width" in t
+        assert "net_name" in t
+
+    def test_add_track(self, tmp_pcb: Path):
+        before = len(_call("pcb_list_tracks", path=str(tmp_pcb))["data"])
+        result = _call(
+            "pcb_add_track",
+            path=str(tmp_pcb),
+            x1=100.0,
+            y1=105.0,
+            x2=110.0,
+            y2=105.0,
+            layer="F.Cu",
+            width=0.3,
+            net="GND",
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["added"] is True
+        after = len(_call("pcb_list_tracks", path=str(tmp_pcb))["data"])
+        assert after == before + 1
+
+    def test_list_not_found(self):
+        result = _call("pcb_list_tracks", path="/no/such/file.kicad_pcb")
+        assert result["status"] == "error"
+
+
+class TestPCBVias:
+    def test_list_vias_empty(self):
+        # The fixture has no vias, but the call should still succeed
+        result = _call("pcb_list_vias", path=str(FIXTURE_PCB))
+        assert result["status"] == "ok"
+        assert isinstance(result["data"], list)
+
+    def test_add_via(self, tmp_pcb: Path):
+        before = len(_call("pcb_list_vias", path=str(tmp_pcb))["data"])
+        result = _call(
+            "pcb_add_via",
+            path=str(tmp_pcb),
+            x=105.0,
+            y=100.0,
+            net="VCC",
+            drill=0.4,
+            size=0.8,
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["added"] is True
+        after = len(_call("pcb_list_vias", path=str(tmp_pcb))["data"])
+        assert after == before + 1
+
+    def test_list_not_found(self):
+        result = _call("pcb_list_vias", path="/no/such/file.kicad_pcb")
+        assert result["status"] == "error"
+
+
+class TestPCBBackupOnSave:
+    def test_backup_created(self, tmp_pcb: Path):
+        bak = Path(str(tmp_pcb) + ".bak")
+        assert not bak.exists()
+        _call("pcb_add_net", path=str(tmp_pcb), name="BACKUP_TEST_NET")
+        assert bak.exists(), ".bak file should be created by _safe_save"
