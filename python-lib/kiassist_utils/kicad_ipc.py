@@ -1,5 +1,7 @@
 """KiCad IPC instance detection module."""
 
+import ctypes
+import ctypes.wintypes
 import json
 import os
 import platform
@@ -97,45 +99,33 @@ def discover_socket_files() -> List[Path]:
     sockets = []
     
     if _CURRENT_PLATFORM == "Windows":
-        # On Windows, we need to enumerate named pipes
-        # The pipe names are the full paths: C:\Users\...\Temp\kicad\api.sock
+        # On Windows, KiCad IPC uses named pipes via NNG.
+        # Enumerate pipes using os.listdir which is orders of magnitude faster
+        # than spawning a PowerShell subprocess.
         try:
-            # Use PowerShell to enumerate pipes matching our pattern
-            temp_dir = str(socket_dir).replace('/', '\\')
+            # Normalize socket_dir for case-insensitive comparison with forward slashes
+            # (NNG on Windows uses forward slashes in pipe names)
+            temp_dir_normalized = str(socket_dir).replace('\\', '/').lower().rstrip('/')
             
-            # PowerShell command to find pipes matching the kicad socket pattern
-            cmd = f'Get-ChildItem \\\\.\\pipe\\ | Where-Object {{ $_.Name -like "{temp_dir}\\api*.sock" }} | Select-Object -ExpandProperty Name'
-            
-            # Use CREATE_NO_WINDOW to prevent command prompt from appearing
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            
-            result = subprocess.run(
-                ['powershell', '-Command', cmd],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            
-            if result.returncode == 0 and result.stdout.strip():
-                # Parse the output to get pipe names
-                pipe_names = result.stdout.strip().split('\n')
-                for pipe_name in pipe_names:
-                    pipe_name = pipe_name.strip()
-                    if pipe_name:
-                        # Extract just the filename part after the last backslash
-                        filename = pipe_name.split('\\')[-1]
-                        # Validate the pattern: api.sock or api-<PID>.sock
-                        if filename == "api.sock" or (
-                            filename.startswith("api-") and 
-                            filename.endswith(".sock") and
-                            filename[4:-5].isdigit()
-                        ):
-                            # Return the full pipe path (this is what gets passed to ipc://)
-                            sockets.append(Path(pipe_name))
+            for pipe_name in os.listdir(r'\\.\pipe'):
+                pipe_lower = pipe_name.replace('\\', '/').lower()
+                
+                # Check if this pipe belongs to our kicad socket dir
+                prefix = temp_dir_normalized + '/'
+                if not pipe_lower.startswith(prefix):
+                    continue
+                
+                # Extract the filename part after the directory prefix
+                filename = pipe_lower[len(prefix):]
+                
+                # Validate the pattern: api.sock or api-<PID>.sock
+                if filename == "api.sock" or (
+                    filename.startswith("api-") and 
+                    filename.endswith(".sock") and
+                    filename[4:-5].isdigit()
+                ):
+                    # Reconstruct the path using socket_dir for consistent format
+                    sockets.append(socket_dir / filename)
         except Exception as e:
             print(f"Warning: Could not enumerate Windows named pipes: {e}")
         
@@ -240,24 +230,8 @@ def _get_kicad_process_info() -> List[Dict[str, str]]:
     results = []
     try:
         if _CURRENT_PLATFORM == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            
-            result = subprocess.run(
-                ['powershell', '-Command',
-                 "Get-Process | Where-Object {$_.ProcessName -like '*kicad*' -and $_.MainWindowTitle -ne ''} "
-                 "| ForEach-Object { $_.Id.ToString() + '|' + $_.MainWindowTitle }"],
-                capture_output=True, text=True, timeout=5,
-                startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                for line in result.stdout.strip().split('\n'):
-                    line = line.strip()
-                    if '|' in line:
-                        pid, title = line.split('|', 1)
-                        results.append({'pid': pid.strip(), 'title': title.strip()})
+            # Use Win32 API directly (much faster than spawning PowerShell)
+            results = _get_kicad_process_info_win32()
         else:
             # On Linux, try wmctrl or xdotool
             result = subprocess.run(
@@ -270,6 +244,57 @@ def _get_kicad_process_info() -> List[Dict[str, str]]:
                         parts = line.split(None, 4)
                         if len(parts) >= 5:
                             results.append({'pid': parts[2], 'title': parts[4]})
+    except Exception:
+        pass
+    return results
+
+
+def _get_kicad_process_info_win32() -> List[Dict[str, str]]:
+    """Get KiCad process info using Win32 API (EnumWindows).
+    
+    Much faster than spawning PowerShell — completes in milliseconds.
+    
+    Returns:
+        List of dicts with 'pid' and 'title' keys.
+    """
+    results = []
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        
+        EnumWindows = user32.EnumWindows
+        GetWindowTextW = user32.GetWindowTextW
+        GetWindowTextLengthW = user32.GetWindowTextLengthW
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        IsWindowVisible = user32.IsWindowVisible
+        
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.HWND,
+            ctypes.wintypes.LPARAM,
+        )
+        
+        def _enum_callback(hwnd: int, _lparam: int) -> bool:
+            if not IsWindowVisible(hwnd):
+                return True
+            
+            length = GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return True
+            
+            buf = ctypes.create_unicode_buffer(length + 1)
+            GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value
+            
+            if not title or 'kicad' not in title.lower():
+                return True
+            
+            pid = ctypes.wintypes.DWORD()
+            GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            
+            results.append({'pid': str(pid.value), 'title': title})
+            return True
+        
+        EnumWindows(WNDENUMPROC(_enum_callback), 0)
     except Exception:
         pass
     return results

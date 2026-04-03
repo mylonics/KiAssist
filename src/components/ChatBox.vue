@@ -1,16 +1,34 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, nextTick, watch } from 'vue';
+import { marked } from 'marked';
+import hljs from 'highlight.js';
 import '../types/pywebview';
+
+// Configure marked with code highlighting
+marked.use({
+  renderer: {
+    code({ text, lang }: { text: string; lang?: string }): string {
+      const validLang = lang && hljs.getLanguage(lang) ? lang : undefined;
+      const highlighted = validLang
+        ? hljs.highlight(text, { language: validLang }).value
+        : hljs.highlightAuto(text).value;
+      return `<pre><code class="hljs${validLang ? ` language-${validLang}` : ''}">${highlighted}</code></pre>`;
+    }
+  },
+  breaks: true,
+});
 
 interface Message {
   id: string;
   text: string;
   sender: 'user' | 'assistant';
   timestamp: Date;
+  isStreaming?: boolean;
 }
 
-const copiedMessageId = ref<string | null>(null);
+const STORAGE_KEY = 'kiassist-chat-messages';
 
+const copiedMessageId = ref<string | null>(null);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
 const selectedModel = ref('3-flash');
@@ -19,6 +37,10 @@ const showApiKeyPrompt = ref(false);
 const apiKeyInput = ref('');
 const isLoading = ref(false);
 const apiKeyWarning = ref<string>('');
+const apiKeyError = ref<string>('');
+const messagesContainer = ref<HTMLElement | null>(null);
+const editingMessageId = ref<string | null>(null);
+const editingText = ref('');
 
 const availableModels = [
   { value: '3.1-pro', label: 'Gemini 3.1 Pro' },
@@ -30,110 +52,229 @@ function generateMessageId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
+function renderMarkdown(text: string, isUser: boolean = false): string {
+  if (!text) return '';
+  if (isUser) {
+    return text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\n/g, '<br>');
+  }
+  return marked.parse(text) as string;
+}
+
+function scrollToBottom() {
+  nextTick(() => {
+    if (messagesContainer.value) {
+      messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+    }
+  });
+}
+
+// Persistence
+function saveMessages() {
+  try {
+    const serializable = messages.value
+      .filter(m => !m.isStreaming)
+      .map(m => ({
+        id: m.id,
+        text: m.text,
+        sender: m.sender,
+        timestamp: m.timestamp.toISOString(),
+      }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
+  } catch (e) {
+    console.error('Failed to save messages:', e);
+  }
+}
+
+function loadMessages() {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      messages.value = parsed.map((m: any) => ({
+        ...m,
+        timestamp: new Date(m.timestamp),
+        isStreaming: false,
+      }));
+    }
+  } catch (e) {
+    console.error('Failed to load messages:', e);
+  }
+}
+
+function clearMessages() {
+  if (isLoading.value) return;
+  messages.value = [];
+  localStorage.removeItem(STORAGE_KEY);
+}
+
+// API Key
 async function checkApiKey() {
   try {
     if (window.pywebview?.api) {
-      console.log('[UI] Checking API key...');
       hasApiKey.value = await window.pywebview.api.check_api_key();
-      console.log('[UI] Has API key:', hasApiKey.value);
-      // Don't show API key prompt automatically - only when user tries to use Gemini
-    } else {
-      console.error('[UI] pywebview API not available');
     }
   } catch (error) {
     console.error('[UI] Error checking API key:', error);
   }
 }
 
-// Wait for pywebview API to be ready before checking API key
 async function waitForPywebviewAndCheckApiKey() {
-  console.log('[UI] Waiting for pywebview API...');
-  
-  // Try up to 10 times with 100ms delays
-  for (let i = 0; i < 10; i++) {
-    if (window.pywebview?.api) {
-      console.log('[UI] pywebview API ready!');
-      await checkApiKey();
-      return;
-    }
-    console.log(`[UI] Waiting for API... attempt ${i + 1}/10`);
-    await new Promise(resolve => setTimeout(resolve, 100));
+  if (!window.pywebview?.api) {
+    await new Promise<void>((resolve) => {
+      const onReady = () => resolve();
+      window.addEventListener('pywebviewready', onReady, { once: true });
+      // Fallback timeout in case the event was already fired
+      setTimeout(() => {
+        window.removeEventListener('pywebviewready', onReady);
+        resolve();
+      }, 3000);
+    });
   }
-  
-  console.error('[UI] pywebview API not available after waiting');
-  // Don't show API key prompt automatically - only when user tries to use Gemini
+  try {
+    await checkApiKey();
+  } catch (err) {
+    // Ignore stale callback errors from pywebview (e.g. during HMR reload)
+    if (String(err).includes('_returnValuesCallbacks')) {
+      console.warn('[ChatBox] Stale pywebview callback (likely HMR reload), ignoring.');
+    } else {
+      console.error('[UI] Error during initial API key check:', err);
+    }
+  }
 }
-
-const apiKeyError = ref<string>('');
 
 async function saveApiKey() {
   if (!apiKeyInput.value.trim()) return;
-  
-  apiKeyError.value = ''; // Clear previous errors
-  apiKeyWarning.value = ''; // Clear previous warnings
-  
+  apiKeyError.value = '';
+  apiKeyWarning.value = '';
   const trimmedKey = apiKeyInput.value.trim();
-  
-  // Validate API key format
+
   if (trimmedKey.length < 30) {
     apiKeyError.value = 'API key seems too short. Gemini API keys are typically 39 characters long.';
     return;
   }
-  
   if (!trimmedKey.startsWith('AIza')) {
     apiKeyError.value = 'This doesn\'t look like a valid Gemini API key. Keys should start with "AIza". Get your key from https://aistudio.google.com/apikey';
     return;
   }
-  
+
   try {
     if (window.pywebview?.api) {
-      console.log('[UI] Saving API key...');
       const result = await window.pywebview.api.set_api_key(trimmedKey);
-      console.log('[UI] Save result:', result);
-      
       if (result.success) {
         hasApiKey.value = true;
         showApiKeyPrompt.value = false;
         apiKeyInput.value = '';
-        console.log('[UI] API key saved successfully!');
-        
-        // Show warning as a message if there was one
         if (result.warning) {
           apiKeyWarning.value = result.warning;
-          console.warn('[UI] Save warning:', result.warning);
-          // Also add a message to inform the user
-          const warningMessage: Message = {
+          messages.value.push({
             id: generateMessageId(),
             text: `Note: ${result.warning}`,
             sender: 'assistant',
             timestamp: new Date(),
-          };
-          messages.value.push(warningMessage);
+          });
         }
       } else {
-        console.error('[UI] Failed to save API key:', result.error);
         apiKeyError.value = result.error || 'Unknown error occurred';
       }
     } else {
-      const errorMsg = 'Application backend not available. Please restart the application.';
-      console.error('[UI]', errorMsg);
-      apiKeyError.value = errorMsg;
+      apiKeyError.value = 'Application backend not available. Please restart the application.';
     }
   } catch (error) {
-    console.error('[UI] Error saving API key:', error);
     apiKeyError.value = 'Failed to save API key. Please try again.';
   }
 }
 
-async function sendMessage() {
-  if (!inputMessage.value.trim()) return;
-  
+// Streaming send
+async function sendMessageWithText(messageText: string) {
+  if (!messageText.trim()) return;
   if (!hasApiKey.value) {
     showApiKeyPrompt.value = true;
     return;
   }
 
-  // Add user message
+  isLoading.value = true;
+
+  try {
+    if (window.pywebview?.api) {
+      const startResult = await window.pywebview.api.start_stream_message(messageText, selectedModel.value);
+
+      if (!startResult.success) {
+        messages.value.push({
+          id: generateMessageId(),
+          text: `Sorry, I encountered an error: ${startResult.error || 'Unknown error'}. Please check your API key and try again.`,
+          sender: 'assistant',
+          timestamp: new Date(),
+        });
+        isLoading.value = false;
+        return;
+      }
+
+      // Create streaming assistant message
+      messages.value.push({
+        id: generateMessageId(),
+        text: '',
+        sender: 'assistant',
+        timestamp: new Date(),
+        isStreaming: true,
+      });
+      const streamIdx = messages.value.length - 1;
+
+      // Poll for streaming chunks
+      const pollInterval = setInterval(async () => {
+        try {
+          const poll = await window.pywebview!.api.poll_stream();
+          if (poll.success && messages.value[streamIdx]) {
+            messages.value[streamIdx].text = poll.text || '';
+
+            if (poll.done) {
+              clearInterval(pollInterval);
+              messages.value[streamIdx].isStreaming = false;
+              isLoading.value = false;
+
+              if (poll.error) {
+                messages.value[streamIdx].text = `Sorry, I encountered an error: ${poll.error}`;
+              } else if (!messages.value[streamIdx].text.trim()) {
+                messages.value[streamIdx].text = 'No response received.';
+              }
+              saveMessages();
+            }
+          }
+        } catch (e) {
+          clearInterval(pollInterval);
+          if (messages.value[streamIdx]) {
+            messages.value[streamIdx].isStreaming = false;
+            messages.value[streamIdx].text = `Sorry, I encountered an error: ${e}`;
+          }
+          isLoading.value = false;
+        }
+      }, 100);
+
+    } else {
+      messages.value.push({
+        id: generateMessageId(),
+        text: 'Application backend not available. Please restart the application.',
+        sender: 'assistant',
+        timestamp: new Date(),
+      });
+      isLoading.value = false;
+    }
+  } catch (error) {
+    messages.value.push({
+      id: generateMessageId(),
+      text: `Sorry, I encountered an error: ${error}. Please check your API key and try again.`,
+      sender: 'assistant',
+      timestamp: new Date(),
+    });
+    isLoading.value = false;
+  }
+}
+
+async function sendMessage() {
+  if (!inputMessage.value.trim()) return;
   const userMessage: Message = {
     id: generateMessageId(),
     text: inputMessage.value,
@@ -141,57 +282,46 @@ async function sendMessage() {
     timestamp: new Date(),
   };
   messages.value.push(userMessage);
-
   const messageText = inputMessage.value;
   inputMessage.value = '';
-  isLoading.value = true;
+  await sendMessageWithText(messageText);
+}
 
-  // Call backend to send message to Gemini
-  try {
-    if (window.pywebview?.api) {
-      const result = await window.pywebview.api.send_message(messageText, selectedModel.value);
-      
-      if (result.success && result.response) {
-        // Add assistant response
-        const assistantMessage: Message = {
-          id: generateMessageId(),
-          text: result.response,
-          sender: 'assistant',
-          timestamp: new Date(),
-        };
-        messages.value.push(assistantMessage);
-      } else {
-        // Add error message to UI
-        const errorMessage: Message = {
-          id: generateMessageId(),
-          text: `Sorry, I encountered an error: ${result.error || 'Unknown error'}. Please check your API key and try again.`,
-          sender: 'assistant',
-          timestamp: new Date(),
-        };
-        messages.value.push(errorMessage);
-      }
-    } else {
-      const errorMessage: Message = {
-        id: generateMessageId(),
-        text: 'Application backend not available. Please restart the application.',
-        sender: 'assistant',
-        timestamp: new Date(),
-      };
-      messages.value.push(errorMessage);
+// Message actions
+async function regenerateMessage(messageIndex: number) {
+  const msg = messages.value[messageIndex];
+  if (!msg || msg.sender !== 'assistant' || isLoading.value) return;
+  let userText = '';
+  for (let i = messageIndex - 1; i >= 0; i--) {
+    if (messages.value[i].sender === 'user') {
+      userText = messages.value[i].text;
+      break;
     }
-  } catch (error) {
-    console.error('Error sending message:', error);
-    // Add error message to UI
-    const errorMessage: Message = {
-      id: generateMessageId(),
-      text: `Sorry, I encountered an error: ${error}. Please check your API key and try again.`,
-      sender: 'assistant',
-      timestamp: new Date(),
-    };
-    messages.value.push(errorMessage);
-  } finally {
-    isLoading.value = false;
   }
+  if (!userText) return;
+  messages.value.splice(messageIndex, 1);
+  await sendMessageWithText(userText);
+}
+
+function startEdit(messageId: string, text: string) {
+  editingMessageId.value = messageId;
+  editingText.value = text;
+}
+
+function cancelEdit() {
+  editingMessageId.value = null;
+  editingText.value = '';
+}
+
+async function saveEdit(messageIndex: number) {
+  const msg = messages.value[messageIndex];
+  if (!msg || msg.sender !== 'user') return;
+  const newText = editingText.value.trim();
+  if (!newText) return;
+  msg.text = newText;
+  messages.value.splice(messageIndex + 1);
+  cancelEdit();
+  await sendMessageWithText(newText);
 }
 
 function handleKeyPress(event: KeyboardEvent) {
@@ -205,17 +335,28 @@ async function copyMessage(messageId: string, text: string) {
   try {
     await navigator.clipboard.writeText(text);
     copiedMessageId.value = messageId;
-    setTimeout(() => {
-      copiedMessageId.value = null;
-    }, 2000);
+    setTimeout(() => { copiedMessageId.value = null; }, 2000);
   } catch (error) {
     console.error('Failed to copy message:', error);
   }
 }
 
+// Watchers
+watch(() => messages.value.length, () => { scrollToBottom(); });
+watch(() => {
+  const last = messages.value[messages.value.length - 1];
+  return last?.text?.length ?? 0;
+}, () => { scrollToBottom(); });
+watch(messages, () => {
+  if (!messages.value.some(m => m.isStreaming)) {
+    saveMessages();
+  }
+}, { deep: true });
+
 onMounted(() => {
-  // Use the wait function to ensure pywebview API is ready
+  loadMessages();
   waitForPywebviewAndCheckApiKey();
+  scrollToBottom();
 });
 </script>
 
@@ -227,7 +368,7 @@ onMounted(() => {
         <h3>Configure Gemini API Key</h3>
         <p class="modal-description">
           Please enter your Google Gemini API key to enable AI-powered chat functionality.
-          You can get your API key from the 
+          You can get your API key from the
           <a href="https://makersuite.google.com/app/apikey" target="_blank">Google AI Studio</a>.
         </p>
         <input
@@ -262,41 +403,86 @@ onMounted(() => {
             </option>
           </select>
         </template>
+        <div class="header-spacer"></div>
+        <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" :disabled="isLoading">
+          <span class="material-icons">delete_sweep</span>
+        </button>
         <button @click="showApiKeyPrompt = true" class="icon-btn" title="Configure API Key">
           <span class="material-icons">settings</span>
         </button>
       </div>
     </div>
-    
-    <div class="chat-messages">
+
+    <div class="chat-messages" ref="messagesContainer">
       <div v-if="messages.length === 0" class="welcome-message">
+        <span class="material-icons welcome-icon">smart_toy</span>
         <p>Welcome to KiAssist!</p>
         <p class="hint">Ask me anything about KiCAD or PCB design. Powered by Google Gemini.</p>
       </div>
-      
+
       <div
-        v-for="message in messages"
+        v-for="(message, index) in messages"
         :key="message.id"
         :class="['message', message.sender]"
       >
+        <div class="message-avatar">
+          <span class="material-icons">{{ message.sender === 'user' ? 'person' : 'smart_toy' }}</span>
+        </div>
         <div class="message-content">
-          <div class="message-header">
-            <button 
-              @click="copyMessage(message.id, message.text)"
-              class="copy-btn"
-              :title="copiedMessageId === message.id ? 'Copied!' : 'Copy message'"
-            >
-              <span class="material-icons">{{ copiedMessageId === message.id ? 'check' : 'content_copy' }}</span>
-            </button>
+          <!-- Editing mode -->
+          <div v-if="editingMessageId === message.id" class="edit-area">
+            <textarea v-model="editingText" class="edit-textarea" rows="3"></textarea>
+            <div class="edit-actions">
+              <button @click="saveEdit(index)" class="btn-primary btn-sm">Save &amp; Resend</button>
+              <button @click="cancelEdit" class="btn-secondary btn-sm">Cancel</button>
+            </div>
           </div>
-          <div class="message-text">{{ message.text }}</div>
-          <div class="message-time">
-            {{ message.timestamp.toLocaleTimeString() }}
-          </div>
+          <!-- Normal display -->
+          <template v-else>
+            <div
+              v-if="message.sender === 'assistant'"
+              class="message-text markdown-content"
+              v-html="renderMarkdown(message.text)"
+            ></div>
+            <div v-else class="message-text" v-html="renderMarkdown(message.text, true)"></div>
+            <div class="message-footer">
+              <span class="message-time">{{ message.timestamp.toLocaleTimeString() }}</span>
+              <span v-if="message.isStreaming" class="streaming-indicator">
+                <span class="streaming-dot"></span>
+              </span>
+              <div class="message-actions">
+                <button
+                  @click="copyMessage(message.id, message.text)"
+                  class="action-btn"
+                  :title="copiedMessageId === message.id ? 'Copied!' : 'Copy'"
+                >
+                  <span class="material-icons">{{ copiedMessageId === message.id ? 'check' : 'content_copy' }}</span>
+                </button>
+                <button
+                  v-if="message.sender === 'assistant' && !message.isStreaming"
+                  @click="regenerateMessage(index)"
+                  class="action-btn"
+                  title="Regenerate"
+                  :disabled="isLoading"
+                >
+                  <span class="material-icons">refresh</span>
+                </button>
+                <button
+                  v-if="message.sender === 'user'"
+                  @click="startEdit(message.id, message.text)"
+                  class="action-btn"
+                  title="Edit"
+                  :disabled="isLoading"
+                >
+                  <span class="material-icons">edit</span>
+                </button>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
-      
-      <div v-if="isLoading" class="loading-indicator">
+
+      <div v-if="isLoading && !messages.some(m => m.isStreaming)" class="loading-indicator">
         <div class="typing-dots">
           <span></span>
           <span></span>
@@ -304,7 +490,7 @@ onMounted(() => {
         </div>
       </div>
     </div>
-    
+
     <div class="chat-input">
       <textarea
         v-model="inputMessage"
@@ -342,6 +528,10 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 0.625rem;
+}
+
+.header-spacer {
+  flex: 1;
 }
 
 .model-label {
@@ -396,6 +586,11 @@ onMounted(() => {
   color: var(--accent-color);
 }
 
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .chat-messages {
   flex: 1;
   overflow-y: auto;
@@ -411,7 +606,13 @@ onMounted(() => {
   color: var(--text-secondary);
 }
 
-.welcome-message p:first-child {
+.welcome-icon {
+  font-size: 3rem;
+  opacity: 0.3;
+  margin-bottom: 0.75rem;
+}
+
+.welcome-message p:first-of-type {
   font-size: 1.375rem;
   margin-bottom: 0.625rem;
   font-weight: 500;
@@ -424,74 +625,59 @@ onMounted(() => {
 
 .message {
   display: flex;
+  gap: 0.625rem;
   margin-bottom: 1rem;
   animation: fadeIn 0.2s ease-out;
 }
 
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .message.user {
-  justify-content: flex-end;
+  flex-direction: row-reverse;
 }
 
 .message.assistant {
   justify-content: flex-start;
 }
 
+/* Avatar */
+.message-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.message-avatar .material-icons {
+  font-size: 1.125rem;
+}
+
+.message.user .message-avatar {
+  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
+  color: white;
+}
+
+.message.assistant .message-avatar {
+  background-color: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+}
+
+/* Message Content */
 .message-content {
   max-width: min(75%, 700px);
   padding: 0.75rem 1rem;
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-sm);
   position: relative;
-}
-
-.message-header {
-  display: flex;
-  justify-content: flex-end;
-  margin-bottom: 0.25rem;
-}
-
-.copy-btn {
-  padding: 0.25rem;
-  background: rgba(0, 0, 0, 0.06);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  transition: background 0.15s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.copy-btn .material-icons {
-  font-size: 1rem;
-  color: var(--text-secondary);
-}
-
-.copy-btn:hover {
-  background: rgba(0, 0, 0, 0.12);
-}
-
-.message.user .copy-btn {
-  background: rgba(255, 255, 255, 0.15);
-}
-
-.message.user .copy-btn .material-icons {
-  color: rgba(255, 255, 255, 0.9);
-}
-
-.message.user .copy-btn:hover {
-  background: rgba(255, 255, 255, 0.25);
+  min-width: 0;
 }
 
 .message.user .message-content {
@@ -514,18 +700,216 @@ onMounted(() => {
   line-height: 1.5;
   user-select: text;
   -webkit-user-select: text;
-  -moz-user-select: text;
-  -ms-user-select: text;
-  cursor: text;
   max-width: 100%;
   font-size: 0.9375rem;
 }
 
+/* Message Footer */
+.message-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.375rem;
+}
+
 .message-time {
   font-size: 0.6875rem;
-  margin-top: 0.375rem;
   opacity: 0.6;
-  text-align: right;
+}
+
+.message-actions {
+  display: flex;
+  gap: 0.125rem;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.message:hover .message-actions {
+  opacity: 1;
+}
+
+.action-btn {
+  padding: 0.1875rem;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+}
+
+.action-btn .material-icons {
+  font-size: 0.9375rem;
+}
+
+.action-btn:hover {
+  background-color: rgba(0, 0, 0, 0.08);
+  color: var(--accent-color);
+}
+
+.message.user .action-btn {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.message.user .action-btn:hover {
+  background-color: rgba(255, 255, 255, 0.15);
+  color: white;
+}
+
+.action-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* Streaming Indicator */
+.streaming-indicator {
+  display: flex;
+  align-items: center;
+}
+
+.streaming-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--accent-color);
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+/* Edit Area */
+.edit-area {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.edit-textarea {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-family: inherit;
+  font-size: 0.875rem;
+  resize: vertical;
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+}
+
+.edit-textarea:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.edit-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.btn-sm {
+  padding: 0.25rem 0.75rem !important;
+  font-size: 0.75rem !important;
+}
+
+/* Markdown Content Styles */
+.markdown-content :deep(p) {
+  margin: 0 0 0.5em 0;
+}
+
+.markdown-content :deep(p:last-child) {
+  margin-bottom: 0;
+}
+
+.markdown-content :deep(pre) {
+  margin: 0.75em 0;
+  border-radius: var(--radius-md);
+  overflow-x: auto;
+}
+
+.markdown-content :deep(pre code) {
+  display: block;
+  padding: 0.75rem 1rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  font-family: 'SF Mono', 'Consolas', 'Monaco', 'Courier New', monospace;
+}
+
+.markdown-content :deep(code:not(pre code)) {
+  background-color: var(--bg-tertiary);
+  padding: 0.125rem 0.375rem;
+  border-radius: 3px;
+  font-size: 0.85em;
+  font-family: 'SF Mono', 'Consolas', 'Monaco', 'Courier New', monospace;
+}
+
+.markdown-content :deep(ul),
+.markdown-content :deep(ol) {
+  margin: 0.5em 0;
+  padding-left: 1.5em;
+}
+
+.markdown-content :deep(li) {
+  margin-bottom: 0.25em;
+}
+
+.markdown-content :deep(h1),
+.markdown-content :deep(h2),
+.markdown-content :deep(h3),
+.markdown-content :deep(h4) {
+  margin: 0.75em 0 0.25em;
+  font-weight: 600;
+}
+
+.markdown-content :deep(h1) { font-size: 1.25em; }
+.markdown-content :deep(h2) { font-size: 1.125em; }
+.markdown-content :deep(h3) { font-size: 1em; }
+
+.markdown-content :deep(blockquote) {
+  border-left: 3px solid var(--accent-color);
+  padding-left: 0.75em;
+  margin: 0.5em 0;
+  opacity: 0.85;
+}
+
+.markdown-content :deep(table) {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  width: 100%;
+}
+
+.markdown-content :deep(th),
+.markdown-content :deep(td) {
+  border: 1px solid var(--border-color);
+  padding: 0.375rem 0.625rem;
+  font-size: 0.875rem;
+}
+
+.markdown-content :deep(th) {
+  background-color: var(--bg-tertiary);
+  font-weight: 600;
+}
+
+.markdown-content :deep(a) {
+  color: var(--accent-color);
+  text-decoration: none;
+}
+
+.markdown-content :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.markdown-content :deep(hr) {
+  border: none;
+  border-top: 1px solid var(--border-color);
+  margin: 0.75em 0;
 }
 
 .chat-input {
@@ -669,17 +1053,17 @@ button:disabled {
   gap: 0.625rem;
   padding: 0.75rem;
   margin-bottom: 1rem;
-  background-color: #fef2f2;
-  border: 1px solid #fecaca;
+  background-color: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.2);
   border-radius: var(--radius-md);
-  color: #dc2626;
+  color: #ef4444;
   font-size: 0.875rem;
 }
 
 .error-icon {
   font-size: 1.25rem;
   flex-shrink: 0;
-  color: #dc2626;
+  color: #ef4444;
 }
 
 .modal-actions {
@@ -727,6 +1111,7 @@ button:disabled {
   display: flex;
   justify-content: flex-start;
   margin-bottom: 1rem;
+  padding-left: 42px;
 }
 
 .typing-dots {

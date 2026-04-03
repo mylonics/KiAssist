@@ -2,6 +2,7 @@
 
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import webview
@@ -31,6 +32,11 @@ class KiAssistAPI:
         self.api_key_store = ApiKeyStore()
         self.gemini_api: Optional[GeminiAPI] = None
         self.recent_projects_store = RecentProjectsStore()
+        # Streaming state
+        self._stream_lock = threading.Lock()
+        self._stream_buffer = ""
+        self._stream_done = True
+        self._stream_error = None
     
     def echo_message(self, message: str) -> str:
         """Echo a message (for testing).
@@ -129,6 +135,51 @@ class KiAssistAPI:
             
         except Exception as e:
             return {"success": False, "error": f"Gemini API error: {str(e)}"}
+    
+    def start_stream_message(self, message: str, model: str = "3-flash") -> dict:
+        """Start streaming a message from Gemini API in a background thread."""
+        try:
+            api_key = self.api_key_store.get_api_key()
+            if not api_key:
+                return {"success": False, "error": "API key not configured"}
+            
+            if not self.gemini_api:
+                self.gemini_api = GeminiAPI(api_key)
+            
+            with self._stream_lock:
+                self._stream_buffer = ""
+                self._stream_done = False
+                self._stream_error = None
+            
+            def _run_stream():
+                try:
+                    for chunk in self.gemini_api.send_message_stream(message, model):
+                        with self._stream_lock:
+                            self._stream_buffer += chunk
+                except Exception as e:
+                    with self._stream_lock:
+                        self._stream_error = str(e)
+                finally:
+                    with self._stream_lock:
+                        self._stream_done = True
+            
+            thread = threading.Thread(target=_run_stream, daemon=True)
+            thread.start()
+            
+            return {"success": True}
+            
+        except Exception as e:
+            return {"success": False, "error": f"Stream error: {str(e)}"}
+    
+    def poll_stream(self) -> dict:
+        """Poll for new streaming content."""
+        with self._stream_lock:
+            return {
+                "success": True,
+                "text": self._stream_buffer,
+                "done": self._stream_done,
+                "error": self._stream_error
+            }
     
     def get_recent_projects(self) -> List[Dict[str, Any]]:
         """Get list of recently opened projects.
@@ -490,8 +541,9 @@ def create_window(api: KiAssistAPI, dev_mode: bool = False):
             "KiAssist (Dev)",
             url,
             js_api=api,
-            width=800,
-            height=600,
+            width=1100,
+            height=750,
+            min_size=(800, 500),
         )
         return
 
@@ -521,8 +573,9 @@ def create_window(api: KiAssistAPI, dev_mode: bool = False):
             "KiAssist",
             html=html,
             js_api=api,
-            width=800,
-            height=600,
+            width=1100,
+            height=750,
+            min_size=(800, 500),
         )
         return
     
@@ -531,8 +584,9 @@ def create_window(api: KiAssistAPI, dev_mode: bool = False):
         "KiAssist",
         url,
         js_api=api,
-        width=800,
-        height=600,
+        width=1100,
+        height=750,
+        min_size=(800, 500),
     )
 
 

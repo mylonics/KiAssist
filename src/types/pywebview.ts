@@ -8,12 +8,16 @@ export interface KiCadInstance {
   project_path: string;
   pcb_path: string;
   schematic_path: string;
+  pcb_open: boolean;
+  schematic_open: boolean;
 }
 
 export interface RecentProject {
   path: string;
   name: string;
   last_opened: string;
+  pcb_path?: string;
+  schematic_path?: string;
 }
 
 export interface ApiResult {
@@ -25,6 +29,11 @@ export interface ApiResult {
 
 export interface SendMessageResult extends ApiResult {
   response?: string;
+}
+
+export interface StreamPollResult extends ApiResult {
+  text?: string;
+  done?: boolean;
 }
 
 export interface ProjectValidationResult extends ApiResult {
@@ -91,6 +100,10 @@ export interface PyWebViewAPI {
   get_api_key: () => Promise<string | null>;
   set_api_key: (apiKey: string) => Promise<ApiResult>;
   send_message: (message: string, model: string) => Promise<SendMessageResult>;
+  // Streaming API
+  start_stream_message: (message: string, model: string) => Promise<ApiResult>;
+  poll_stream: () => Promise<StreamPollResult>;
+  // Project API
   get_recent_projects: () => Promise<RecentProject[]>;
   add_recent_project: (projectPath: string) => Promise<ApiResult>;
   remove_recent_project: (projectPath: string) => Promise<ApiResult>;

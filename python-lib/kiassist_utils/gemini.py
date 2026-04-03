@@ -2,7 +2,7 @@
 
 from google import genai
 from google.genai import errors
-from typing import Optional
+from typing import Optional, Generator
 
 
 class GeminiAPI:
@@ -47,6 +47,28 @@ class GeminiAPI:
             )
             return response.text
             
+        except errors.APIError as e:
+            raise Exception(f"Gemini API error: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Unexpected error: {str(e)}")
+
+    def send_message_stream(self, message: str, model: str = "3-flash"):
+        """Send a message to Gemini and stream the response.
+        
+        Yields:
+            Chunks of text as they arrive from Gemini
+        """
+        model_id = self.MODEL_MAP.get(model, "gemini-3-flash-preview")
+        
+        try:
+            response = self.client.models.generate_content_stream(
+                model=model_id,
+                contents=message
+            )
+            for chunk in response:
+                if chunk.text:
+                    yield chunk.text
+                    
         except errors.APIError as e:
             raise Exception(f"Gemini API error: {str(e)}")
         except Exception as e:

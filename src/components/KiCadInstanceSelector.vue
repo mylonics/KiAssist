@@ -5,8 +5,7 @@ import RequirementsWizard from './RequirementsWizard.vue';
 
 // Configuration
 const MAX_VISIBLE_RECENT = 5;
-const REFRESH_INTERVAL_MS = 1000; // 3 seconds
-const MESSAGE_DISPLAY_DURATION_MS = 5000; // 5 seconds for success messages
+const REFRESH_INTERVAL_MS = 3000; // 3 seconds
 
 const openProjects = ref<KiCadInstance[]>([]);
 const recentProjects = ref<RecentProject[]>([]);
@@ -21,25 +20,27 @@ let refreshTimer: number | null = null;
 const showRequirementsWizard = ref(false);
 const requirementsExists = ref(false);
 const todoExists = ref(false);
-
-// Inject test state
-const injectingTest = ref(false);
-const injectTestMessage = ref<string>('');
+let refreshInFlight = false;
 
 // Refs for click-outside detection
 const switcherRef = ref<HTMLElement | null>(null);
 
 async function waitForAPI(maxAttempts = 20, delayMs = 100): Promise<boolean> {
-  for (let i = 0; i < maxAttempts; i++) {
-    if (window.pywebview?.api) {
-      return true;
-    }
-    await new Promise(resolve => setTimeout(resolve, delayMs));
-  }
-  return false;
+  if (window.pywebview?.api) return true;
+  return new Promise((resolve) => {
+    const onReady = () => resolve(!!window.pywebview?.api);
+    window.addEventListener('pywebviewready', onReady, { once: true });
+    // Fallback timeout in case the event was already fired before we listened
+    setTimeout(() => {
+      window.removeEventListener('pywebviewready', onReady);
+      resolve(!!window.pywebview?.api);
+    }, maxAttempts * delayMs);
+  });
 }
 
 async function refreshProjectsList() {
+  if (refreshInFlight) return; // Skip if a previous call is still in-flight
+  refreshInFlight = true;
   loading.value = true;
   error.value = '';
   
@@ -87,10 +88,17 @@ async function refreshProjectsList() {
       error.value = result.error || 'Failed to get projects list';
     }
   } catch (err) {
-    error.value = `Error getting projects: ${err}`;
-    console.error('Error getting projects:', err);
+    // Ignore stale callback errors from pywebview (e.g. during HMR reload)
+    const errStr = String(err);
+    if (errStr.includes('_returnValuesCallbacks')) {
+      console.warn('[KiCadInstanceSelector] Stale pywebview callback (likely HMR reload), ignoring.');
+    } else {
+      error.value = `Error getting projects: ${err}`;
+      console.error('Error getting projects:', err);
+    }
   } finally {
     loading.value = false;
+    refreshInFlight = false;
   }
 }
 
@@ -284,44 +292,6 @@ function onRequirementsSaved(files: string[]) {
   checkRequirementsFile();
 }
 
-// Inject test note function
-async function injectTestNote() {
-  if (!selectedProjectInfo.value?.projectPath) {
-    error.value = 'No project selected. Please select a KiCad project first.';
-    return;
-  }
-  
-  injectingTest.value = true;
-  injectTestMessage.value = '';
-  error.value = '';
-  
-  try {
-    const apiAvailable = await waitForAPI();
-    if (!apiAvailable) {
-      error.value = 'pywebview API not available';
-      return;
-    }
-    
-    const result = await window.pywebview!.api.inject_schematic_test_note(
-      selectedProjectInfo.value.projectPath
-    );
-    
-    if (result.success) {
-      injectTestMessage.value = result.message || 'Test note injected successfully!';
-      setTimeout(() => {
-        injectTestMessage.value = '';
-      }, MESSAGE_DISPLAY_DURATION_MS);
-    } else {
-      error.value = result.error || 'Failed to inject test note';
-    }
-  } catch (err) {
-    error.value = `Error injecting test note: ${err}`;
-    console.error('Error injecting test note:', err);
-  } finally {
-    injectingTest.value = false;
-  }
-}
-
 // Watch for project changes to update requirements status
 watch(selectedProject, () => {
   checkRequirementsFile();
@@ -456,25 +426,6 @@ onUnmounted(() => {
       </button>
     </div>
 
-    <!-- Inject Test Section -->
-    <div v-if="selectedProjectInfo" class="inject-test-section">
-      <button 
-        @click="injectTestNote" 
-        class="inject-test-btn"
-        :disabled="injectingTest || !selectedProjectInfo.projectPath"
-        title="Add a test note to the schematic"
-      >
-        <span class="material-icons" :class="{ spinning: injectingTest }">
-          {{ injectingTest ? 'sync' : 'science' }}
-        </span>
-        {{ injectingTest ? 'Injecting...' : 'Inject Test' }}
-      </button>
-      <div v-if="injectTestMessage" class="inject-test-message success">
-        <span class="material-icons">check_circle</span>
-        {{ injectTestMessage }}
-      </div>
-    </div>
-    
     <!-- Requirements Wizard Modal -->
     <RequirementsWizard
       :project-dir="selectedProjectDir"
@@ -488,81 +439,155 @@ onUnmounted(() => {
 
 <style scoped>
 .kicad-selector {
-  padding: 1rem;
+  padding: 0.75rem;
   height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  gap: 0.5rem;
 }
 
-.selector-header {
+/* ── Project Switcher ── */
+.switcher-wrapper {
+  position: relative;
+}
+
+.switcher-btn {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  margin-bottom: 1rem;
-  padding-bottom: 0.75rem;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.selector-header h3 {
-  margin: 0;
-  font-size: 0.9375rem;
-  font-weight: 600;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0.5rem 0.625rem;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  cursor: pointer;
   color: var(--text-primary);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  transition: all 0.15s ease;
 }
 
-.refresh-btn {
-  padding: 0.375rem;
+.switcher-btn:hover {
+  border-color: var(--accent-color);
+}
+
+.switcher-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.switcher-arrow {
+  font-size: 1.25rem;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.switcher-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  z-index: 100;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.dropdown-section {
+  padding: 0.25rem 0;
+}
+
+.dropdown-section + .dropdown-section {
+  border-top: 1px solid var(--border-color);
+}
+
+.dropdown-section-label {
+  padding: 0.25rem 0.625rem;
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.375rem 0.625rem;
   background: transparent;
   border: none;
-  border-radius: var(--radius-sm);
   cursor: pointer;
-  color: var(--text-secondary);
-  transition: all 0.15s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  text-align: left;
+  color: var(--text-primary);
+  font-size: 0.8125rem;
+  transition: background 0.1s ease;
 }
 
-.refresh-btn .material-icons {
-  font-size: 1.375rem;
-}
-
-.refresh-btn .material-icons.spinning {
-  animation: spin 1s linear infinite;
-}
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-.refresh-btn:hover:not(:disabled) {
+.dropdown-item:hover {
   background-color: var(--bg-tertiary);
+}
+
+.dropdown-item-icon {
+  font-size: 1rem;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.dropdown-item-icon.open {
+  color: #22c55e;
+}
+
+.dropdown-item-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.dropdown-item.show-more {
+  color: var(--accent-color);
+  font-size: 0.75rem;
+}
+
+.dropdown-item.browse {
   color: var(--accent-color);
 }
 
-.refresh-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
+.dropdown-browse {
+  border-top: 1px solid var(--border-color);
 }
 
+.dropdown-empty {
+  padding: 0.5rem 0.625rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+/* ── Error ── */
 .error-message {
   display: flex;
   align-items: flex-start;
-  gap: 0.5rem;
-  padding: 0.75rem;
-  background-color: #fef2f2;
-  border: 1px solid #fecaca;
-  border-radius: var(--radius-md);
-  color: #dc2626;
-  font-size: 0.8125rem;
+  gap: 0.375rem;
+  padding: 0.5rem;
+  background-color: rgba(220, 38, 38, 0.08);
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  border-radius: var(--radius-sm);
+  color: #ef4444;
+  font-size: 0.75rem;
 }
 
 .error-icon {
-  font-size: 1.25rem;
+  font-size: 1rem;
   flex-shrink: 0;
-  color: #dc2626;
 }
 
 .error-text {
@@ -571,281 +596,110 @@ onUnmounted(() => {
 }
 
 .copy-btn {
-  padding: 0.25rem;
-  background-color: rgba(220, 38, 38, 0.1);
-  border: 1px solid rgba(220, 38, 38, 0.2);
-  border-radius: var(--radius-sm);
+  padding: 0.125rem;
+  background: transparent;
+  border: none;
   cursor: pointer;
-  flex-shrink: 0;
   color: #dc2626;
-  transition: background 0.15s ease;
   display: flex;
   align-items: center;
-  justify-content: center;
 }
 
 .copy-btn .material-icons {
-  font-size: 1rem;
+  font-size: 0.875rem;
 }
 
-.copy-btn:hover {
-  background-color: rgba(220, 38, 38, 0.15);
-}
-
-.projects-container {
-  flex: 1;
-  overflow-y: auto;
+/* ── Status Panel (Project / PCB / Schematic) ── */
+.status-panel {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-}
-
-.section {
-  display: flex;
-  flex-direction: column;
-}
-
-.section-header {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  padding: 0.375rem 0;
-  color: var(--text-secondary);
-  font-size: 0.75rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-.section-icon {
-  font-size: 1rem;
-}
-
-.project-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.project-item {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  padding: 0.5rem 0.625rem;
-  background: transparent;
-  border: 1px solid transparent;
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  cursor: pointer;
-  text-align: left;
-  transition: all 0.15s ease;
-  width: 100%;
-}
-
-.project-item:hover {
-  background-color: var(--bg-tertiary);
-  border-color: var(--border-color);
-}
-
-.project-item.selected {
-  background: linear-gradient(135deg, rgba(88, 101, 242, 0.08) 0%, rgba(71, 82, 196, 0.08) 100%);
-  border-color: var(--accent-color);
-}
-
-.status-icon {
-  font-size: 1.125rem;
-  color: var(--text-secondary);
-  flex-shrink: 0;
-}
-
-.status-icon.open {
-  color: #22c55e;
-}
-
-.project-info {
-  flex: 1;
-  min-width: 0;
   overflow: hidden;
 }
 
-.project-name {
-  font-weight: 500;
-  font-size: 0.8125rem;
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.625rem;
+  cursor: default;
+}
+
+.status-row + .status-row {
+  border-top: 1px solid var(--border-color);
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background-color: var(--text-secondary);
+  opacity: 0.35;
+  transition: all 0.2s ease;
+}
+
+.status-dot.active {
+  background-color: #22c55e;
+  opacity: 1;
+  box-shadow: 0 0 4px rgba(34, 197, 94, 0.4);
+}
+
+.status-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-secondary);
+  width: 62px;
+  flex-shrink: 0;
+}
+
+.status-value {
+  font-size: 0.75rem;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
+  font-family: 'SF Mono', 'Consolas', 'Monaco', 'Courier New', monospace;
 }
 
-.project-path {
-  font-size: 0.6875rem;
-  color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-top: 0.125rem;
-}
-
-.show-more-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  padding: 0.375rem;
-  background: transparent;
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  color: var(--accent-color);
-  font-size: 0.75rem;
-  font-weight: 500;
-  transition: background 0.15s ease;
-}
-
-.show-more-btn:hover {
-  background-color: var(--bg-tertiary);
-}
-
-.show-more-btn .material-icons {
-  font-size: 1.125rem;
-}
-
-.no-projects {
+/* ── No project ── */
+.no-project {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: 1.5rem;
+  padding: 1.25rem 0.5rem;
   color: var(--text-secondary);
   text-align: center;
 }
 
-.no-projects .material-icons {
-  font-size: 2.5rem;
-  margin-bottom: 0.75rem;
-  opacity: 0.5;
+.no-project .material-icons {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+  opacity: 0.4;
 }
 
-.no-projects p {
+.no-project p {
   margin: 0;
-  font-size: 0.875rem;
-}
-
-.no-projects .hint {
-  font-size: 0.75rem;
-  margin-top: 0.25rem;
-  opacity: 0.8;
-}
-
-.browse-section {
-  margin-top: auto;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border-color);
-}
-
-.browse-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  width: 100%;
-  padding: 0.625rem;
-  background-color: var(--bg-secondary);
-  border: 1px dashed var(--border-color);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  color: var(--text-primary);
   font-size: 0.8125rem;
-  font-weight: 500;
-  transition: all 0.15s ease;
 }
 
-.browse-btn:hover {
-  background-color: var(--bg-tertiary);
-  border-color: var(--accent-color);
-  color: var(--accent-color);
-}
-
-.browse-btn .material-icons {
-  font-size: 1.125rem;
-}
-
-.selected-info {
-  margin-top: 0.75rem;
-  padding: 0.75rem;
-  background-color: var(--bg-secondary);
-  border-radius: var(--radius-md);
-  border: 1px solid var(--border-color);
-}
-
-.connection-status {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.75rem;
-  font-weight: 500;
-  color: var(--text-secondary);
-  margin-bottom: 0.625rem;
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.connection-status.connected {
-  color: #22c55e;
-}
-
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background-color: var(--text-secondary);
-}
-
-.connection-status.connected .status-dot {
-  background-color: #22c55e;
-  animation: pulse 2s infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-.info-row {
-  display: flex;
-  flex-direction: column;
-  padding: 0.375rem 0;
-}
-
-.info-row:not(:last-child) {
-  border-bottom: 1px solid var(--border-color);
-}
-
-.info-row .label {
-  font-weight: 500;
-  color: var(--text-secondary);
+.no-project .hint {
   font-size: 0.6875rem;
-  margin-bottom: 0.125rem;
-  text-transform: uppercase;
-  letter-spacing: 0.025em;
+  margin-top: 0.125rem;
+  opacity: 0.7;
 }
 
-.info-row .value {
-  color: var(--text-primary);
-  font-weight: 400;
-  word-break: break-all;
-  font-size: 0.75rem;
-  font-family: 'SF Mono', 'Consolas', 'Monaco', 'Courier New', monospace;
-  line-height: 1.4;
-}
-
-/* Requirements Section */
+/* ── Requirements Section ── */
 .requirements-section {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border-color);
+  padding: 0.375rem 0;
 }
 
 .requirements-status {
@@ -856,12 +710,12 @@ onUnmounted(() => {
   color: var(--text-secondary);
 }
 
-.requirements-status .status-icon {
-  font-size: 1rem;
+.requirements-status .req-icon {
+  font-size: 0.875rem;
   color: #f59e0b;
 }
 
-.requirements-status.exists .status-icon {
+.requirements-status.exists .req-icon {
   color: #22c55e;
 }
 
@@ -873,12 +727,12 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 0.25rem;
-  padding: 0.375rem 0.625rem;
+  padding: 0.25rem 0.5rem;
   background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
   color: white;
   border: none;
   border-radius: var(--radius-sm);
-  font-size: 0.75rem;
+  font-size: 0.6875rem;
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s ease;
@@ -890,72 +744,8 @@ onUnmounted(() => {
 }
 
 .requirements-btn .material-icons {
-  font-size: 0.875rem;
-}
-
-/* Inject Test Section */
-.inject-test-section {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--border-color);
-}
-
-.inject-test-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  width: 100%;
-  padding: 0.625rem;
-  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-  color: white;
-  border: none;
-  border-radius: var(--radius-md);
   font-size: 0.8125rem;
-  font-weight: 500;
-  cursor: pointer;
-  transition: all 0.15s ease;
 }
 
-.inject-test-btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-sm);
-}
 
-.inject-test-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  transform: none;
-}
-
-.inject-test-btn .material-icons {
-  font-size: 1.125rem;
-}
-
-.inject-test-btn .material-icons.spinning {
-  animation: spin 1s linear infinite;
-}
-
-.inject-test-message {
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-  padding: 0.5rem 0.625rem;
-  border-radius: var(--radius-sm);
-  font-size: 0.75rem;
-  font-weight: 500;
-}
-
-.inject-test-message.success {
-  background-color: rgba(16, 185, 129, 0.1);
-  color: #10b981;
-  border: 1px solid rgba(16, 185, 129, 0.2);
-}
-
-.inject-test-message .material-icons {
-  font-size: 1rem;
-}
 </style>
