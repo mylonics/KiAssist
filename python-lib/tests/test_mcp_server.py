@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Any, Dict
 
@@ -630,24 +629,28 @@ class TestProjectGetContext:
         assert len(result["data"]["design_rule_files"]) == 1
         assert result["data"]["design_rules"][0]["content"] == "(rules (version 1))"
 
-    def test_unreadable_design_rule_file(self, tmp_path: Path):
+    def test_unreadable_design_rule_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
         """Error handling: unreadable .kicad_dru produces empty content string."""
-        import stat
-
         dru = tmp_path / "unreadable.kicad_dru"
         dru.write_text("(rules)", encoding="utf-8")
-        # Remove read permission so Path.read_text() fails
-        dru.chmod(0o000)
-        try:
-            result = _call("project_get_context", project_path=str(tmp_path))
-            assert result["status"] == "ok"
-            # The file path is still listed
-            assert len(result["data"]["design_rule_files"]) == 1
-            # Content falls back to empty string on read error
-            assert result["data"]["design_rules"][0]["content"] == ""
-        finally:
-            # Restore permission so tmp_path cleanup works
-            dru.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+        original_read_text = Path.read_text
+
+        def _mock_read_text(self: Path, *args, **kwargs):
+            if self == dru:
+                raise PermissionError("simulated read failure")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _mock_read_text)
+
+        result = _call("project_get_context", project_path=str(tmp_path))
+        assert result["status"] == "ok"
+        # The file path is still listed
+        assert len(result["data"]["design_rule_files"]) == 1
+        # Content falls back to empty string on read error
+        assert result["data"]["design_rules"][0]["content"] == ""
 
     def test_not_found(self):
         result = _call("project_get_context", project_path="/totally/fake/path")
@@ -886,6 +889,21 @@ class TestPCBTracks:
         after = len(_call("pcb_list_tracks", path=str(tmp_pcb))["data"])
         assert after == before + 1
 
+    def test_add_track_numeric_net_string(self, tmp_pcb: Path):
+        """Numeric net string (e.g. '1') should be treated as a net number, not a name."""
+        result = _call(
+            "pcb_add_track",
+            path=str(tmp_pcb),
+            x1=50.0,
+            y1=50.0,
+            x2=60.0,
+            y2=50.0,
+            layer="F.Cu",
+            net="1",  # numeric string — must resolve to net number 1
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["net"] == 1
+
     def test_list_not_found(self):
         result = _call("pcb_list_tracks", path="/no/such/file.kicad_pcb")
         assert result["status"] == "error"
@@ -913,6 +931,18 @@ class TestPCBVias:
         assert result["data"]["added"] is True
         after = len(_call("pcb_list_vias", path=str(tmp_pcb))["data"])
         assert after == before + 1
+
+    def test_add_via_numeric_net_string(self, tmp_pcb: Path):
+        """Numeric net string (e.g. '2') should be treated as a net number, not a name."""
+        result = _call(
+            "pcb_add_via",
+            path=str(tmp_pcb),
+            x=70.0,
+            y=70.0,
+            net="2",  # numeric string — must resolve to net number 2
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["net"] == 2
 
     def test_list_not_found(self):
         result = _call("pcb_list_vias", path="/no/such/file.kicad_pcb")

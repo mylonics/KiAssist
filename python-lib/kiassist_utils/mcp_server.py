@@ -22,6 +22,8 @@ import math
 import os
 import platform
 import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,28 +75,38 @@ def _pos_dict(pos: Position) -> Dict[str, float]:
 
 
 def _safe_save(obj: Any, path: str | os.PathLike) -> None:
-    """Save *obj* to *path* atomically, creating a ``.bak`` backup first.
+    """Save *obj* to *path* with a ``.bak`` backup and an atomic rename.
 
     The sequence is:
     1. If *path* already exists, copy it to ``<path>.bak`` (backup).
-    2. Call ``obj.save(path)`` to write the new content.
+    2. Write the new content to a sibling temporary file in the same directory.
+    3. Atomically replace *path* with the temp file via ``os.replace()``.
 
-    This preserves the original file if the save raises an exception, and
-    leaves a ``.bak`` beside the file so the user can recover the previous
-    version manually.  If the save itself fails the original is untouched
-    because we only copy to ``.bak`` *before* writing.
+    Because the write goes to a temp file first, the original is never
+    truncated: if the write raises the destination is untouched and the
+    ``.bak`` copy is available for manual recovery.
 
     Args:
         obj:  Object with a ``save(path)`` method (Schematic, SymbolLibrary, …).
         path: Destination file path.
 
     Raises:
-        Any exception raised by ``obj.save(path)`` is re-raised unchanged.
+        Any exception raised by ``obj.save()`` or ``os.replace()`` is re-raised.
     """
     dest = Path(path)
     if dest.exists():
         shutil.copy2(dest, str(dest) + ".bak")
-    obj.save(path)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
+    try:
+        os.close(tmp_fd)
+        obj.save(tmp_path)
+        os.replace(tmp_path, str(dest))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 # ===========================================================================
 # 2.2  Schematic Tools
@@ -1414,14 +1426,25 @@ def kicad_save_schematic(window_title_hint: str = "") -> Dict[str, Any]:
             # Try xdotool on Linux, osascript on macOS
             if system == "Linux":
                 if shutil.which("xdotool"):
-                    os.system("xdotool key --clearmodifiers ctrl+s")
+                    result = subprocess.run(
+                        ["xdotool", "key", "--clearmodifiers", "ctrl+s"],
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        return _err(f"xdotool exited with code {result.returncode}")
                     return _ok({"triggered": True, "method": "xdotool"})
                 return _err("xdotool not found; install xdotool for keyboard automation")
             else:
-                os.system(
-                    "osascript -e 'tell application \"System Events\" "
-                    'to keystroke "s" using command down\''
+                result = subprocess.run(
+                    [
+                        "osascript",
+                        "-e",
+                        'tell application "System Events" to keystroke "s" using command down',
+                    ],
+                    check=False,
                 )
+                if result.returncode != 0:
+                    return _err(f"osascript exited with code {result.returncode}")
                 return _ok({"triggered": True, "method": "osascript"})
         else:
             return _err(f"Keyboard automation not supported on platform: {system}")
@@ -1919,7 +1942,10 @@ def pcb_add_track(
         x2, y2: End coordinate in mm.
         layer:  Copper layer name (e.g. ``"F.Cu"``).
         width:  Track width in mm.
-        net:    Net name string (resolved to number) or ``""`` for unconnected.
+        net:    Net name string, numeric string (``"1"``), or ``""`` for
+                unconnected.  Digit-only strings are converted to net numbers
+                so that passing ``"1"`` resolves to net number 1, not a
+                search for a net *named* ``"1"``.
 
     Returns:
         ``{"added": true, "net": <net_number>}`` on success.
@@ -1931,7 +1957,10 @@ def pcb_add_track(
     except Exception as exc:  # noqa: BLE001
         return _err(str(exc))
 
-    track = board.add_track(x1, y1, x2, y2, layer, width, net if net else 0)
+    # Resolve net: digit-only strings are treated as net numbers so that
+    # passing "1" reaches net number 1, not a net named "1".
+    net_arg: int | str = int(net) if net and net.isdigit() else (net or 0)
+    track = board.add_track(x1, y1, x2, y2, layer, width, net_arg)
     try:
         _safe_save(board, path)
     except Exception as exc:  # noqa: BLE001
@@ -1993,8 +2022,10 @@ def pcb_add_via(
     Args:
         path:       Path to a ``.kicad_pcb`` file (modified in-place).
         x, y:       Via centre position in mm.
-        net:        Net name string (resolved to number) or ``""`` for
-                    unconnected.
+        net:        Net name string, numeric string (``"1"``), or ``""`` for
+                    unconnected.  Digit-only strings are converted to net
+                    numbers so that passing ``"1"`` resolves to net number 1,
+                    not a search for a net *named* ``"1"``.
         drill:      Drill diameter in mm (default 0.8).
         size:       Pad diameter in mm (default 1.6).
         layer_from: Top copper layer (default ``"F.Cu"``).
@@ -2010,7 +2041,10 @@ def pcb_add_via(
     except Exception as exc:  # noqa: BLE001
         return _err(str(exc))
 
-    via = board.add_via(x, y, net if net else 0, drill, size, layer_from, layer_to)
+    # Resolve net: digit-only strings are treated as net numbers so that
+    # passing "1" reaches net number 1, not a net named "1".
+    net_arg: int | str = int(net) if net and net.isdigit() else (net or 0)
+    via = board.add_via(x, y, net_arg, drill, size, layer_from, layer_to)
     try:
         _safe_save(board, path)
     except Exception as exc:  # noqa: BLE001
@@ -2181,7 +2215,8 @@ async def in_process_call(tool_name: str, args: Dict[str, Any]) -> Any:
         KeyError: If *tool_name* is not registered.
     """
     # Provide a clear error message when the requested tool does not exist.
-    registered = {t.name for t in mcp._tool_manager.list_tools()}
+    # Use the public mcp.list_tools() API instead of the private _tool_manager.
+    registered = {t.name for t in await mcp.list_tools()}
     if tool_name not in registered:
         raise KeyError(
             f"MCP tool '{tool_name}' is not registered.  "
