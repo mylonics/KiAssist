@@ -39,6 +39,10 @@ dev = [
     "pytest>=7.0.0",
     "pyinstaller>=6.0.0",
 ]
+ai = [
+    "anthropic>=0.30.0",
+    "openai>=1.30.0",
+]
 
 [project.scripts]
 kiassist = "kiassist_utils.main:main"
