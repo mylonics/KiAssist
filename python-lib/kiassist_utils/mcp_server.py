@@ -1609,6 +1609,13 @@ async def in_process_call(tool_name: str, args: Dict[str, Any]) -> Any:
     Raises:
         KeyError: If *tool_name* is not registered.
     """
+    # Provide a clear error message when the requested tool does not exist.
+    registered = {t.name for t in mcp._tool_manager.list_tools()}
+    if tool_name not in registered:
+        raise KeyError(
+            f"MCP tool '{tool_name}' is not registered.  "
+            f"Available tools: {sorted(registered)}"
+        )
     raw = await mcp.call_tool(tool_name, args)
     # FastMCP 1.x returns a (list[ContentBlock], structured_result) tuple.
     # The structured_result dict contains a ``result`` key with the actual

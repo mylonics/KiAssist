@@ -54,6 +54,17 @@ def tmp_fp(tmp_path: Path) -> Path:
 
 
 # ===========================================================================
+# in_process_call helper
+# ===========================================================================
+
+
+class TestInProcessCall:
+    def test_unknown_tool_raises_key_error(self):
+        with pytest.raises(KeyError, match="not registered"):
+            asyncio.run(in_process_call("this_tool_does_not_exist", {}))
+
+
+# ===========================================================================
 # Schematic tools
 # ===========================================================================
 
