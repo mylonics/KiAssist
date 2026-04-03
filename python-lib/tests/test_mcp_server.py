@@ -623,6 +623,25 @@ class TestProjectGetContext:
         assert len(result["data"]["design_rule_files"]) == 1
         assert result["data"]["design_rules"][0]["content"] == "(rules (version 1))"
 
+    def test_unreadable_design_rule_file(self, tmp_path: Path):
+        """Error handling: unreadable .kicad_dru produces empty content string."""
+        import stat
+
+        dru = tmp_path / "unreadable.kicad_dru"
+        dru.write_text("(rules)", encoding="utf-8")
+        # Remove read permission so Path.read_text() fails
+        dru.chmod(0o000)
+        try:
+            result = _call("project_get_context", project_path=str(tmp_path))
+            assert result["status"] == "ok"
+            # The file path is still listed
+            assert len(result["data"]["design_rule_files"]) == 1
+            # Content falls back to empty string on read error
+            assert result["data"]["design_rules"][0]["content"] == ""
+        finally:
+            # Restore permission so tmp_path cleanup works
+            dru.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
     def test_not_found(self):
         result = _call("project_get_context", project_path="/totally/fake/path")
         assert result["status"] == "error"
