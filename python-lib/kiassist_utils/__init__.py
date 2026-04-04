@@ -10,7 +10,18 @@ from .api_key import ApiKeyStore
 from .gemini import GeminiAPI
 from .kicad_ipc import detect_kicad_instances, KiCadInstance, get_open_project_paths, is_project_open
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path
-from .main import KiAssistAPI, main
+
+
+def __getattr__(name: str):
+    """Lazy-load main module symbols to avoid importing kiassist_utils.main
+    at package init time.  When the package is invoked via
+    ``python -m kiassist_utils.main``, an eager import causes a
+    RuntimeWarning because the module appears in sys.modules before it is
+    executed as ``__main__``."""
+    if name in ("KiAssistAPI", "main"):
+        from . import main as _main_mod  # noqa: F811
+        return getattr(_main_mod, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ApiKeyStore",

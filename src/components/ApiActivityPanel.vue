@@ -99,6 +99,18 @@ function formatTime(d: Date): string {
 // Expose addEntry for parent components
 defineExpose({ addEntry, clearEntries });
 
+const copiedField = ref<string | null>(null);
+
+async function copyContent(entryId: string, field: 'request' | 'response', content: string) {
+  try {
+    await navigator.clipboard.writeText(content);
+    copiedField.value = `${entryId}-${field}`;
+    setTimeout(() => { copiedField.value = null; }, 2000);
+  } catch (e) {
+    console.error('Failed to copy:', e);
+  }
+}
+
 watch(() => entries.value.length, () => {
   scrollToBottom();
 });
@@ -172,11 +184,21 @@ watch(() => entries.value.length, () => {
 
         <div v-if="expandedIds.has(entry.id)" class="entry-detail" @click.stop>
           <div class="detail-section">
-            <span class="detail-label">Request:</span>
+            <div class="detail-header">
+              <span class="detail-label">Request (full context):</span>
+              <button class="copy-detail-btn" @click="copyContent(entry.id, 'request', entry.requestFull)" :title="copiedField === `${entry.id}-request` ? 'Copied!' : 'Copy request'">
+                <span class="material-icons">{{ copiedField === `${entry.id}-request` ? 'check' : 'content_copy' }}</span>
+              </button>
+            </div>
             <pre class="detail-content">{{ entry.requestFull }}</pre>
           </div>
           <div class="detail-section">
-            <span class="detail-label">Response:</span>
+            <div class="detail-header">
+              <span class="detail-label">Response (full context):</span>
+              <button class="copy-detail-btn" @click="copyContent(entry.id, 'response', entry.responseFull)" :title="copiedField === `${entry.id}-response` ? 'Copied!' : 'Copy response'">
+                <span class="material-icons">{{ copiedField === `${entry.id}-response` ? 'check' : 'content_copy' }}</span>
+              </button>
+            </div>
             <pre class="detail-content">{{ entry.responseFull }}</pre>
           </div>
         </div>
@@ -458,10 +480,39 @@ watch(() => entries.value.length, () => {
   border-radius: var(--radius-sm);
   white-space: pre-wrap;
   word-break: break-all;
-  max-height: 200px;
+  max-height: 600px;
   overflow-y: auto;
   margin: 0;
   line-height: 1.4;
+}
+
+.detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.125rem;
+}
+
+.copy-detail-btn {
+  background: none;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0.0625rem 0.25rem;
+  display: flex;
+  align-items: center;
+  font-size: 0.625rem;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.copy-detail-btn:hover {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.copy-detail-btn .material-icons {
+  font-size: 0.75rem;
 }
 
 .activity-footer {

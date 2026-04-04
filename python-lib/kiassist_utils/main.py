@@ -13,6 +13,7 @@ from .api_key import ApiKeyStore
 from .ai.base import AIProvider, AIMessage
 from .ai.gemini import GeminiProvider
 from .ai.ollama import OllamaProvider
+from .local_llm import LocalModelManager
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path, find_file_in_dir
 from .requirements_wizard import (
@@ -93,6 +94,21 @@ _PROVIDER_REGISTRY: List[Dict[str, Any]] = [
         "key_prefix": "",
         "key_min_length": 0,
     },
+    {
+        "id": "gemma4",
+        "name": "Gemma 4 (Local)",
+        "models": [
+            {"id": "gemma4-e2b-q4_k_m", "name": "Gemma 4 E2B (Q4_K_M)"},
+            {"id": "gemma4-e4b-q4_k_m", "name": "Gemma 4 E4B (Q4_K_M)"},
+            {"id": "gemma4-26b-a4b-q4_k_m", "name": "Gemma 4 26B-A4B (Q4_K_M)"},
+            {"id": "gemma4-31b-q4_k_m", "name": "Gemma 4 31B (Q4_K_M)"},
+        ],
+        "default_model": "gemma4-e2b-q4_k_m",
+        # Gemma 4 runs entirely locally — no API key needed.
+        "key_url": "",
+        "key_prefix": "",
+        "key_min_length": 0,
+    },
 ]
 
 
@@ -103,13 +119,14 @@ class KiAssistAPI:
         """Initialize the backend API."""
         self.api_key_store = ApiKeyStore()
         self.current_provider: Optional[AIProvider] = None
-        self.current_provider_name: str = "gemini"
-        self.current_model: str = "3-flash"
+        self.current_provider_name: str = "gemma4"
+        self.current_model: str = "gemma4-e2b-q4_k_m"
         # Secondary (lightweight/cheap) model used for simple tasks
         self.secondary_provider: Optional[AIProvider] = None
-        self.secondary_provider_name: str = "gemini"
-        self.secondary_model: str = "3.1-flash-lite"
+        self.secondary_provider_name: str = "gemma4"
+        self.secondary_model: str = "gemma4-e2b-q4_k_m"
         self.recent_projects_store = RecentProjectsStore()
+        self._local_model_manager = LocalModelManager()
         self.current_session_id: Optional[str] = None
         self._current_project_path: Optional[str] = None
         # System prompt builder for injecting project/PCB context
@@ -168,6 +185,12 @@ class KiAssistAPI:
                 # frontend can display/edit it.
                 entry["has_key"] = True
                 entry["base_url"] = self._get_local_base_url()
+            elif info["id"] == "gemma4":
+                # Gemma 4 runs locally — no API key needed.
+                entry["has_key"] = True
+                # Include server status so the frontend knows whether the
+                # local inference server is running and which model is loaded.
+                entry["server_status"] = self._local_model_manager.get_server_status()
             else:
                 entry["has_key"] = self.api_key_store.has_api_key(info["id"])
             providers.append(entry)
@@ -224,6 +247,27 @@ class KiAssistAPI:
             except ImportError as exc:
                 raise ImportError(
                     "The 'openai' package is required to use local models. "
+                    "Install it with: pip install openai"
+                ) from exc
+
+        if provider_name == "gemma4":
+            # Gemma 4 uses the local llama-cpp-python server managed by
+            # LocalModelManager.  If the server is running, connect to it;
+            # otherwise auto-start it with the requested model.
+            status = self._local_model_manager.get_server_status()
+            if not status["running"]:
+                start_result = self._local_model_manager.start_server(model)
+                if not start_result.get("success"):
+                    raise RuntimeError(
+                        start_result.get("error", "Failed to start Gemma 4 server.")
+                    )
+                status = self._local_model_manager.get_server_status()
+            base_url = status["url"]
+            try:
+                return OllamaProvider(model=model, base_url=base_url)
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'openai' package is required to use Gemma 4 local models. "
                     "Install it with: pip install openai"
                 ) from exc
 
@@ -546,6 +590,122 @@ class KiAssistAPI:
                 "models": [],
                 "base_url": base_url,
             }
+
+    # ------------------------------------------------------------------
+    # Gemma 4 local model management
+    # ------------------------------------------------------------------
+
+    def get_gemma_models(self) -> Dict[str, Any]:
+        """Return available Gemma 4 model variants with download status.
+
+        Each entry includes ``id``, ``name``, ``size_label``, ``description``,
+        ``downloaded`` (bool), and ``path``.
+
+        Returns:
+            Dictionary with ``models`` list and server status.
+        """
+        try:
+            models = self._local_model_manager.get_available_models()
+            status = self._local_model_manager.get_server_status()
+            return {
+                "success": True,
+                "models": models,
+                "server_status": status,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "models": []}
+
+    def download_gemma_model(self, model_id: str) -> Dict[str, Any]:
+        """Start downloading a Gemma 4 model variant.
+
+        The download runs in the background.  Use :meth:`get_gemma_download_progress`
+        to poll progress.
+
+        Args:
+            model_id: Variant ID (e.g. ``"gemma4-e4b-q4_k_m"``).
+
+        Returns:
+            Result dictionary.
+        """
+        try:
+            return self._local_model_manager.download_model(model_id)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def cancel_gemma_download(self) -> Dict[str, Any]:
+        """Cancel an in-progress Gemma 4 model download.
+
+        Returns:
+            Result dictionary.
+        """
+        return self._local_model_manager.cancel_download()
+
+    def get_gemma_download_progress(self) -> Dict[str, Any]:
+        """Poll the current download progress for Gemma 4 models.
+
+        Returns:
+            Dictionary with ``model_id``, ``percent``, ``downloaded_bytes``,
+            ``total_bytes``, ``speed_bytes_per_sec``, ``eta_seconds``,
+            ``status`` (``idle`` / ``downloading`` / ``completed`` / ``error``
+            / ``cancelled``), and ``error`` string.
+        """
+        return self._local_model_manager.get_download_progress()
+
+    def delete_gemma_model(self, model_id: str) -> Dict[str, Any]:
+        """Delete a downloaded Gemma 4 model file.
+
+        Args:
+            model_id: The variant ID to delete.
+
+        Returns:
+            Result dictionary.
+        """
+        try:
+            return self._local_model_manager.delete_model(model_id)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def start_gemma_server(
+        self,
+        model_id: str,
+        n_ctx: int = 4096,
+        n_gpu_layers: int = -1,
+    ) -> Dict[str, Any]:
+        """Start the local Gemma 4 inference server.
+
+        Launches a ``llama-cpp-python`` server to serve the requested model
+        on ``http://127.0.0.1:{port}/v1``.
+
+        Args:
+            model_id: Variant ID of the downloaded model to serve.
+            n_ctx: Context window size in tokens (default 4096).
+            n_gpu_layers: GPU layers to offload (-1 = all available).
+
+        Returns:
+            Result dictionary with ``url`` on success.
+        """
+        try:
+            return self._local_model_manager.start_server(
+                model_id, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def stop_gemma_server(self) -> Dict[str, Any]:
+        """Stop the local Gemma 4 inference server.
+
+        Returns:
+            Result dictionary.
+        """
+        return self._local_model_manager.stop_server()
+
+    def get_gemma_server_status(self) -> Dict[str, Any]:
+        """Check whether the local Gemma 4 inference server is running.
+
+        Returns:
+            Dictionary with ``running`` (bool), ``url``, ``model_id``, ``port``.
+        """
+        return self._local_model_manager.get_server_status()
 
     # ------------------------------------------------------------------
     # API key management
@@ -1284,7 +1444,7 @@ def main():
     create_window(api, dev_mode=args.dev)
     
     # Start the webview
-    webview.start(debug=True)
+    webview.start(debug=False)
 
 
 if __name__ == "__main__":

@@ -319,7 +319,15 @@ class GeminiProvider(AIProvider):
                 raise Exception(f"Gemini API error: {exc}") from exc
 
         tool_calls = _extract_tool_calls(response)
-        text = response.text or "" if not tool_calls else ""
+        # Only access .text when there are no tool calls to avoid
+        # "non-text parts in the response" warning from the SDK.
+        if tool_calls:
+            text = ""
+        else:
+            try:
+                text = response.text or ""
+            except (ValueError, AttributeError):
+                text = ""
 
         usage: Dict[str, int] = {}
         if hasattr(response, "usage_metadata") and response.usage_metadata:
@@ -383,8 +391,20 @@ class GeminiProvider(AIProvider):
                 ):
                     tool_calls_in_chunk = _extract_tool_calls(chunk)
                     accumulated_tool_calls.extend(tool_calls_in_chunk)
+
+                    # Extract text from parts manually to avoid the
+                    # "non-text parts" warning that .text triggers when
+                    # function_call parts are present.
+                    chunk_text = ""
+                    try:
+                        for part in chunk.candidates[0].content.parts:
+                            if hasattr(part, "text") and part.text:
+                                chunk_text += part.text
+                    except (AttributeError, IndexError):
+                        pass
+
                     yield AIChunk(
-                        text=chunk.text or "",
+                        text=chunk_text,
                         is_final=False,
                     )
                 break  # Success — exit retry loop

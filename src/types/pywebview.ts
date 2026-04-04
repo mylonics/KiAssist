@@ -110,6 +110,8 @@ export interface ProviderInfo {
   has_key: boolean;
   /** Base URL for local model providers (id === 'local') */
   base_url?: string;
+  /** Server status for Gemma 4 provider (id === 'gemma4') */
+  server_status?: GemmaServerStatus;
 }
 
 export interface ModelSelection {
@@ -135,6 +137,49 @@ export interface ProvidersResult extends ApiResult {
 export interface LocalModelsResult extends ApiResult {
   models: ProviderModel[];
   base_url?: string;
+}
+
+// Gemma 4 local model types
+export interface GemmaModelInfo {
+  id: string;
+  name: string;
+  filename: string;
+  size_label: string;
+  size_bytes: number;
+  description: string;
+  context_window: number;
+  release_tag: string;
+  downloaded: boolean;
+  path: string;
+}
+
+export interface GemmaServerStatus {
+  running: boolean;
+  url: string | null;
+  model_id: string | null;
+  port: number;
+}
+
+export interface GemmaModelsResult extends ApiResult {
+  models: GemmaModelInfo[];
+  server_status: GemmaServerStatus;
+}
+
+export interface GemmaDownloadProgress {
+  model_id: string;
+  filename: string;
+  total_bytes: number;
+  downloaded_bytes: number;
+  speed_bytes_per_sec: number;
+  eta_seconds: number;
+  status: 'idle' | 'downloading' | 'completed' | 'error' | 'cancelled';
+  error: string;
+  percent: number;
+}
+
+export interface GemmaServerResult extends ApiResult {
+  url?: string;
+  model_id?: string;
 }
 
 // Session management types
@@ -174,6 +219,15 @@ export interface PyWebViewAPI {
   // Local model management
   get_local_models: () => Promise<LocalModelsResult>;
   set_local_base_url: (baseUrl: string) => Promise<ApiResult>;
+  // Gemma 4 local model management
+  get_gemma_models: () => Promise<GemmaModelsResult>;
+  download_gemma_model: (modelId: string) => Promise<ApiResult>;
+  cancel_gemma_download: () => Promise<ApiResult>;
+  get_gemma_download_progress: () => Promise<GemmaDownloadProgress>;
+  delete_gemma_model: (modelId: string) => Promise<ApiResult>;
+  start_gemma_server: (modelId: string, nCtx?: number, nGpuLayers?: number) => Promise<GemmaServerResult>;
+  stop_gemma_server: () => Promise<ApiResult>;
+  get_gemma_server_status: () => Promise<GemmaServerStatus>;
   // Chat API
   send_message: (message: string, model?: string) => Promise<SendMessageResult>;
   // Streaming API

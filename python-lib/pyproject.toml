@@ -42,6 +42,9 @@ ai = [
     "anthropic>=0.30.0",
     "openai>=1.30.0",
 ]
+local-llm = [
+    "llama-cpp-python[server]>=0.3.0",
+]
 
 [project.scripts]
 kiassist = "kiassist_utils.main:main"

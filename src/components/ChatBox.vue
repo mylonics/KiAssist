@@ -3,7 +3,7 @@ import { ref, computed, onMounted, nextTick, watch } from 'vue';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
 import '../types/pywebview';
-import type { ProviderInfo, SessionInfo, ProviderModel } from '../types/pywebview';
+import type { ProviderInfo, SessionInfo, ProviderModel, GemmaModelInfo, GemmaServerStatus, GemmaDownloadProgress } from '../types/pywebview';
 import type ApiActivityPanel from './ApiActivityPanel.vue';
 import type { ApiActivityEntry } from './ApiActivityPanel.vue';
 
@@ -94,17 +94,17 @@ const copiedMessageId = ref<string | null>(null);
 const copiedChatHistory = ref(false);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
-const selectedProvider = ref('gemini');
-const selectedModel = ref('3-flash');
+const selectedProvider = ref('gemma4');
+const selectedModel = ref('gemma4-e2b-q4_k_m');
 // Quick (lightweight/cheap) model
-const selectedSecondaryProvider = ref('gemini');
-const selectedSecondaryModel = ref('3.1-flash-lite');
+const selectedSecondaryProvider = ref('gemma4');
+const selectedSecondaryModel = ref('gemma4-e2b-q4_k_m');
 const hasApiKey = ref(false);
 const showApiKeyPrompt = ref(false);
 const showSessionsModal = ref(false);
 const apiKeyInput = ref('');
 // Which provider's key is being configured in the settings modal
-const configuringProvider = ref('gemini');
+const configuringProvider = ref('gemma4');
 const isLoading = ref(false);
 const apiKeyWarning = ref<string>('');
 const apiKeyError = ref<string>('');
@@ -117,6 +117,14 @@ const localBaseUrlInput = ref('');
 const localBaseUrlError = ref<string>('');
 const isLoadingLocalModels = ref(false);
 const detectedLocalModels = ref<ProviderModel[]>([]);
+// Gemma 4 local model state
+const gemmaModels = ref<GemmaModelInfo[]>([]);
+const gemmaServerStatus = ref<GemmaServerStatus>({ running: false, url: null, model_id: null, port: 8741 });
+const gemmaDownloadProgress = ref<GemmaDownloadProgress | null>(null);
+const gemmaDownloadPollTimer = ref<ReturnType<typeof setInterval> | null>(null);
+const gemmaError = ref('');
+const isLoadingGemmaModels = ref(false);
+const gemmaModelsLoaded = ref(false);
 
 // Provider list is populated from the backend via get_providers()
 const providers = ref<ProviderInfo[]>([]);
@@ -154,10 +162,25 @@ function generateMessageId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 }
 
-/** Returns the warning suffix for a provider dropdown option. */
+/** Returns a status suffix for a provider dropdown option. */
 function providerWarning(p: ProviderInfo): string {
-  return p.id !== 'local' && !p.has_key ? ' ⚠' : '';
+  if (p.id === 'local') return '';
+  if (p.id === 'gemma4') {
+    if (!gemmaModelsLoaded.value) return '';  // Don't warn until we know
+    return gemmaHasDownloadedModel.value ? '' : ' (no model)';
+  }
+  return p.has_key ? '' : ' (no key)';
 }
+
+/** Whether any Gemma model has been downloaded. */
+const gemmaHasDownloadedModel = computed(() =>
+  gemmaModels.value.some(m => m.downloaded)
+);
+
+/** Whether the Gemma provider is ready (has downloaded model and server running or downloadable). */
+const gemmaReady = computed(() =>
+  gemmaHasDownloadedModel.value
+);
 
 function renderMarkdown(text: string, isUser: boolean = false): string {
   if (!text) return '';
@@ -245,7 +268,7 @@ async function onProviderChange() {
     }
   }
   // Derive hasApiKey from the in-memory providers list (no extra IPC call)
-  hasApiKey.value = selectedProvider.value === 'local'
+  hasApiKey.value = (selectedProvider.value === 'local' || selectedProvider.value === 'gemma4')
     ? true
     : (currentProviderInfo.value?.has_key ?? false);
 }
@@ -346,7 +369,7 @@ async function loadProviders() {
 
       // Derive hasApiKey from the providers list — no extra round-trips needed
       const active = result.providers.find((p: ProviderInfo) => p.id === selectedProvider.value);
-      hasApiKey.value = selectedProvider.value === 'local' ? true : (active?.has_key ?? false);
+      hasApiKey.value = (selectedProvider.value === 'local' || selectedProvider.value === 'gemma4') ? true : (active?.has_key ?? false);
 
       // --- Secondary model ---
       const storedSecondaryProvider = localStorage.getItem(SECONDARY_PROVIDER_KEY);
@@ -375,6 +398,9 @@ async function loadProviders() {
       await trackedApiCall('set_secondary_model', [selectedSecondaryProvider.value, selectedSecondaryModel.value], () =>
         window.pywebview!.api.set_secondary_model(selectedSecondaryProvider.value, selectedSecondaryModel.value)
       );
+
+      // Pre-load Gemma model info so status indicators are accurate from the start
+      loadGemmaModels();
     }
   } catch (e) {
     console.error('[UI] Failed to load providers:', e);
@@ -412,6 +438,10 @@ function openSettings(provider?: string) {
   apiKeyError.value = '';
   apiKeyWarning.value = '';
   showApiKeyPrompt.value = true;
+  // Auto-load Gemma 4 model list when opening settings on that tab
+  if (configuringProvider.value === 'gemma4') {
+    loadGemmaModels();
+  }
 }
 
 function selectProviderForConfig(providerId: string) {
@@ -419,6 +449,10 @@ function selectProviderForConfig(providerId: string) {
   apiKeyInput.value = '';
   apiKeyError.value = '';
   apiKeyWarning.value = '';
+  // Auto-load Gemma 4 model list when switching to that tab
+  if (providerId === 'gemma4') {
+    loadGemmaModels();
+  }
 }
 
 function validateApiKeyFormat(key: string, providerInfo: ProviderInfo): string | null {
@@ -540,6 +574,134 @@ async function detectLocalModels() {
   } finally {
     isLoadingLocalModels.value = false;
   }
+}
+
+// ---- Gemma 4 local model management ----
+
+async function loadGemmaModels() {
+  if (!window.pywebview?.api) return;
+  isLoadingGemmaModels.value = true;
+  try {
+    const result = await trackedApiCall('get_gemma_models', [], () =>
+      window.pywebview!.api.get_gemma_models()
+    );
+    if (result.success) {
+      gemmaModels.value = result.models ?? [];
+      gemmaServerStatus.value = result.server_status;
+    } else {
+      gemmaError.value = result.error || 'Failed to load Gemma models.';
+    }
+  } catch (e) {
+    console.error('[Gemma] Failed to load models:', e);
+    gemmaError.value = `Failed to load Gemma models: ${e instanceof Error ? e.message : String(e)}`;
+  } finally {
+    isLoadingGemmaModels.value = false;
+    gemmaModelsLoaded.value = true;
+  }
+}
+
+async function downloadGemmaModel(modelId: string) {
+  if (!window.pywebview?.api) return;
+  gemmaError.value = '';
+  try {
+    const result = await trackedApiCall('download_gemma_model', [modelId], () =>
+      window.pywebview!.api.download_gemma_model(modelId)
+    );
+    if (!result.success) {
+      gemmaError.value = result.error || 'Download failed.';
+      return;
+    }
+    // Start polling download progress
+    startGemmaDownloadPoll();
+  } catch (e) {
+    gemmaError.value = `Download error: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+function startGemmaDownloadPoll() {
+  stopGemmaDownloadPoll();
+  gemmaDownloadPollTimer.value = setInterval(async () => {
+    if (!window.pywebview?.api) return;
+    try {
+      const progress = await window.pywebview.api.get_gemma_download_progress();
+      gemmaDownloadProgress.value = progress;
+      if (progress.status === 'completed' || progress.status === 'error' || progress.status === 'cancelled' || progress.status === 'idle') {
+        stopGemmaDownloadPoll();
+        if (progress.status === 'completed') {
+          await loadGemmaModels();
+        }
+      }
+    } catch (e) {
+      stopGemmaDownloadPoll();
+    }
+  }, 500);
+}
+
+function stopGemmaDownloadPoll() {
+  if (gemmaDownloadPollTimer.value) {
+    clearInterval(gemmaDownloadPollTimer.value);
+    gemmaDownloadPollTimer.value = null;
+  }
+}
+
+async function cancelGemmaDownload() {
+  if (!window.pywebview?.api) return;
+  await trackedApiCall('cancel_gemma_download', [], () =>
+    window.pywebview!.api.cancel_gemma_download()
+  );
+}
+
+async function deleteGemmaModel(modelId: string) {
+  if (!window.pywebview?.api) return;
+  gemmaError.value = '';
+  const result = await trackedApiCall('delete_gemma_model', [modelId], () =>
+    window.pywebview!.api.delete_gemma_model(modelId)
+  );
+  if (result.success) {
+    await loadGemmaModels();
+  } else {
+    gemmaError.value = result.error || 'Failed to delete model.';
+  }
+}
+
+async function startGemmaServer(modelId: string) {
+  if (!window.pywebview?.api) return;
+  gemmaError.value = '';
+  const result = await trackedApiCall('start_gemma_server', [modelId], () =>
+    window.pywebview!.api.start_gemma_server(modelId)
+  );
+  if (result.success) {
+    gemmaServerStatus.value = { running: true, url: result.url ?? null, model_id: result.model_id ?? modelId, port: 8741 };
+  } else {
+    gemmaError.value = result.error || 'Failed to start server.';
+  }
+}
+
+async function stopGemmaServer() {
+  if (!window.pywebview?.api) return;
+  gemmaError.value = '';
+  const result = await trackedApiCall('stop_gemma_server', [], () =>
+    window.pywebview!.api.stop_gemma_server()
+  );
+  if (result.success) {
+    gemmaServerStatus.value = { running: false, url: null, model_id: null, port: 8741 };
+  } else {
+    gemmaError.value = result.error || 'Failed to stop server.';
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${sizes[i]}`;
+}
+
+function formatEta(seconds: number): string {
+  if (seconds <= 0) return '';
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
 // Streaming send
@@ -689,9 +851,12 @@ function handleKeyPress(event: KeyboardEvent) {
   }
 }
 
-async function copyMessage(messageId: string, text: string) {
+async function copyMessage(messageId: string, text: string, timestamp: Date, sender: 'user' | 'assistant') {
   try {
-    await navigator.clipboard.writeText(text);
+    const timeStr = timestamp.toLocaleString();
+    const senderLabel = sender === 'user' ? 'User' : 'Assistant';
+    const formatted = `[${timeStr}] ${senderLabel}:\n${text}`;
+    await navigator.clipboard.writeText(formatted);
     copiedMessageId.value = messageId;
     setTimeout(() => { copiedMessageId.value = null; }, 2000);
   } catch (error) {
@@ -702,7 +867,7 @@ async function copyMessage(messageId: string, text: string) {
 async function copyChatHistory() {
   try {
     const history = messages.value
-      .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}:\n${m.text}`)
+      .map(m => `[${m.timestamp.toLocaleString()}] ${m.sender === 'user' ? 'User' : 'Assistant'}:\n${m.text}`)
       .join('\n\n---\n\n');
     await navigator.clipboard.writeText(history);
     copiedChatHistory.value = true;
@@ -801,9 +966,15 @@ onMounted(() => {
 <template>
   <div class="chat-container">
     <!-- Settings Modal -->
-    <div v-if="showApiKeyPrompt" class="modal-overlay">
-      <div class="modal-content modal-wide">
-        <h3>Settings</h3>
+    <div v-if="showApiKeyPrompt" class="modal-overlay" @click.self="showApiKeyPrompt = false">
+      <div class="modal-content modal-wide settings-modal">
+        <div class="modal-header-row">
+          <h3>Settings</h3>
+          <button class="modal-close-btn" @click="showApiKeyPrompt = false" title="Close">
+            <span class="material-icons">close</span>
+          </button>
+        </div>
+        <div class="settings-scroll-area">
 
         <!-- Model Selection Section -->
         <div class="settings-section">
@@ -817,6 +988,7 @@ onMounted(() => {
               <select
                 v-model="selectedProvider"
                 class="model-select"
+                :class="{ 'select-warning': providers.find(p => p.id === selectedProvider)?.id !== 'local' && providers.find(p => p.id === selectedProvider)?.id !== 'gemma4' && !providers.find(p => p.id === selectedProvider)?.has_key }"
                 title="Select Deep AI Provider"
                 aria-label="Deep AI Provider"
                 @change="onProviderChange"
@@ -837,6 +1009,17 @@ onMounted(() => {
                 </option>
               </select>
             </div>
+            <!-- Inline status for deep model -->
+            <div v-if="selectedProvider !== 'local' && selectedProvider !== 'gemma4' && !currentProviderInfo?.has_key" class="model-status-warning">
+              <span class="material-icons">warning_amber</span>
+              <span>No API key configured for {{ currentProviderInfo?.name }}.</span>
+              <button class="btn-link" @click="selectProviderForConfig(selectedProvider)">Add key</button>
+            </div>
+            <div v-else-if="selectedProvider === 'gemma4' && gemmaModelsLoaded && !gemmaReady" class="model-status-warning">
+              <span class="material-icons">warning_amber</span>
+              <span>No Gemma model downloaded.</span>
+              <button class="btn-link" @click="selectProviderForConfig('gemma4')">Download</button>
+            </div>
           </div>
 
           <!-- Quick provider/model -->
@@ -847,6 +1030,7 @@ onMounted(() => {
               <select
                 v-model="selectedSecondaryProvider"
                 class="model-select"
+                :class="{ 'select-warning': providers.find(p => p.id === selectedSecondaryProvider)?.id !== 'local' && providers.find(p => p.id === selectedSecondaryProvider)?.id !== 'gemma4' && !providers.find(p => p.id === selectedSecondaryProvider)?.has_key }"
                 title="Select Quick AI Provider"
                 aria-label="Quick AI Provider"
                 @change="onSecondaryProviderChange"
@@ -867,6 +1051,17 @@ onMounted(() => {
                 </option>
               </select>
             </div>
+            <!-- Inline status for quick model -->
+            <div v-if="selectedSecondaryProvider !== 'local' && selectedSecondaryProvider !== 'gemma4' && !secondaryProviderInfo?.has_key" class="model-status-warning">
+              <span class="material-icons">warning_amber</span>
+              <span>No API key configured for {{ secondaryProviderInfo?.name }}.</span>
+              <button class="btn-link" @click="selectProviderForConfig(selectedSecondaryProvider)">Add key</button>
+            </div>
+            <div v-else-if="selectedSecondaryProvider === 'gemma4' && gemmaModelsLoaded && !gemmaReady" class="model-status-warning">
+              <span class="material-icons">warning_amber</span>
+              <span>No Gemma model downloaded.</span>
+              <button class="btn-link" @click="selectProviderForConfig('gemma4')">Download</button>
+            </div>
           </div>
         </div>
 
@@ -875,23 +1070,30 @@ onMounted(() => {
           <h4 class="settings-section-title">API Keys</h4>
 
           <div class="modal-provider-selector">
-            <label class="modal-label">Provider:</label>
+            <label class="modal-label">Configure provider:</label>
             <div class="provider-tabs">
               <button
                 v-for="p in providers"
                 :key="p.id"
-                :class="['provider-tab', { active: configuringProvider === p.id, 'has-key': p.id === 'local' || p.has_key }]"
+                :class="['provider-tab', {
+                  active: configuringProvider === p.id,
+                  'has-key': p.id === 'local' || (p.id === 'gemma4' && gemmaReady) || (p.id !== 'local' && p.id !== 'gemma4' && p.has_key),
+                  'needs-attention': (p.id !== 'local' && p.id !== 'gemma4' && !p.has_key) || (p.id === 'gemma4' && !gemmaReady)
+                }]"
                 @click="selectProviderForConfig(p.id)"
               >
                 {{ p.name }}
-                <span v-if="p.id === 'local'" class="key-indicator" title="Local server">⚙</span>
-                <span v-else-if="p.has_key" class="key-indicator" title="Key configured">✓</span>
+                <span v-if="p.id === 'local'" class="key-indicator key-local" title="Local server">&#11044;</span>
+                <span v-else-if="p.id === 'gemma4' && gemmaReady" class="key-indicator key-ok" title="Model downloaded">&#10003;</span>
+                <span v-else-if="p.id === 'gemma4'" class="key-indicator key-missing" title="No model downloaded">&#10007;</span>
+                <span v-else-if="p.has_key" class="key-indicator key-ok" title="Key configured">&#10003;</span>
+                <span v-else class="key-indicator key-missing" title="No API key">&#10007;</span>
               </button>
             </div>
           </div>
 
         <!-- Cloud provider: API key input -->
-        <template v-if="configuringProvider !== 'local'">
+        <template v-if="configuringProvider !== 'local' && configuringProvider !== 'gemma4'">
           <p class="modal-description" v-if="configuringProviderInfo">
             Enter your {{ configuringProviderInfo.name }} API key.
             <template v-if="configuringProviderInfo.key_url">
@@ -914,8 +1116,152 @@ onMounted(() => {
             <button @click="saveApiKey" class="btn-primary" :disabled="!apiKeyInput.trim()">
               Save API Key
             </button>
-            <button @click="showApiKeyPrompt = false" class="btn-secondary">
-              Cancel
+          </div>
+        </template>
+
+        <!-- Gemma 4 provider: local model management -->
+        <template v-else-if="configuringProvider === 'gemma4'">
+          <p class="modal-description">
+            Gemma 4 models run entirely on your machine. Download a model variant
+            below, then start the inference server. No API key or internet required
+            for inference.
+          </p>
+
+          <!-- Server status -->
+          <div class="gemma-server-status" :class="{ 'server-running': gemmaServerStatus.running }">
+            <span class="material-icons status-icon">{{ gemmaServerStatus.running ? 'check_circle' : 'radio_button_unchecked' }}</span>
+            <span v-if="gemmaServerStatus.running">
+              Server running &mdash; <code>{{ gemmaServerStatus.url }}</code>
+              (model: <strong>{{ gemmaServerStatus.model_id }}</strong>)
+            </span>
+            <span v-else>Server not running</span>
+            <button
+              v-if="gemmaServerStatus.running"
+              class="btn-secondary btn-sm gemma-stop-btn"
+              @click="stopGemmaServer"
+            >Stop Server</button>
+          </div>
+
+          <!-- Download progress -->
+          <div v-if="gemmaDownloadProgress && gemmaDownloadProgress.status === 'downloading'" class="gemma-download-progress">
+            <div class="progress-info">
+              <span>Downloading <strong>{{ gemmaDownloadProgress.filename }}</strong></span>
+              <span>{{ gemmaDownloadProgress.percent.toFixed(1) }}%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill" :style="{ width: gemmaDownloadProgress.percent + '%' }"></div>
+            </div>
+            <div class="progress-details">
+              <span>{{ formatBytes(gemmaDownloadProgress.downloaded_bytes) }} / {{ formatBytes(gemmaDownloadProgress.total_bytes) }}</span>
+              <span v-if="gemmaDownloadProgress.speed_bytes_per_sec > 0">
+                {{ formatBytes(gemmaDownloadProgress.speed_bytes_per_sec) }}/s
+              </span>
+              <span v-if="gemmaDownloadProgress.eta_seconds > 0">
+                ETA: {{ formatEta(gemmaDownloadProgress.eta_seconds) }}
+              </span>
+              <button class="btn-secondary btn-sm" @click="cancelGemmaDownload">Cancel</button>
+            </div>
+          </div>
+          <div v-else-if="gemmaDownloadProgress && gemmaDownloadProgress.status === 'completed'" class="gemma-download-done success-banner">
+            <span class="material-icons">check_circle</span>
+            <span><strong>{{ gemmaDownloadProgress.filename }}</strong> downloaded successfully.</span>
+          </div>
+          <div v-else-if="gemmaDownloadProgress && gemmaDownloadProgress.status === 'cancelled'" class="gemma-download-done warning-banner">
+            <span class="material-icons">cancel</span>
+            <span>Download of <strong>{{ gemmaDownloadProgress.filename }}</strong> was cancelled.</span>
+          </div>
+          <div v-else-if="gemmaDownloadProgress && gemmaDownloadProgress.status === 'error'" class="error-banner">
+            <span class="material-icons error-icon">warning</span>
+            <span>Download failed: {{ gemmaDownloadProgress.error }}</span>
+          </div>
+
+          <!-- Error banner -->
+          <div v-if="gemmaError" class="error-banner">
+            <span class="material-icons error-icon">warning</span>
+            <span>{{ gemmaError }}</span>
+          </div>
+
+          <!-- Loading state -->
+          <div v-if="isLoadingGemmaModels" class="gemma-loading">
+            <span class="material-icons spinning">sync</span>
+            <span>Loading available models…</span>
+          </div>
+
+          <!-- Empty state: no models found -->
+          <div v-else-if="gemmaModelsLoaded && gemmaModels.length === 0 && !gemmaError" class="gemma-empty-state">
+            <span class="material-icons">cloud_off</span>
+            <p>No model variants found.</p>
+            <p class="settings-hint">Check your internet connection and try refreshing.</p>
+            <button @click="loadGemmaModels" class="btn-primary btn-sm">
+              <span class="material-icons btn-icon">refresh</span>
+              Retry
+            </button>
+          </div>
+
+          <!-- Model cards -->
+          <div v-else class="gemma-models-grid">
+            <div
+              v-for="model in gemmaModels"
+              :key="model.id"
+              class="gemma-model-card"
+              :class="{ 'downloaded': model.downloaded, 'active': gemmaServerStatus.model_id === model.id }"
+            >
+              <div class="gemma-model-header">
+                <strong>{{ model.name }}</strong>
+                <span class="gemma-size-badge">{{ model.size_label }}</span>
+              </div>
+              <p class="gemma-model-desc">{{ model.description }}</p>
+              <div class="gemma-model-actions">
+                <template v-if="!model.downloaded">
+                  <button
+                    class="btn-primary btn-sm"
+                    @click="downloadGemmaModel(model.id)"
+                    :disabled="gemmaDownloadProgress?.status === 'downloading'"
+                  >
+                    <span class="material-icons btn-icon">download</span>
+                    Download
+                  </button>
+                </template>
+                <template v-else>
+                  <button
+                    v-if="gemmaServerStatus.model_id !== model.id"
+                    class="btn-primary btn-sm"
+                    @click="startGemmaServer(model.id)"
+                    :disabled="gemmaServerStatus.running"
+                  >
+                    <span class="material-icons btn-icon">play_arrow</span>
+                    Start
+                  </button>
+                  <span
+                    v-else
+                    class="gemma-active-label"
+                  >
+                    <span class="material-icons btn-icon">check</span>
+                    Active
+                  </span>
+                  <button
+                    class="btn-secondary btn-sm btn-danger"
+                    @click="deleteGemmaModel(model.id)"
+                    :disabled="gemmaServerStatus.model_id === model.id"
+                    title="Delete downloaded model"
+                  >
+                    <span class="material-icons btn-icon">delete</span>
+                  </button>
+                </template>
+              </div>
+            </div>
+          </div>
+
+          <!-- Hint when no models downloaded -->
+          <div v-if="gemmaModels.length > 0 && !gemmaHasDownloadedModel && !isLoadingGemmaModels" class="gemma-no-model-hint">
+            <span class="material-icons">info</span>
+            <span>Download at least one model above to use the Gemma 4 provider.</span>
+          </div>
+
+          <div class="modal-actions">
+            <button @click="loadGemmaModels" class="btn-secondary">
+              <span class="material-icons btn-icon">refresh</span>
+              Refresh
             </button>
           </div>
         </template>
@@ -966,13 +1312,10 @@ onMounted(() => {
               class="local-model-chip"
             >{{ m.name }}</span>
           </div>
-          <div class="modal-actions">
-            <button @click="showApiKeyPrompt = false" class="btn-secondary">
-              Close
-            </button>
-          </div>
+          <div class="modal-actions"></div>
         </template>
         </div>
+        </div><!-- end settings-scroll-area -->
       </div>
     </div>
 
@@ -1072,7 +1415,7 @@ onMounted(() => {
               </span>
               <div class="message-actions">
                 <button
-                  @click="copyMessage(message.id, message.text)"
+                  @click="copyMessage(message.id, message.text, message.timestamp, message.sender)"
                   class="action-btn"
                   :title="copiedMessageId === message.id ? 'Copied!' : 'Copy'"
                 >
@@ -1667,6 +2010,9 @@ button:disabled {
   width: 90%;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
   border: 1px solid var(--border-color);
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-content h3 {
@@ -1884,14 +2230,137 @@ button:disabled {
 }
 
 .key-indicator {
-  font-size: 0.75rem;
-  color: #22c55e;
+  font-size: 0.6875rem;
   font-weight: 700;
+  line-height: 1;
 }
 
-/* Wide modal for sessions */
+.key-ok {
+  color: #22c55e;
+}
+
+.key-missing {
+  color: #ef4444;
+}
+
+.key-local {
+  color: var(--text-secondary);
+  font-size: 0.5rem;
+}
+
+.provider-tab.needs-attention {
+  border-color: rgba(251, 188, 4, 0.4);
+  color: var(--text-secondary);
+}
+
+.provider-tab.needs-attention:not(.active):hover {
+  border-color: rgba(251, 188, 4, 0.7);
+}
+
+/* Wide modal for settings / sessions */
 .modal-wide {
-  max-width: 560px;
+  max-width: 600px;
+}
+
+.settings-modal {
+  max-height: 85vh;
+}
+
+.settings-scroll-area {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  padding-right: 0.25rem;
+}
+
+.settings-scroll-area::-webkit-scrollbar {
+  width: 6px;
+}
+
+.settings-scroll-area::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-scroll-area::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.settings-scroll-area::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+.modal-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+  flex-shrink: 0;
+}
+
+.modal-header-row h3 {
+  margin: 0;
+}
+
+.modal-close-btn {
+  background: transparent;
+  border: none;
+  padding: 0.25rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.modal-close-btn:hover {
+  color: var(--text-primary);
+  background-color: var(--bg-tertiary);
+}
+
+.modal-close-btn .material-icons {
+  font-size: 1.25rem;
+}
+
+/* Provider status indicators */
+.model-status-warning {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin-top: 0.375rem;
+  padding: 0.375rem 0.625rem;
+  border-radius: var(--radius-sm);
+  background-color: rgba(251, 188, 4, 0.08);
+  border: 1px solid rgba(251, 188, 4, 0.25);
+  font-size: 0.75rem;
+  color: #f9a825;
+}
+
+.model-status-warning .material-icons {
+  font-size: 0.9375rem;
+  flex-shrink: 0;
+}
+
+.btn-link {
+  background: none;
+  border: none;
+  color: var(--accent-color);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  margin-left: auto;
+}
+
+.btn-link:hover {
+  color: var(--accent-hover);
+}
+
+.select-warning {
+  border-color: rgba(251, 188, 4, 0.5) !important;
 }
 
 /* Sessions list */
@@ -2004,5 +2473,234 @@ code {
   background-color: var(--bg-tertiary);
   padding: 0.1em 0.3em;
   border-radius: 3px;
+}
+
+/* ---- Gemma 4 local model styles ---- */
+
+.gemma-server-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  margin-bottom: 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.gemma-server-status.server-running {
+  border-color: #34a853;
+  background-color: rgba(52, 168, 83, 0.08);
+}
+
+.gemma-server-status .status-icon {
+  font-size: 1.125rem;
+  color: var(--text-secondary);
+}
+
+.gemma-server-status.server-running .status-icon {
+  color: #34a853;
+}
+
+.gemma-stop-btn {
+  margin-left: auto;
+}
+
+.gemma-download-progress {
+  margin-bottom: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+}
+
+.gemma-download-progress .progress-info {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8125rem;
+  margin-bottom: 0.375rem;
+}
+
+.progress-bar-bg {
+  width: 100%;
+  height: 6px;
+  background-color: var(--border-color);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background-color: var(--accent-color, #4285f4);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.progress-details {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 0.375rem;
+  align-items: center;
+}
+
+.gemma-models-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.gemma-model-card {
+  padding: 0.75rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-secondary);
+  transition: border-color 0.2s;
+}
+
+.gemma-model-card.downloaded {
+  border-color: var(--accent-color, #4285f4);
+}
+
+.gemma-model-card.active {
+  border-color: #34a853;
+  background-color: rgba(52, 168, 83, 0.05);
+}
+
+.gemma-model-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.375rem;
+  font-size: 0.8125rem;
+}
+
+.gemma-size-badge {
+  font-size: 0.6875rem;
+  padding: 0.125rem 0.375rem;
+  border-radius: 9999px;
+  background-color: var(--bg-tertiary);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.gemma-model-desc {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin: 0 0 0.5rem;
+  line-height: 1.35;
+}
+
+.gemma-model-actions {
+  display: flex;
+  gap: 0.375rem;
+  align-items: center;
+}
+
+.gemma-active-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  font-size: 0.75rem;
+  color: #34a853;
+  font-weight: 600;
+}
+
+.btn-danger {
+  color: #ea4335;
+  border-color: #ea4335;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: rgba(234, 67, 53, 0.1);
+}
+
+.gemma-download-done {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.8125rem;
+  margin-bottom: 0.75rem;
+}
+
+.success-banner {
+  background-color: rgba(52, 168, 83, 0.08);
+  border: 1px solid #34a853;
+  color: #34a853;
+}
+
+.warning-banner {
+  background-color: rgba(251, 188, 4, 0.08);
+  border: 1px solid #fbbc04;
+  color: #f9a825;
+}
+
+.gemma-no-model-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: var(--radius-sm);
+  background-color: rgba(66, 133, 244, 0.08);
+  border: 1px solid rgba(66, 133, 244, 0.25);
+  font-size: 0.8125rem;
+  color: var(--accent-color);
+  margin-bottom: 0.75rem;
+}
+
+.gemma-no-model-hint .material-icons {
+  font-size: 1rem;
+  flex-shrink: 0;
+}
+
+.gemma-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 1.5rem;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+}
+
+.gemma-loading .material-icons {
+  font-size: 1.25rem;
+  color: var(--accent-color);
+}
+
+.spinning {
+  animation: spin 1.2s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.gemma-empty-state {
+  text-align: center;
+  padding: 1.5rem 1rem;
+  color: var(--text-secondary);
+}
+
+.gemma-empty-state .material-icons {
+  font-size: 2.5rem;
+  opacity: 0.35;
+  margin-bottom: 0.5rem;
+  display: block;
+}
+
+.gemma-empty-state p {
+  margin: 0 0 0.375rem 0;
+  font-size: 0.875rem;
+}
+
+.gemma-empty-state .btn-primary {
+  margin-top: 0.75rem;
 }
 </style>
