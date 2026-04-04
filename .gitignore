@@ -63,3 +63,18 @@ installer-output/
 # Research and temporary files
 # research/ - Removed to allow structured research documentation
 test_backend.py
+
+# Virtual environment
+venv/
+
+# Debug / one-off scripts
+check_stored_key.py
+clear_api_key.py
+test_api_key.py
+API_KEY_DEBUG.md
+FIX_SUMMARY.md
+INVALID_KEY_FIX.md
+QUICK_REFERENCE.md
+
+# Dev convenience scripts
+start_dev.bat
