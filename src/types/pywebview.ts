@@ -108,12 +108,33 @@ export interface ProviderInfo {
   key_prefix: string;
   key_min_length: number;
   has_key: boolean;
+  /** Base URL for local model providers (id === 'local') */
+  base_url?: string;
 }
+
+export interface ModelSelection {
+  provider: string;
+  model: string;
+}
+
+export interface ModelConfig {
+  primary: ModelSelection;
+  secondary: ModelSelection;
+}
+
+export interface ModelConfigResult extends ApiResult, ModelConfig {}
 
 export interface ProvidersResult extends ApiResult {
   providers?: ProviderInfo[];
   current_provider?: string;
   current_model?: string;
+  secondary_provider?: string;
+  secondary_model?: string;
+}
+
+export interface LocalModelsResult extends ApiResult {
+  models: ProviderModel[];
+  base_url?: string;
 }
 
 // Session management types
@@ -147,6 +168,12 @@ export interface PyWebViewAPI {
   // Provider management
   get_providers: () => Promise<ProvidersResult>;
   set_provider: (provider: string, model: string) => Promise<ApiResult>;
+  // Dual-model (primary / secondary) configuration
+  get_model_config: () => Promise<ModelConfigResult>;
+  set_secondary_model: (provider: string, model: string) => Promise<ApiResult>;
+  // Local model management
+  get_local_models: () => Promise<LocalModelsResult>;
+  set_local_base_url: (baseUrl: string) => Promise<ApiResult>;
   // Chat API
   send_message: (message: string, model?: string) => Promise<SendMessageResult>;
   // Streaming API

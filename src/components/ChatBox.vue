@@ -3,7 +3,7 @@ import { ref, computed, onMounted, nextTick, watch } from 'vue';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
 import '../types/pywebview';
-import type { ProviderInfo, SessionInfo } from '../types/pywebview';
+import type { ProviderInfo, SessionInfo, ProviderModel } from '../types/pywebview';
 
 // Configure marked with code highlighting
 marked.use({
@@ -30,12 +30,17 @@ interface Message {
 const STORAGE_KEY = 'kiassist-chat-messages';
 const PROVIDER_KEY = 'kiassist-provider';
 const MODEL_KEY = 'kiassist-model';
+const SECONDARY_PROVIDER_KEY = 'kiassist-secondary-provider';
+const SECONDARY_MODEL_KEY = 'kiassist-secondary-model';
 
 const copiedMessageId = ref<string | null>(null);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
 const selectedProvider = ref('gemini');
 const selectedModel = ref('3-flash');
+// Secondary (lightweight/cheap) model
+const selectedSecondaryProvider = ref('gemini');
+const selectedSecondaryModel = ref('3.1-flash-lite');
 const hasApiKey = ref(false);
 const showApiKeyPrompt = ref(false);
 const showSessionsModal = ref(false);
@@ -48,6 +53,12 @@ const apiKeyError = ref<string>('');
 const messagesContainer = ref<HTMLElement | null>(null);
 const editingMessageId = ref<string | null>(null);
 const editingText = ref('');
+// Local model server
+const localBaseUrl = ref('http://localhost:11434/v1');
+const localBaseUrlInput = ref('');
+const localBaseUrlError = ref<string>('');
+const isLoadingLocalModels = ref(false);
+const detectedLocalModels = ref<ProviderModel[]>([]);
 
 // Provider list is populated from the backend via get_providers()
 const providers = ref<ProviderInfo[]>([]);
@@ -66,8 +77,28 @@ const availableModels = computed(() =>
   currentProviderInfo.value?.models ?? []
 );
 
+const secondaryProviderInfo = computed<ProviderInfo | undefined>(() =>
+  providers.value.find(p => p.id === selectedSecondaryProvider.value)
+);
+
+const availableSecondaryModels = computed(() => {
+  const base = secondaryProviderInfo.value?.models ?? [];
+  // Merge in any locally-detected models when the secondary provider is "local"
+  if (selectedSecondaryProvider.value === 'local' && detectedLocalModels.value.length > 0) {
+    const baseIds = new Set(base.map(m => m.id));
+    const extra = detectedLocalModels.value.filter(m => !baseIds.has(m.id));
+    return [...base, ...extra];
+  }
+  return base;
+});
+
 function generateMessageId(): string {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+/** Returns the warning suffix for a provider dropdown option. */
+function providerWarning(p: ProviderInfo): string {
+  return p.id !== 'local' && !p.has_key ? ' ⚠' : '';
 }
 
 function renderMarkdown(text: string, isUser: boolean = false): string {
@@ -140,16 +171,58 @@ async function onProviderChange() {
   localStorage.setItem(MODEL_KEY, selectedModel.value);
 
   if (window.pywebview?.api) {
-    await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+    const result = await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+    if (!result.success) {
+      console.error('[UI] set_provider failed:', result.error);
+    } else if (result.warning) {
+      console.warn('[UI] set_provider warning:', result.warning);
+    }
   }
   // Derive hasApiKey from the in-memory providers list (no extra IPC call)
-  hasApiKey.value = currentProviderInfo.value?.has_key ?? false;
+  hasApiKey.value = selectedProvider.value === 'local'
+    ? true
+    : (currentProviderInfo.value?.has_key ?? false);
 }
 
 async function onModelChange() {
   localStorage.setItem(MODEL_KEY, selectedModel.value);
   if (window.pywebview?.api) {
     await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+  }
+}
+
+async function onSecondaryProviderChange() {
+  const info = secondaryProviderInfo.value;
+  if (info) {
+    selectedSecondaryModel.value = info.default_model;
+  }
+  localStorage.setItem(SECONDARY_PROVIDER_KEY, selectedSecondaryProvider.value);
+  localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
+  if (window.pywebview?.api) {
+    const result = await window.pywebview.api.set_secondary_model(
+      selectedSecondaryProvider.value,
+      selectedSecondaryModel.value,
+    );
+    if (!result.success) {
+      console.error('[UI] set_secondary_model failed:', result.error);
+    } else if (result.warning) {
+      console.warn('[UI] set_secondary_model warning:', result.warning);
+    }
+  }
+}
+
+async function onSecondaryModelChange() {
+  localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
+  if (window.pywebview?.api) {
+    const result = await window.pywebview.api.set_secondary_model(
+      selectedSecondaryProvider.value,
+      selectedSecondaryModel.value,
+    );
+    if (!result.success) {
+      console.error('[UI] set_secondary_model failed:', result.error);
+    } else if (result.warning) {
+      console.warn('[UI] set_secondary_model warning:', result.warning);
+    }
   }
 }
 
@@ -163,6 +236,13 @@ async function loadProviders() {
     if (result.success && result.providers) {
       // Backend is the single source of truth for provider metadata
       providers.value = result.providers;
+
+      // Sync local base URL from backend
+      const localInfo = result.providers.find((p: ProviderInfo) => p.id === 'local');
+      if (localInfo?.base_url) {
+        localBaseUrl.value = localInfo.base_url;
+        localBaseUrlInput.value = localInfo.base_url;
+      }
 
       // Determine which provider/model to use, honouring localStorage first
       const storedProvider = localStorage.getItem(PROVIDER_KEY);
@@ -196,7 +276,36 @@ async function loadProviders() {
 
       // Derive hasApiKey from the providers list — no extra round-trips needed
       const active = result.providers.find((p: ProviderInfo) => p.id === selectedProvider.value);
-      hasApiKey.value = active?.has_key ?? false;
+      hasApiKey.value = selectedProvider.value === 'local' ? true : (active?.has_key ?? false);
+
+      // --- Secondary model ---
+      const storedSecondaryProvider = localStorage.getItem(SECONDARY_PROVIDER_KEY);
+      const storedSecondaryModel = localStorage.getItem(SECONDARY_MODEL_KEY);
+
+      const nextSecondaryProvider =
+        (storedSecondaryProvider &&
+          result.providers.find((p: ProviderInfo) => p.id === storedSecondaryProvider)?.id) ??
+        result.secondary_provider ??
+        selectedSecondaryProvider.value;
+
+      const nextSecondaryProviderInfo =
+        result.providers.find((p: ProviderInfo) => p.id === nextSecondaryProvider);
+
+      const nextSecondaryModel =
+        storedSecondaryModel ??
+        result.secondary_model ??
+        nextSecondaryProviderInfo?.default_model ??
+        selectedSecondaryModel.value;
+
+      selectedSecondaryProvider.value = nextSecondaryProvider;
+      selectedSecondaryModel.value = nextSecondaryModel ?? selectedSecondaryModel.value;
+
+      localStorage.setItem(SECONDARY_PROVIDER_KEY, selectedSecondaryProvider.value);
+      localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
+      await window.pywebview.api.set_secondary_model(
+        selectedSecondaryProvider.value,
+        selectedSecondaryModel.value,
+      );
     }
   } catch (e) {
     console.error('[UI] Failed to load providers:', e);
@@ -299,6 +408,62 @@ async function saveApiKey() {
     }
   } catch (error) {
     apiKeyError.value = 'Failed to save API key. Please try again.';
+  }
+}
+
+async function saveLocalBaseUrl() {
+  const url = localBaseUrlInput.value.trim();
+  if (!url) {
+    localBaseUrlError.value = 'Server URL cannot be empty.';
+    return;
+  }
+  localBaseUrlError.value = '';
+  if (!window.pywebview?.api) return;
+  try {
+    const result = await window.pywebview.api.set_local_base_url(url);
+    if (result.success) {
+      localBaseUrl.value = url;
+      // Update the local provider entry in the providers list
+      const lp = providers.value.find(p => p.id === 'local');
+      if (lp) lp.base_url = url;
+      if (result.warning) {
+        localBaseUrlError.value = result.warning;
+      }
+    } else {
+      localBaseUrlError.value = result.error || 'Failed to save server URL.';
+    }
+  } catch (e) {
+    localBaseUrlError.value = 'Failed to save server URL.';
+  }
+}
+
+async function detectLocalModels() {
+  if (!window.pywebview?.api) return;
+  isLoadingLocalModels.value = true;
+  localBaseUrlError.value = '';
+  try {
+    const result = await window.pywebview.api.get_local_models();
+    if (result.success) {
+      detectedLocalModels.value = result.models ?? [];
+      // Merge detected models into the local provider's model list
+      const lp = providers.value.find(p => p.id === 'local');
+      if (lp && result.models.length > 0) {
+        const existingIds = new Set(lp.models.map((m: ProviderModel) => m.id));
+        const newModels = result.models.filter((m: ProviderModel) => !existingIds.has(m.id));
+        lp.models = [...lp.models, ...newModels];
+      }
+      if (result.base_url) {
+        localBaseUrl.value = result.base_url;
+        localBaseUrlInput.value = result.base_url;
+      }
+    } else {
+      localBaseUrlError.value = result.error || 'Could not connect to local server.';
+    }
+  } catch (e) {
+    const errorMessage = e instanceof Error ? e.message : String(e);
+    localBaseUrlError.value = `Error: ${errorMessage}`;
+  } finally {
+    isLoadingLocalModels.value = false;
   }
 }
 
@@ -539,8 +704,8 @@ onMounted(() => {
   <div class="chat-container">
     <!-- API Key Prompt Modal -->
     <div v-if="showApiKeyPrompt" class="modal-overlay">
-      <div class="modal-content">
-        <h3>Configure API Key</h3>
+      <div class="modal-content modal-wide">
+        <h3>Configure AI Providers</h3>
 
         <!-- Provider selector inside settings modal -->
         <div class="modal-provider-selector">
@@ -549,39 +714,98 @@ onMounted(() => {
             <button
               v-for="p in providers"
               :key="p.id"
-              :class="['provider-tab', { active: configuringProvider === p.id, 'has-key': p.has_key }]"
+              :class="['provider-tab', { active: configuringProvider === p.id, 'has-key': p.id === 'local' || p.has_key }]"
               @click="selectProviderForConfig(p.id)"
             >
               {{ p.name }}
-              <span v-if="p.has_key" class="key-indicator" title="Key configured">✓</span>
+              <span v-if="p.id === 'local'" class="key-indicator" title="Local server">⚙</span>
+              <span v-else-if="p.has_key" class="key-indicator" title="Key configured">✓</span>
             </button>
           </div>
         </div>
 
-        <p class="modal-description" v-if="configuringProviderInfo">
-          Enter your {{ configuringProviderInfo.name }} API key.
-          Get your key from
-          <a :href="configuringProviderInfo.key_url" target="_blank">{{ configuringProviderInfo.key_url }}</a>.
-        </p>
-        <input
-          v-model="apiKeyInput"
-          type="password"
-          :placeholder="`Enter your ${configuringProviderInfo?.name ?? ''} API key...`"
-          class="api-key-input"
-          @keypress.enter="saveApiKey"
-        />
-        <div v-if="apiKeyError" class="error-banner">
-          <span class="material-icons error-icon">warning</span>
-          <span>{{ apiKeyError }}</span>
-        </div>
-        <div class="modal-actions">
-          <button @click="saveApiKey" class="btn-primary" :disabled="!apiKeyInput.trim()">
-            Save API Key
-          </button>
-          <button @click="showApiKeyPrompt = false" class="btn-secondary">
-            Cancel
-          </button>
-        </div>
+        <!-- Cloud provider: API key input -->
+        <template v-if="configuringProvider !== 'local'">
+          <p class="modal-description" v-if="configuringProviderInfo">
+            Enter your {{ configuringProviderInfo.name }} API key.
+            <template v-if="configuringProviderInfo.key_url">
+              Get your key from
+              <a :href="configuringProviderInfo.key_url" target="_blank">{{ configuringProviderInfo.key_url }}</a>.
+            </template>
+          </p>
+          <input
+            v-model="apiKeyInput"
+            type="password"
+            :placeholder="`Enter your ${configuringProviderInfo?.name ?? ''} API key...`"
+            class="api-key-input"
+            @keypress.enter="saveApiKey"
+          />
+          <div v-if="apiKeyError" class="error-banner">
+            <span class="material-icons error-icon">warning</span>
+            <span>{{ apiKeyError }}</span>
+          </div>
+          <div class="modal-actions">
+            <button @click="saveApiKey" class="btn-primary" :disabled="!apiKeyInput.trim()">
+              Save API Key
+            </button>
+            <button @click="showApiKeyPrompt = false" class="btn-secondary">
+              Cancel
+            </button>
+          </div>
+        </template>
+
+        <!-- Local provider: server URL + model detection -->
+        <template v-else>
+          <p class="modal-description">
+            Configure the URL of your local OpenAI-compatible server.
+            Supported servers: <strong>Ollama</strong> (default <code>http://localhost:11434/v1</code>)
+            and <strong>LM Studio</strong> (default <code>http://localhost:1234/v1</code>).
+            No API key is required. Model detection uses the OpenAI-compatible
+            <code>/v1/models</code> endpoint (works with both servers) and falls back
+            to Ollama's <code>/api/tags</code> endpoint.
+          </p>
+          <div class="local-url-row">
+            <input
+              v-model="localBaseUrlInput"
+              type="text"
+              placeholder="http://localhost:11434/v1"
+              class="api-key-input"
+              @keypress.enter="saveLocalBaseUrl"
+            />
+            <button @click="saveLocalBaseUrl" class="btn-primary btn-sm" :disabled="!localBaseUrlInput.trim()">
+              Save
+            </button>
+          </div>
+          <div v-if="localBaseUrlError" class="error-banner">
+            <span class="material-icons error-icon">warning</span>
+            <span>{{ localBaseUrlError }}</span>
+          </div>
+          <div class="local-detect-row">
+            <button
+              @click="detectLocalModels"
+              class="btn-secondary"
+              :disabled="isLoadingLocalModels"
+            >
+              <span class="material-icons btn-icon">search</span>
+              {{ isLoadingLocalModels ? 'Detecting…' : 'Detect Models' }}
+            </button>
+            <span v-if="detectedLocalModels.length > 0" class="local-models-found">
+              {{ detectedLocalModels.length }} model{{ detectedLocalModels.length !== 1 ? 's' : '' }} found
+            </span>
+          </div>
+          <div v-if="detectedLocalModels.length > 0" class="local-models-list">
+            <span
+              v-for="m in detectedLocalModels"
+              :key="m.id"
+              class="local-model-chip"
+            >{{ m.name }}</span>
+          </div>
+          <div class="modal-actions">
+            <button @click="showApiKeyPrompt = false" class="btn-secondary">
+              Close
+            </button>
+          </div>
+        </template>
       </div>
     </div>
 
@@ -621,34 +845,69 @@ onMounted(() => {
 
     <div class="chat-header">
       <div class="header-controls">
-        <!-- Provider selector — always visible so users can switch/configure providers -->
+        <!-- Primary provider/model selectors -->
         <template v-if="providers.length > 0">
-          <select
-            id="provider-select"
-            v-model="selectedProvider"
-            class="model-select"
-            title="Select AI Provider"
-            aria-label="AI Provider"
-            @change="onProviderChange"
-          >
-            <option v-for="p in providers" :key="p.id" :value="p.id">
-              {{ p.name }}{{ p.has_key ? '' : ' ⚠' }}
-            </option>
-          </select>
+          <div class="model-group" title="Primary model (used for complex tasks)">
+            <span class="model-group-label">Primary</span>
+            <select
+              id="provider-select"
+              v-model="selectedProvider"
+              class="model-select"
+              title="Select Primary AI Provider"
+              aria-label="Primary AI Provider"
+              @change="onProviderChange"
+            >
+              <option v-for="p in providers" :key="p.id" :value="p.id">
+                {{ p.name }}{{ providerWarning(p) }}
+              </option>
+            </select>
 
-          <!-- Model selector (provider-specific) -->
-          <select
-            id="model-select"
-            v-model="selectedModel"
-            class="model-select"
-            title="Select Model"
-            aria-label="AI Model"
-            @change="onModelChange"
-          >
-            <option v-for="model in availableModels" :key="model.id" :value="model.id">
-              {{ model.name }}
-            </option>
-          </select>
+            <select
+              id="model-select"
+              v-model="selectedModel"
+              class="model-select"
+              title="Select Primary Model"
+              aria-label="Primary AI Model"
+              @change="onModelChange"
+            >
+              <option v-for="model in availableModels" :key="model.id" :value="model.id">
+                {{ model.name }}
+              </option>
+            </select>
+          </div>
+
+          <!-- Separator -->
+          <span class="model-separator" title="Secondary model is used for simpler tasks">→</span>
+
+          <!-- Secondary provider/model selectors -->
+          <div class="model-group" title="Secondary model (used for simpler/cheaper tasks)">
+            <span class="model-group-label">Secondary</span>
+            <select
+              id="secondary-provider-select"
+              v-model="selectedSecondaryProvider"
+              class="model-select"
+              title="Select Secondary AI Provider"
+              aria-label="Secondary AI Provider"
+              @change="onSecondaryProviderChange"
+            >
+              <option v-for="p in providers" :key="p.id" :value="p.id">
+                {{ p.name }}{{ providerWarning(p) }}
+              </option>
+            </select>
+
+            <select
+              id="secondary-model-select"
+              v-model="selectedSecondaryModel"
+              class="model-select"
+              title="Select Secondary Model"
+              aria-label="Secondary AI Model"
+              @change="onSecondaryModelChange"
+            >
+              <option v-for="model in availableSecondaryModels" :key="model.id" :value="model.id">
+                {{ model.name }}
+              </option>
+            </select>
+          </div>
         </template>
         <div class="header-spacer"></div>
         <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" :disabled="isLoading">
@@ -657,7 +916,7 @@ onMounted(() => {
         <button @click="openSessionsModal" class="icon-btn" title="Conversation sessions">
           <span class="material-icons">history</span>
         </button>
-        <button @click="openSettings()" class="icon-btn" title="Configure API Keys">
+        <button @click="openSettings()" class="icon-btn" title="Configure API Keys &amp; Local Models">
           <span class="material-icons">settings</span>
         </button>
       </div>
@@ -803,6 +1062,30 @@ onMounted(() => {
   outline: none;
   border-color: var(--accent-color);
   box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.2);
+}
+
+/* Model group: label + provider select + model select */
+.model-group {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.model-group-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* Arrow separator between primary and secondary groups */
+.model-separator {
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  opacity: 0.6;
+  flex-shrink: 0;
 }
 
 .icon-btn {
@@ -1524,5 +1807,61 @@ button:disabled {
   display: flex;
   gap: 0.5rem;
   flex-shrink: 0;
+}
+
+/* Local model settings */
+.local-url-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.local-url-row .api-key-input {
+  flex: 1;
+}
+
+.local-detect-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.local-models-found {
+  font-size: 0.8125rem;
+  color: #22c55e;
+  font-weight: 500;
+}
+
+.local-models-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-bottom: 0.75rem;
+}
+
+.local-model-chip {
+  padding: 0.25rem 0.5rem;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  color: var(--text-primary);
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+}
+
+.btn-icon {
+  font-size: 1rem;
+  vertical-align: middle;
+  margin-right: 0.25rem;
+}
+
+code {
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+  font-size: 0.8125rem;
+  background-color: var(--bg-tertiary);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
 }
 </style>

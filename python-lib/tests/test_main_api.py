@@ -98,6 +98,7 @@ class TestGetProviders:
         assert "gemini" in ids
         assert "claude" in ids
         assert "openai" in ids
+        assert "local" in ids
 
     def test_default_provider_is_gemini(self, api):
         result = api.get_providers()
@@ -112,10 +113,13 @@ class TestGetProviders:
                 assert "name" in m
 
     def test_has_key_reflects_store(self, api):
-        # No keys configured yet
+        # No cloud keys configured yet; local provider always has has_key=True
         result = api.get_providers()
         for p in result["providers"]:
-            assert p["has_key"] is False
+            if p["id"] == "local":
+                assert p["has_key"] is True  # local needs no cloud key
+            else:
+                assert p["has_key"] is False
 
     def test_has_key_true_after_set(self, api, monkeypatch):
         # Simulate key being set for gemini
@@ -420,3 +424,194 @@ class TestSetProjectPath:
         result = api.set_project_path("/nonexistent/path/that/does/not/exist")
         assert result["success"] is False
         assert "error" in result
+
+
+# ===========================================================================
+# Tests: local provider and dual-model (primary/secondary) support
+# ===========================================================================
+
+class TestLocalProvider:
+    """Tests for the 'local' (Ollama/LM Studio) provider integration."""
+
+    def test_get_providers_includes_local(self, api):
+        result = api.get_providers()
+        assert result["success"] is True
+        ids = [p["id"] for p in result["providers"]]
+        assert "local" in ids
+
+    def test_local_provider_has_key_always_true(self, api):
+        result = api.get_providers()
+        local = next(p for p in result["providers"] if p["id"] == "local")
+        assert local["has_key"] is True
+
+    def test_local_provider_has_base_url(self, api):
+        result = api.get_providers()
+        local = next(p for p in result["providers"] if p["id"] == "local")
+        assert "base_url" in local
+        assert local["base_url"].startswith("http")
+
+    def test_set_local_base_url_persists(self, api, monkeypatch):
+        new_url = "http://localhost:1234/v1"
+        api.api_key_store.get_api_key.side_effect = lambda p=None: (
+            new_url if p == "local" else None
+        )
+        result = api.set_local_base_url(new_url)
+        assert result["success"] is True
+        # The stored URL should be used for subsequent local providers
+        api.api_key_store.set_api_key.assert_called_with(new_url, "local")
+
+    def test_set_local_base_url_empty_string_fails(self, api):
+        result = api.set_local_base_url("")
+        assert result["success"] is False
+        assert "empty" in result["error"].lower()
+
+    def test_set_provider_local_creates_ollama_provider(self, api, monkeypatch):
+        local_base_url = "http://127.0.0.1:11434/v1"
+        api.api_key_store.get_api_key.side_effect = lambda p=None: (
+            local_base_url if p == "local" else None
+        )
+
+        fake_ollama = _FakeProvider("local AI response")
+        with patch.object(_main_mod, "OllamaProvider", autospec=True) as mock_ollama_cls:
+            mock_ollama_cls.return_value = fake_ollama
+            result = api.set_provider("local", "llama3.2")
+
+        assert result["success"] is True
+        assert api.current_provider_name == "local"
+        mock_ollama_cls.assert_called_once()
+        call_kwargs = mock_ollama_cls.call_args[1]
+        assert call_kwargs.get("model") == "llama3.2"
+        assert call_kwargs.get("base_url") == local_base_url
+
+    def test_get_local_models_server_unreachable(self, api):
+        """When Ollama is not running, get_local_models returns an error dict."""
+        # Use a port that is almost certainly not listening
+        api.api_key_store.get_api_key.side_effect = lambda p=None: (
+            "http://127.0.0.1:19999/v1" if p == "local" else None
+        )
+        result = api.get_local_models()
+        assert result["success"] is False
+        assert "models" in result
+        assert result["models"] == []
+        assert "error" in result
+
+
+class TestDualModelSupport:
+    """Tests for secondary (lightweight) model selection."""
+
+    def test_get_providers_includes_secondary_model_info(self, api):
+        result = api.get_providers()
+        assert "secondary_provider" in result
+        assert "secondary_model" in result
+
+    def test_secondary_model_defaults(self, api):
+        result = api.get_providers()
+        # Default secondary provider should be a valid provider ID
+        valid_ids = {p["id"] for p in result["providers"]}
+        assert result["secondary_provider"] in valid_ids
+
+    def test_get_model_config_returns_primary_and_secondary(self, api):
+        result = api.get_model_config()
+        assert result["success"] is True
+        assert "primary" in result
+        assert "secondary" in result
+        assert "provider" in result["primary"]
+        assert "model" in result["primary"]
+        assert "provider" in result["secondary"]
+        assert "model" in result["secondary"]
+
+    def test_set_secondary_model_valid(self, api):
+        result = api.set_secondary_model("gemini", "3.1-flash-lite")
+        assert result["success"] is True
+        assert api.secondary_provider_name == "gemini"
+        assert api.secondary_model == "3.1-flash-lite"
+
+    def test_set_secondary_model_invalid_provider(self, api):
+        result = api.set_secondary_model("unknown", "model-x")
+        assert result["success"] is False
+        assert "Unknown provider" in result["error"]
+
+    def test_set_secondary_model_with_key_creates_instance(self, api, monkeypatch):
+        api.api_key_store.get_api_key.side_effect = lambda p=None: (
+            "AIzaFakeKey" if (p or "gemini") == "gemini" else None
+        )
+        fake_provider = _FakeProvider()
+        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake_provider)
+
+        result = api.set_secondary_model("gemini", "3.1-flash-lite")
+        assert result["success"] is True
+        assert api.secondary_provider is fake_provider
+
+    def test_set_secondary_model_no_key_returns_warning(self, api):
+        result = api.set_secondary_model("openai", "gpt-4o-mini")
+        assert result["success"] is True
+        assert "warning" in result
+
+    def test_primary_and_secondary_can_be_different(self, api, monkeypatch):
+        api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFakeKey"
+        fake1 = _FakeProvider("primary response")
+        fake2 = _FakeProvider("secondary response")
+        call_count = [0]
+
+        def _make_gemini(key, model):
+            call_count[0] += 1
+            return fake1 if call_count[0] == 1 else fake2
+
+        monkeypatch.setattr(_main_mod, "GeminiProvider", _make_gemini)
+        api.set_provider("gemini", "3.1-pro")
+        api.set_secondary_model("gemini", "3.1-flash-lite")
+
+        assert api.current_model == "3.1-pro"
+        assert api.secondary_model == "3.1-flash-lite"
+
+
+class TestOllamaProvider:
+    """Unit tests for OllamaProvider."""
+
+    def _make_provider(self, model="llama3.2", base_url="http://localhost:11434/v1"):
+        from kiassist_utils.ai.ollama import OllamaProvider
+        from unittest.mock import patch
+        with patch("kiassist_utils.ai.openai._openai.OpenAI"), \
+             patch("kiassist_utils.ai.openai._openai.AsyncOpenAI"):
+            return OllamaProvider(model=model, base_url=base_url)
+
+    def test_provider_name(self):
+        p = self._make_provider()
+        assert p.provider_name == "OllamaProvider"
+
+    def test_model_name(self):
+        p = self._make_provider(model="mistral")
+        assert p.model_name == "mistral"
+
+    def test_base_url(self):
+        p = self._make_provider(base_url="http://localhost:1234/v1")
+        assert p.base_url == "http://localhost:1234/v1"
+
+    def test_default_context_window(self):
+        from kiassist_utils.ai.ollama import _DEFAULT_CONTEXT_WINDOW
+        p = self._make_provider()
+        assert p.get_context_window() == _DEFAULT_CONTEXT_WINDOW
+
+    def test_default_max_output_tokens(self):
+        from kiassist_utils.ai.ollama import _DEFAULT_MAX_OUTPUT_TOKENS
+        p = self._make_provider()
+        assert p.get_max_output_tokens() == _DEFAULT_MAX_OUTPUT_TOKENS
+
+    def test_supports_tool_calling(self):
+        p = self._make_provider()
+        assert p.supports_tool_calling() is True
+
+    def test_chat_delegates_to_openai_provider(self):
+        from kiassist_utils.ai.ollama import OllamaProvider
+        from kiassist_utils.ai.base import AIMessage, AIResponse
+        from unittest.mock import MagicMock, patch
+        with patch("kiassist_utils.ai.openai._openai.OpenAI"), \
+             patch("kiassist_utils.ai.openai._openai.AsyncOpenAI"):
+            p = OllamaProvider(model="llama3.2")
+
+        fake_response = AIResponse(content="Hello from Ollama", tool_calls=[], usage={})
+        p._delegate.chat = MagicMock(return_value=fake_response)
+
+        result = p.chat([AIMessage(role="user", content="hi")])
+        assert result.content == "Hello from Ollama"
+        p._delegate.chat.assert_called_once()

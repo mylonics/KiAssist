@@ -47,6 +47,12 @@ from kiassist_utils.ai.openai import (
 )
 from kiassist_utils.ai.tool_executor import ToolExecutor
 from kiassist_utils.api_key import ApiKeyStore
+from kiassist_utils.ai.ollama import (
+    OllamaProvider,
+    _DEFAULT_CONTEXT_WINDOW,
+    _DEFAULT_MAX_OUTPUT_TOKENS,
+    _DEFAULT_BASE_URL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -860,3 +866,92 @@ class TestApiKeyStoreMultiProvider:
         result = self.store._save_to_file("o-key", "openai")
         assert result is True
         assert self.store._load_from_file("openai") == "o-key"
+
+
+# ---------------------------------------------------------------------------
+# OllamaProvider tests
+# ---------------------------------------------------------------------------
+
+
+class TestOllamaProvider:
+    def _make_provider(self, model="llama3.2", base_url="http://localhost:11434/v1"):
+        with patch("kiassist_utils.ai.openai._openai.OpenAI"), \
+             patch("kiassist_utils.ai.openai._openai.AsyncOpenAI"):
+            return OllamaProvider(model=model, base_url=base_url)
+
+    def test_provider_name(self):
+        p = self._make_provider()
+        assert p.provider_name == "OllamaProvider"
+
+    def test_model_name_passes_through(self):
+        p = self._make_provider(model="mistral")
+        assert p.model_name == "mistral"
+
+    def test_base_url_stored(self):
+        p = self._make_provider(base_url="http://localhost:1234/v1")
+        assert p.base_url == "http://localhost:1234/v1"
+
+    def test_get_context_window(self):
+        p = self._make_provider()
+        assert p.get_context_window() == _DEFAULT_CONTEXT_WINDOW
+
+    def test_get_max_output_tokens(self):
+        p = self._make_provider()
+        assert p.get_max_output_tokens() == _DEFAULT_MAX_OUTPUT_TOKENS
+
+    def test_supports_tool_calling(self):
+        p = self._make_provider()
+        assert p.supports_tool_calling() is True
+
+    def test_chat_delegates_to_delegate(self):
+        p = self._make_provider()
+        fake_response = AIResponse(content="local model says hi", tool_calls=[], usage={})
+        p._delegate.chat = MagicMock(return_value=fake_response)
+        msgs = [AIMessage(role="user", content="hello")]
+        result = p.chat(msgs)
+        assert result.content == "local model says hi"
+        p._delegate.chat.assert_called_once_with(msgs, None, None)
+
+    def test_default_base_url_is_ollama(self):
+        assert "11434" in _DEFAULT_BASE_URL  # Ollama default port
+
+    def test_exported_from_package(self):
+        from kiassist_utils.ai import OllamaProvider as _OP
+        assert _OP is OllamaProvider
+
+
+# ---------------------------------------------------------------------------
+# ApiKeyStore: local provider tests
+# ---------------------------------------------------------------------------
+
+
+class TestApiKeyStoreLocalProvider:
+    def setup_method(self):
+        self.store = ApiKeyStore()
+        os.environ.pop("LOCAL_BASE_URL", None)
+        self.store._memory_keys = {p: None for p in ("gemini", "claude", "openai", "local")}
+        self.store._keyring_available = False
+
+    def test_set_and_get_local_base_url(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(self.store, "_get_config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr(self.store, "_ensure_config_dir", lambda: tmp_path / "config.json")
+        self.store.set_api_key("http://localhost:1234/v1", "local")
+        assert self.store.get_api_key("local") == "http://localhost:1234/v1"
+
+    def test_local_base_url_env_var(self, monkeypatch):
+        monkeypatch.setenv("LOCAL_BASE_URL", "http://192.168.1.100:11434/v1")
+        assert self.store.get_api_key("local") == "http://192.168.1.100:11434/v1"
+
+    def test_local_url_stored_in_config_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(self.store, "_get_config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr(self.store, "_ensure_config_dir", lambda: tmp_path / "config.json")
+        self.store._save_to_file("http://localhost:11434/v1", "local")
+        assert self.store._load_from_file("local") == "http://localhost:11434/v1"
+
+    def test_local_key_does_not_interfere_with_others(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(self.store, "_get_config_path", lambda: tmp_path / "config.json")
+        monkeypatch.setattr(self.store, "_ensure_config_dir", lambda: tmp_path / "config.json")
+        self.store.set_api_key("http://localhost:11434/v1", "local")
+        self.store.set_api_key("AIzaKey", "gemini")
+        assert self.store.get_api_key("local") == "http://localhost:11434/v1"
+        assert self.store.get_api_key("gemini") == "AIzaKey"

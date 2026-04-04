@@ -25,6 +25,7 @@ from .base import (
 from .gemini import GeminiProvider
 from .claude import ClaudeProvider
 from .openai import OpenAIProvider
+from .ollama import OllamaProvider
 from .tool_executor import ToolExecutor
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "GeminiProvider",
     "ClaudeProvider",
     "OpenAIProvider",
+    "OllamaProvider",
     # Executor
     "ToolExecutor",
 ]
