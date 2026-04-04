@@ -4,6 +4,63 @@ import { marked } from 'marked';
 import hljs from 'highlight.js';
 import '../types/pywebview';
 import type { ProviderInfo, SessionInfo, ProviderModel } from '../types/pywebview';
+import type ApiActivityPanel from './ApiActivityPanel.vue';
+import type { ApiActivityEntry } from './ApiActivityPanel.vue';
+
+// Props: parent passes the activity panel ref
+const props = defineProps<{
+  activityPanel?: InstanceType<typeof ApiActivityPanel> | null;
+}>();
+
+// Helper to log API calls to the activity panel
+function generateEntryId(): string {
+  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function summarize(val: any, maxLen = 120): string {
+  if (val === undefined || val === null) return '';
+  const s = typeof val === 'string' ? val : JSON.stringify(val);
+  return s.length > maxLen ? s.substring(0, maxLen) + '…' : s;
+}
+
+function fullString(val: any): string {
+  if (val === undefined || val === null) return '';
+  return typeof val === 'string' ? val : JSON.stringify(val, null, 2);
+}
+
+async function trackedApiCall<T>(
+  method: string,
+  args: any[],
+  fn: () => Promise<T>,
+  isStreamPoll = false,
+): Promise<T> {
+  const start = Date.now();
+  let result: T;
+  let success = true;
+  try {
+    result = await fn();
+    return result;
+  } catch (e) {
+    success = false;
+    result = { error: String(e) } as any;
+    throw e;
+  } finally {
+    const duration = Date.now() - start;
+    const entry: ApiActivityEntry = {
+      id: generateEntryId(),
+      timestamp: new Date(),
+      method,
+      requestSummary: summarize(args.length === 1 ? args[0] : args),
+      requestFull: fullString(args.length === 1 ? args[0] : args),
+      responseSummary: summarize(result!),
+      responseFull: fullString(result!),
+      durationMs: duration,
+      success,
+      isStreamPoll,
+    };
+    props.activityPanel?.addEntry(entry);
+  }
+}
 
 // Configure marked with code highlighting
 marked.use({
@@ -34,11 +91,12 @@ const SECONDARY_PROVIDER_KEY = 'kiassist-secondary-provider';
 const SECONDARY_MODEL_KEY = 'kiassist-secondary-model';
 
 const copiedMessageId = ref<string | null>(null);
+const copiedChatHistory = ref(false);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
 const selectedProvider = ref('gemini');
 const selectedModel = ref('3-flash');
-// Secondary (lightweight/cheap) model
+// Quick (lightweight/cheap) model
 const selectedSecondaryProvider = ref('gemini');
 const selectedSecondaryModel = ref('3.1-flash-lite');
 const hasApiKey = ref(false);
@@ -158,6 +216,12 @@ function clearMessages() {
   if (isLoading.value) return;
   messages.value = [];
   localStorage.removeItem(STORAGE_KEY);
+  // Start a fresh backend session so history isn't carried over
+  if (window.pywebview?.api) {
+    trackedApiCall('new_chat_session', [], () =>
+      window.pywebview!.api.new_chat_session()
+    ).catch(() => {});
+  }
 }
 
 // Provider switching
@@ -171,7 +235,9 @@ async function onProviderChange() {
   localStorage.setItem(MODEL_KEY, selectedModel.value);
 
   if (window.pywebview?.api) {
-    const result = await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+    const result = await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
+      window.pywebview!.api.set_provider(selectedProvider.value, selectedModel.value)
+    );
     if (!result.success) {
       console.error('[UI] set_provider failed:', result.error);
     } else if (result.warning) {
@@ -187,7 +253,9 @@ async function onProviderChange() {
 async function onModelChange() {
   localStorage.setItem(MODEL_KEY, selectedModel.value);
   if (window.pywebview?.api) {
-    await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+    await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
+      window.pywebview!.api.set_provider(selectedProvider.value, selectedModel.value)
+    );
   }
 }
 
@@ -199,9 +267,8 @@ async function onSecondaryProviderChange() {
   localStorage.setItem(SECONDARY_PROVIDER_KEY, selectedSecondaryProvider.value);
   localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
   if (window.pywebview?.api) {
-    const result = await window.pywebview.api.set_secondary_model(
-      selectedSecondaryProvider.value,
-      selectedSecondaryModel.value,
+    const result = await trackedApiCall('set_secondary_model', [selectedSecondaryProvider.value, selectedSecondaryModel.value], () =>
+      window.pywebview!.api.set_secondary_model(selectedSecondaryProvider.value, selectedSecondaryModel.value)
     );
     if (!result.success) {
       console.error('[UI] set_secondary_model failed:', result.error);
@@ -214,9 +281,8 @@ async function onSecondaryProviderChange() {
 async function onSecondaryModelChange() {
   localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
   if (window.pywebview?.api) {
-    const result = await window.pywebview.api.set_secondary_model(
-      selectedSecondaryProvider.value,
-      selectedSecondaryModel.value,
+    const result = await trackedApiCall('set_secondary_model', [selectedSecondaryProvider.value, selectedSecondaryModel.value], () =>
+      window.pywebview!.api.set_secondary_model(selectedSecondaryProvider.value, selectedSecondaryModel.value)
     );
     if (!result.success) {
       console.error('[UI] set_secondary_model failed:', result.error);
@@ -232,7 +298,9 @@ async function onSecondaryModelChange() {
 async function loadProviders() {
   if (!window.pywebview?.api) return;
   try {
-    const result = await window.pywebview.api.get_providers();
+    const result = await trackedApiCall('get_providers', [], () =>
+      window.pywebview!.api.get_providers()
+    );
     if (result.success && result.providers) {
       // Backend is the single source of truth for provider metadata
       providers.value = result.providers;
@@ -272,7 +340,9 @@ async function loadProviders() {
       // Persist the resolved selection and sync the backend
       localStorage.setItem(PROVIDER_KEY, selectedProvider.value);
       localStorage.setItem(MODEL_KEY, selectedModel.value);
-      await window.pywebview.api.set_provider(selectedProvider.value, selectedModel.value);
+      await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
+        window.pywebview!.api.set_provider(selectedProvider.value, selectedModel.value)
+      );
 
       // Derive hasApiKey from the providers list — no extra round-trips needed
       const active = result.providers.find((p: ProviderInfo) => p.id === selectedProvider.value);
@@ -302,9 +372,8 @@ async function loadProviders() {
 
       localStorage.setItem(SECONDARY_PROVIDER_KEY, selectedSecondaryProvider.value);
       localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
-      await window.pywebview.api.set_secondary_model(
-        selectedSecondaryProvider.value,
-        selectedSecondaryModel.value,
+      await trackedApiCall('set_secondary_model', [selectedSecondaryProvider.value, selectedSecondaryModel.value], () =>
+        window.pywebview!.api.set_secondary_model(selectedSecondaryProvider.value, selectedSecondaryModel.value)
       );
     }
   } catch (e) {
@@ -379,7 +448,9 @@ async function saveApiKey() {
 
   try {
     if (window.pywebview?.api) {
-      const result = await window.pywebview.api.set_api_key(trimmedKey, configuringProvider.value);
+      const result = await trackedApiCall('set_api_key', [configuringProvider.value], () =>
+        window.pywebview!.api.set_api_key(trimmedKey, configuringProvider.value)
+      );
       if (result.success) {
         // Update local has_key status
         const localProvider = providers.value.find(p => p.id === configuringProvider.value);
@@ -420,7 +491,9 @@ async function saveLocalBaseUrl() {
   localBaseUrlError.value = '';
   if (!window.pywebview?.api) return;
   try {
-    const result = await window.pywebview.api.set_local_base_url(url);
+    const result = await trackedApiCall('set_local_base_url', [url], () =>
+      window.pywebview!.api.set_local_base_url(url)
+    );
     if (result.success) {
       localBaseUrl.value = url;
       // Update the local provider entry in the providers list
@@ -442,7 +515,9 @@ async function detectLocalModels() {
   isLoadingLocalModels.value = true;
   localBaseUrlError.value = '';
   try {
-    const result = await window.pywebview.api.get_local_models();
+    const result = await trackedApiCall('get_local_models', [], () =>
+      window.pywebview!.api.get_local_models()
+    );
     if (result.success) {
       detectedLocalModels.value = result.models ?? [];
       // Merge detected models into the local provider's model list
@@ -479,7 +554,9 @@ async function sendMessageWithText(messageText: string) {
 
   try {
     if (window.pywebview?.api) {
-      const startResult = await window.pywebview.api.start_stream_message(messageText, selectedModel.value);
+      const startResult = await trackedApiCall('start_stream_message', [messageText, selectedModel.value], () =>
+        window.pywebview!.api.start_stream_message(messageText, selectedModel.value)
+      );
 
       if (!startResult.success) {
         messages.value.push({
@@ -505,7 +582,9 @@ async function sendMessageWithText(messageText: string) {
       // Poll for streaming chunks
       const pollInterval = setInterval(async () => {
         try {
-          const poll = await window.pywebview!.api.poll_stream();
+          const poll = await trackedApiCall('poll_stream', [], () =>
+            window.pywebview!.api.poll_stream(), true
+          );
           if (poll.success && messages.value[streamIdx]) {
             messages.value[streamIdx].text = poll.text || '';
 
@@ -620,11 +699,26 @@ async function copyMessage(messageId: string, text: string) {
   }
 }
 
+async function copyChatHistory() {
+  try {
+    const history = messages.value
+      .map(m => `${m.sender === 'user' ? 'User' : 'Assistant'}:\n${m.text}`)
+      .join('\n\n---\n\n');
+    await navigator.clipboard.writeText(history);
+    copiedChatHistory.value = true;
+    setTimeout(() => { copiedChatHistory.value = false; }, 2000);
+  } catch (error) {
+    console.error('Failed to copy chat history:', error);
+  }
+}
+
 // Session management
 async function openSessionsModal() {
   if (window.pywebview?.api) {
     try {
-      const result = await window.pywebview.api.get_sessions();
+      const result = await trackedApiCall('get_sessions', [], () =>
+        window.pywebview!.api.get_sessions()
+      );
       if (result.success) {
         sessions.value = result.sessions ?? [];
       }
@@ -638,7 +732,9 @@ async function openSessionsModal() {
 async function resumeSession(sessionId: string) {
   if (!window.pywebview?.api) return;
   try {
-    const result = await window.pywebview.api.resume_session(sessionId);
+    const result = await trackedApiCall('resume_session', [sessionId], () =>
+      window.pywebview!.api.resume_session(sessionId)
+    );
     if (result.success && result.messages) {
       messages.value = result.messages.map((m: any) => ({
         id: generateMessageId(),
@@ -658,7 +754,9 @@ async function resumeSession(sessionId: string) {
 async function exportSession(sessionId: string) {
   if (!window.pywebview?.api) return;
   try {
-    const result = await window.pywebview.api.export_session(sessionId);
+    const result = await trackedApiCall('export_session', [sessionId], () =>
+      window.pywebview!.api.export_session(sessionId)
+    );
     if (result.success && result.content) {
       const blob = new Blob([result.content], { type: 'text/plain' });
       const url = URL.createObjectURL(blob);
@@ -702,27 +800,95 @@ onMounted(() => {
 
 <template>
   <div class="chat-container">
-    <!-- API Key Prompt Modal -->
+    <!-- Settings Modal -->
     <div v-if="showApiKeyPrompt" class="modal-overlay">
       <div class="modal-content modal-wide">
-        <h3>Configure AI Providers</h3>
+        <h3>Settings</h3>
 
-        <!-- Provider selector inside settings modal -->
-        <div class="modal-provider-selector">
-          <label class="modal-label">Provider:</label>
-          <div class="provider-tabs">
-            <button
-              v-for="p in providers"
-              :key="p.id"
-              :class="['provider-tab', { active: configuringProvider === p.id, 'has-key': p.id === 'local' || p.has_key }]"
-              @click="selectProviderForConfig(p.id)"
-            >
-              {{ p.name }}
-              <span v-if="p.id === 'local'" class="key-indicator" title="Local server">⚙</span>
-              <span v-else-if="p.has_key" class="key-indicator" title="Key configured">✓</span>
-            </button>
+        <!-- Model Selection Section -->
+        <div class="settings-section">
+          <h4 class="settings-section-title">Model Selection</h4>
+
+          <!-- Deep provider/model -->
+          <div class="settings-model-row">
+            <label class="modal-label">Deep Model</label>
+            <p class="settings-hint">Used for complex, in-depth tasks</p>
+            <div class="settings-model-selects">
+              <select
+                v-model="selectedProvider"
+                class="model-select"
+                title="Select Deep AI Provider"
+                aria-label="Deep AI Provider"
+                @change="onProviderChange"
+              >
+                <option v-for="p in providers" :key="p.id" :value="p.id">
+                  {{ p.name }}{{ providerWarning(p) }}
+                </option>
+              </select>
+              <select
+                v-model="selectedModel"
+                class="model-select"
+                title="Select Deep Model"
+                aria-label="Deep AI Model"
+                @change="onModelChange"
+              >
+                <option v-for="model in availableModels" :key="model.id" :value="model.id">
+                  {{ model.name }}
+                </option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Quick provider/model -->
+          <div class="settings-model-row">
+            <label class="modal-label">Quick Model</label>
+            <p class="settings-hint">Used for fast, lightweight tasks</p>
+            <div class="settings-model-selects">
+              <select
+                v-model="selectedSecondaryProvider"
+                class="model-select"
+                title="Select Quick AI Provider"
+                aria-label="Quick AI Provider"
+                @change="onSecondaryProviderChange"
+              >
+                <option v-for="p in providers" :key="p.id" :value="p.id">
+                  {{ p.name }}{{ providerWarning(p) }}
+                </option>
+              </select>
+              <select
+                v-model="selectedSecondaryModel"
+                class="model-select"
+                title="Select Quick Model"
+                aria-label="Quick AI Model"
+                @change="onSecondaryModelChange"
+              >
+                <option v-for="model in availableSecondaryModels" :key="model.id" :value="model.id">
+                  {{ model.name }}
+                </option>
+              </select>
+            </div>
           </div>
         </div>
+
+        <!-- API Key Configuration Section -->
+        <div class="settings-section">
+          <h4 class="settings-section-title">API Keys</h4>
+
+          <div class="modal-provider-selector">
+            <label class="modal-label">Provider:</label>
+            <div class="provider-tabs">
+              <button
+                v-for="p in providers"
+                :key="p.id"
+                :class="['provider-tab', { active: configuringProvider === p.id, 'has-key': p.id === 'local' || p.has_key }]"
+                @click="selectProviderForConfig(p.id)"
+              >
+                {{ p.name }}
+                <span v-if="p.id === 'local'" class="key-indicator" title="Local server">⚙</span>
+                <span v-else-if="p.has_key" class="key-indicator" title="Key configured">✓</span>
+              </button>
+            </div>
+          </div>
 
         <!-- Cloud provider: API key input -->
         <template v-if="configuringProvider !== 'local'">
@@ -806,6 +972,7 @@ onMounted(() => {
             </button>
           </div>
         </template>
+        </div>
       </div>
     </div>
 
@@ -845,78 +1012,25 @@ onMounted(() => {
 
     <div class="chat-header">
       <div class="header-controls">
-        <!-- Primary provider/model selectors -->
-        <template v-if="providers.length > 0">
-          <div class="model-group" title="Primary model (used for complex tasks)">
-            <span class="model-group-label">Primary</span>
-            <select
-              id="provider-select"
-              v-model="selectedProvider"
-              class="model-select"
-              title="Select Primary AI Provider"
-              aria-label="Primary AI Provider"
-              @change="onProviderChange"
-            >
-              <option v-for="p in providers" :key="p.id" :value="p.id">
-                {{ p.name }}{{ providerWarning(p) }}
-              </option>
-            </select>
-
-            <select
-              id="model-select"
-              v-model="selectedModel"
-              class="model-select"
-              title="Select Primary Model"
-              aria-label="Primary AI Model"
-              @change="onModelChange"
-            >
-              <option v-for="model in availableModels" :key="model.id" :value="model.id">
-                {{ model.name }}
-              </option>
-            </select>
-          </div>
-
-          <!-- Separator -->
-          <span class="model-separator" title="Secondary model is used for simpler tasks">→</span>
-
-          <!-- Secondary provider/model selectors -->
-          <div class="model-group" title="Secondary model (used for simpler/cheaper tasks)">
-            <span class="model-group-label">Secondary</span>
-            <select
-              id="secondary-provider-select"
-              v-model="selectedSecondaryProvider"
-              class="model-select"
-              title="Select Secondary AI Provider"
-              aria-label="Secondary AI Provider"
-              @change="onSecondaryProviderChange"
-            >
-              <option v-for="p in providers" :key="p.id" :value="p.id">
-                {{ p.name }}{{ providerWarning(p) }}
-              </option>
-            </select>
-
-            <select
-              id="secondary-model-select"
-              v-model="selectedSecondaryModel"
-              class="model-select"
-              title="Select Secondary Model"
-              aria-label="Secondary AI Model"
-              @change="onSecondaryModelChange"
-            >
-              <option v-for="model in availableSecondaryModels" :key="model.id" :value="model.id">
-                {{ model.name }}
-              </option>
-            </select>
-          </div>
-        </template>
+        <!-- Compact model summary -->
+        <button class="model-summary-btn" @click="openSettings()" title="Change model settings">
+          <span class="material-icons model-summary-icon">smart_toy</span>
+          <span class="model-summary-text">
+            {{ currentProviderInfo?.name ?? 'AI' }}
+            <span class="model-summary-name">{{ availableModels.find(m => m.id === selectedModel)?.name ?? selectedModel }}</span>
+          </span>
+        </button>
         <div class="header-spacer"></div>
+        <button v-if="messages.length > 0" @click="copyChatHistory" class="icon-btn" :title="copiedChatHistory ? 'Copied!' : 'Copy chat history'">
+          <span class="material-icons">{{ copiedChatHistory ? 'check' : 'copy_all' }}</span>
+        </button>
         <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" :disabled="isLoading">
           <span class="material-icons">delete_sweep</span>
         </button>
         <button @click="openSessionsModal" class="icon-btn" title="Conversation sessions">
           <span class="material-icons">history</span>
         </button>
-        <button @click="openSettings()" class="icon-btn" title="Configure API Keys &amp; Local Models">
+        <button @click="openSettings()" class="icon-btn" title="Settings">
           <span class="material-icons">settings</span>
         </button>
       </div>
@@ -934,9 +1048,6 @@ onMounted(() => {
         :key="message.id"
         :class="['message', message.sender]"
       >
-        <div class="message-avatar">
-          <span class="material-icons">{{ message.sender === 'user' ? 'person' : 'smart_toy' }}</span>
-        </div>
         <div class="message-content">
           <!-- Editing mode -->
           <div v-if="editingMessageId === message.id" class="edit-area">
@@ -1064,28 +1175,85 @@ onMounted(() => {
   box-shadow: 0 0 0 2px rgba(88, 101, 242, 0.2);
 }
 
-/* Model group: label + provider select + model select */
-.model-group {
+/* Compact model summary button in header */
+.model-summary-btn {
   display: flex;
   align-items: center;
   gap: 0.375rem;
+  padding: 0.3125rem 0.625rem;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+  color: var(--text-primary);
+  font-size: 0.8125rem;
 }
 
-.model-group-label {
-  font-size: 0.6875rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  white-space: nowrap;
+.model-summary-btn:hover {
+  border-color: var(--accent-color);
+  background-color: var(--bg-input);
 }
 
-/* Arrow separator between primary and secondary groups */
-.model-separator {
+.model-summary-icon {
+  font-size: 1.125rem;
+  color: var(--accent-color);
+}
+
+.model-summary-text {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
   color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.model-summary-name {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* Settings modal sections */
+.settings-section {
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.settings-section:last-of-type {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+.settings-section-title {
   font-size: 0.875rem;
-  opacity: 0.6;
-  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 0.75rem 0;
+}
+
+.settings-model-row {
+  margin-bottom: 0.75rem;
+}
+
+.settings-model-row:last-child {
+  margin-bottom: 0;
+}
+
+.settings-hint {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin: 0 0 0.5rem 0;
+}
+
+.settings-model-selects {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.settings-model-selects .model-select {
+  flex: 1;
 }
 
 .icon-btn {
@@ -1165,33 +1333,6 @@ onMounted(() => {
 
 .message.assistant {
   justify-content: flex-start;
-}
-
-/* Avatar */
-.message-avatar {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  margin-top: 2px;
-}
-
-.message-avatar .material-icons {
-  font-size: 1.125rem;
-}
-
-.message.user .message-avatar {
-  background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
-  color: white;
-}
-
-.message.assistant .message-avatar {
-  background-color: var(--bg-tertiary);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-color);
 }
 
 /* Message Content */

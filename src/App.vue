@@ -1,6 +1,11 @@
 <script setup lang="ts">
+import { ref } from 'vue';
 import ChatBox from './components/ChatBox.vue';
 import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
+import ApiActivityPanel from './components/ApiActivityPanel.vue';
+
+const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
+const rightPanelCollapsed = ref(false);
 </script>
 
 <template>
@@ -9,8 +14,18 @@ import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
       <KiCadInstanceSelector />
     </aside>
     <main class="chat-panel">
-      <ChatBox />
+      <ChatBox :activityPanel="activityPanel" />
     </main>
+    <button
+      class="panel-toggle-btn"
+      @click="rightPanelCollapsed = !rightPanelCollapsed"
+      :title="rightPanelCollapsed ? 'Show API Activity' : 'Hide API Activity'"
+    >
+      <span class="material-icons">{{ rightPanelCollapsed ? 'chevron_left' : 'chevron_right' }}</span>
+    </button>
+    <aside v-if="!rightPanelCollapsed" class="right-panel">
+      <ApiActivityPanel ref="activityPanel" />
+    </aside>
   </div>
 </template>
 
@@ -101,5 +116,44 @@ body {
   min-width: 0;
   display: flex;
   flex-direction: column;
+}
+
+.panel-toggle-btn {
+  width: 20px;
+  min-width: 20px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background-color: var(--bg-tertiary);
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+  cursor: pointer;
+  padding: 0;
+  color: var(--text-secondary);
+  transition: background-color 0.15s ease;
+  flex-shrink: 0;
+}
+
+.panel-toggle-btn:hover {
+  background-color: var(--bg-secondary);
+  color: var(--accent-color);
+}
+
+.panel-toggle-btn .material-icons {
+  font-size: 1rem;
+}
+
+.right-panel {
+  width: 340px;
+  min-width: 340px;
+  max-width: 340px;
+  height: 100%;
+  background-color: var(--bg-primary);
+  border-left: 1px solid var(--border-color);
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow: var(--shadow-sm);
 }
 </style>

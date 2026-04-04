@@ -20,6 +20,7 @@ Shortcut       Actual model ID
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -291,20 +292,31 @@ class GeminiProvider(AIProvider):
 
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
-        try:
-            if config is not None:
-                response = self._client.models.generate_content(
-                    model=self._model_name,
-                    contents=contents,
-                    config=config,
-                )
-            else:
-                response = self._client.models.generate_content(
-                    model=self._model_name,
-                    contents=contents,
-                )
-        except errors.APIError as exc:
-            raise Exception(f"Gemini API error: {exc}") from exc
+        import time
+        max_retries = 3
+        retry_delay = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                if config is not None:
+                    response = self._client.models.generate_content(
+                        model=self._model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                else:
+                    response = self._client.models.generate_content(
+                        model=self._model_name,
+                        contents=contents,
+                    )
+                break  # Success
+            except errors.APIError as exc:
+                status = getattr(exc, "code", None) or getattr(exc, "status", None)
+                retryable = status in (429, 503) or "503" in str(exc) or "429" in str(exc) or "UNAVAILABLE" in str(exc)
+                if retryable and attempt < max_retries - 1:
+                    time.sleep(retry_delay * (2 ** attempt))
+                    continue
+                raise Exception(f"Gemini API error: {exc}") from exc
 
         tool_calls = _extract_tool_calls(response)
         text = response.text or "" if not tool_calls else ""
@@ -354,25 +366,36 @@ class GeminiProvider(AIProvider):
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
         accumulated_tool_calls: List[AIToolCall] = []
-        try:
-            stream_kwargs: Dict[str, Any] = {
-                "model": self._model_name,
-                "contents": contents,
-            }
-            if config is not None:
-                stream_kwargs["config"] = config
+        max_retries = 3
+        retry_delay = 2.0  # seconds
 
-            async for chunk in await self._client.aio.models.generate_content_stream(
-                **stream_kwargs
-            ):
-                tool_calls_in_chunk = _extract_tool_calls(chunk)
-                accumulated_tool_calls.extend(tool_calls_in_chunk)
-                yield AIChunk(
-                    text=chunk.text or "",
-                    is_final=False,
-                )
-        except errors.APIError as exc:
-            raise Exception(f"Gemini API error: {exc}") from exc
+        for attempt in range(max_retries):
+            try:
+                stream_kwargs: Dict[str, Any] = {
+                    "model": self._model_name,
+                    "contents": contents,
+                }
+                if config is not None:
+                    stream_kwargs["config"] = config
+
+                async for chunk in await self._client.aio.models.generate_content_stream(
+                    **stream_kwargs
+                ):
+                    tool_calls_in_chunk = _extract_tool_calls(chunk)
+                    accumulated_tool_calls.extend(tool_calls_in_chunk)
+                    yield AIChunk(
+                        text=chunk.text or "",
+                        is_final=False,
+                    )
+                break  # Success — exit retry loop
+            except errors.APIError as exc:
+                status = getattr(exc, "code", None) or getattr(exc, "status", None)
+                retryable = status in (429, 503) or "503" in str(exc) or "429" in str(exc) or "UNAVAILABLE" in str(exc)
+                if retryable and attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
+                    accumulated_tool_calls.clear()
+                    continue
+                raise Exception(f"Gemini API error: {exc}") from exc
 
         # Emit final sentinel
         yield AIChunk(

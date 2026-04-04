@@ -76,6 +76,14 @@ async function refreshProjectsList() {
           );
           if (nowOpen) {
             selectedProject.value = nowOpen;
+          } else {
+            // Sync selected recent project with refreshed data (e.g. enriched pcb/schematic paths)
+            const updatedRecent = result.recent_projects.find(
+              (p: RecentProject) => p.path.toLowerCase() === currentPath
+            );
+            if (updatedRecent) {
+              selectedProject.value = updatedRecent;
+            }
           }
         }
       }

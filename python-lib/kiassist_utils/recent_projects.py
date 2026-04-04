@@ -150,8 +150,8 @@ def validate_kicad_project_path(path: str) -> Dict[str, Any]:
                 'project_path': str(p),
                 'project_dir': str(project_dir),
                 'project_name': project_name,
-                'pcb_path': find_file_in_dir(project_dir, '.kicad_pcb'),
-                'schematic_path': find_file_in_dir(project_dir, '.kicad_sch')
+                'pcb_path': find_file_in_dir(project_dir, '.kicad_pcb', project_name),
+                'schematic_path': find_file_in_dir(project_dir, '.kicad_sch', project_name)
             }
         
         # Check if it's a directory containing a .kicad_pro file
@@ -165,8 +165,8 @@ def validate_kicad_project_path(path: str) -> Dict[str, Any]:
                     'project_path': str(pro_file),
                     'project_dir': str(p),
                     'project_name': project_name,
-                    'pcb_path': find_file_in_dir(p, '.kicad_pcb'),
-                    'schematic_path': find_file_in_dir(p, '.kicad_sch')
+                    'pcb_path': find_file_in_dir(p, '.kicad_pcb', project_name),
+                    'schematic_path': find_file_in_dir(p, '.kicad_sch', project_name)
                 }
             return {'valid': False, 'error': 'No KiCad project file found in directory'}
         
@@ -176,20 +176,28 @@ def validate_kicad_project_path(path: str) -> Dict[str, Any]:
         return {'valid': False, 'error': str(e)}
 
 
-def find_file_in_dir(directory: Path, extension: str) -> Optional[str]:
+def find_file_in_dir(directory: Path, extension: str, project_name: Optional[str] = None) -> Optional[str]:
     """Find a file with a specific extension in a directory.
+    
+    When multiple files match, prefers the one whose stem matches project_name.
     
     Args:
         directory: Directory to search in
         extension: File extension to look for (e.g., '.kicad_pcb')
+        project_name: Optional project name to prioritize matching files
         
     Returns:
         Path to the file if found, None otherwise
     """
     try:
         files = list(directory.glob(f'*{extension}'))
-        if files:
-            return str(files[0])
+        if not files:
+            return None
+        if project_name:
+            for f in files:
+                if f.stem == project_name:
+                    return str(f)
+        return str(files[0])
     except Exception:
         pass
     return None

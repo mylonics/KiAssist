@@ -14,7 +14,7 @@ from .ai.base import AIProvider, AIMessage
 from .ai.gemini import GeminiProvider
 from .ai.ollama import OllamaProvider
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
-from .recent_projects import RecentProjectsStore, validate_kicad_project_path
+from .recent_projects import RecentProjectsStore, validate_kicad_project_path, find_file_in_dir
 from .requirements_wizard import (
     get_default_questions,
     check_requirements_file,
@@ -27,6 +27,7 @@ from .requirements_wizard import (
 )
 from .kicad_schematic import inject_test_note, is_schematic_api_available
 from .context.history import ConversationStore
+from .context.prompts import SystemPromptBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +112,20 @@ class KiAssistAPI:
         self.recent_projects_store = RecentProjectsStore()
         self.current_session_id: Optional[str] = None
         self._current_project_path: Optional[str] = None
+        # System prompt builder for injecting project/PCB context
+        self._prompt_builder = SystemPromptBuilder()
         # Streaming state
         self._stream_lock = threading.Lock()
         self._stream_buffer = ""
         self._stream_done = True
         self._stream_error = None
+        # Persistent event loop for async streaming (avoids closing the loop
+        # between calls which would destroy the genai client's async session)
+        self._async_loop = asyncio.new_event_loop()
+        self._async_thread = threading.Thread(
+            target=self._async_loop.run_forever, daemon=True
+        )
+        self._async_thread.start()
     
     def echo_message(self, message: str) -> str:
         """Echo a message (for testing).
@@ -292,6 +302,84 @@ class KiAssistAPI:
         msgs = [AIMessage(role="user", content=prompt)]
         response = provider.chat(msgs)
         return response.content
+
+    def _build_system_prompt(self) -> Optional[str]:
+        """Build a system prompt including project/PCB context.
+
+        Returns:
+            System prompt string, or ``None`` when no project context
+            is available.
+        """
+        dynamic_parts: List[str] = []
+
+        # Add KiCad instance info if available
+        try:
+            instances = detect_kicad_instances()
+            if instances:
+                editor_lines = []
+                for inst in instances:
+                    status_parts = []
+                    if inst.get("pcb_open"):
+                        status_parts.append("PCB editor open")
+                    if inst.get("schematic_open"):
+                        status_parts.append("Schematic editor open")
+                    status = ", ".join(status_parts) if status_parts else "running"
+                    editor_lines.append(
+                        f"- {inst.get('display_name', 'KiCad')} ({status})"
+                    )
+                dynamic_parts.append(
+                    "**Open KiCad editors:**\n" + "\n".join(editor_lines)
+                )
+        except Exception:
+            pass
+
+        if self._current_project_path:
+            dynamic_parts.append(
+                f"**Active project:** `{self._current_project_path}`"
+            )
+
+        dynamic_context = "\n\n".join(dynamic_parts) if dynamic_parts else None
+
+        return self._prompt_builder.build(
+            project_path=self._current_project_path,
+            dynamic_context=dynamic_context,
+        ) or None
+
+    def _build_conversation_messages(
+        self,
+        store: "ConversationStore",
+        session_id: str,
+    ) -> List[AIMessage]:
+        """Build the full message list from conversation history in the session store.
+
+        The caller should already have persisted the latest user message before
+        calling this method—it will be included in the loaded messages.
+        Limits history to the last 40 turns to avoid exceeding context windows.
+
+        Args:
+            store: The conversation store instance.
+            session_id: Current session ID.
+
+        Returns:
+            Ordered list of :class:`AIMessage` for the AI provider.
+        """
+        history: List[AIMessage] = []
+        try:
+            stored_messages = store.load_session(session_id)
+            # Only include user and assistant messages (skip tool messages
+            # that the simple chat flow doesn't need)
+            for m in stored_messages:
+                if m.role in ("user", "assistant") and m.content:
+                    history.append(m)
+        except Exception as exc:
+            logger.debug("Failed to load session history: %s", exc)
+
+        # Limit to last N turns to stay within context budget
+        MAX_HISTORY_TURNS = 40
+        if len(history) > MAX_HISTORY_TURNS:
+            history = history[-MAX_HISTORY_TURNS:]
+
+        return history
 
     # ------------------------------------------------------------------
     # Secondary (lightweight) model management
@@ -535,7 +623,9 @@ class KiAssistAPI:
         """Send a message to the active AI provider and return a response.
 
         The user prompt and assistant response are persisted to the active
-        ConversationStore so they appear in the sessions list.
+        ConversationStore so they appear in the sessions list.  The full
+        conversation history from the current session is sent to the AI so it
+        has context from prior turns.
 
         Args:
             message: The message to send.
@@ -545,14 +635,27 @@ class KiAssistAPI:
             Dictionary with ``response`` text or ``error``.
         """
         try:
+            provider = self._get_or_create_provider(model)
+            if not provider:
+                return {
+                    "success": False,
+                    "error": "No AI provider configured. Please add an API key via Settings.",
+                }
+
             store = self._get_session_store()
             if not self.current_session_id:
                 self.current_session_id = store.new_session()
 
+            # Persist the user message first
             user_msg = AIMessage(role="user", content=message)
             store.append(self.current_session_id, user_msg)
 
-            response_text = self._send_to_ai(message, model)
+            # Build full conversation history + system prompt
+            msgs = self._build_conversation_messages(store, self.current_session_id)
+            system_prompt = self._build_system_prompt()
+
+            response = provider.chat(msgs, system_prompt=system_prompt)
+            response_text = response.content
 
             assistant_msg = AIMessage(role="assistant", content=response_text)
             store.append(self.current_session_id, assistant_msg)
@@ -566,6 +669,9 @@ class KiAssistAPI:
 
         The user prompt is persisted immediately; the final assembled assistant
         response is persisted in the background thread once streaming completes.
+        The full conversation history from the current session is sent to the
+        AI provider so it has context from prior turns, along with a system
+        prompt containing project/PCB environment information.
 
         Args:
             message: The message to send.
@@ -594,12 +700,17 @@ class KiAssistAPI:
                 self._stream_done = False
                 self._stream_error = None
 
-            msgs = [AIMessage(role="user", content=message)]
+            # Build full conversation history (the new user message is
+            # already persisted above and will be included)
+            msgs = self._build_conversation_messages(store, session_id)
+            system_prompt = self._build_system_prompt()
 
             def _run_stream():
                 async def _async_stream():
                     try:
-                        async for chunk in provider.chat_stream(msgs):
+                        async for chunk in provider.chat_stream(
+                            msgs, system_prompt=system_prompt
+                        ):
                             if chunk.text:
                                 with self._stream_lock:
                                     self._stream_buffer += chunk.text
@@ -624,7 +735,11 @@ class KiAssistAPI:
                                     persist_exc,
                                 )
 
-                asyncio.run(_async_stream())
+                # Schedule the coroutine on the persistent event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    _async_stream(), self._async_loop
+                )
+                future.result()  # Block this thread until done
 
             thread = threading.Thread(target=_run_stream, daemon=True)
             thread.start()
@@ -642,6 +757,20 @@ class KiAssistAPI:
                 "done": self._stream_done,
                 "error": self._stream_error,
             }
+
+    def new_chat_session(self) -> dict:
+        """Start a new chat session, discarding the current session ID.
+
+        The next ``send_message`` / ``start_stream_message`` call will
+        automatically create a fresh session in the conversation store.
+
+        Returns:
+            Dictionary with ``success`` status and the new session ID.
+        """
+        self.current_session_id = None
+        # Also clear the prompt cache so the next message rebuilds context
+        self._prompt_builder.clear_cache()
+        return {"success": True}
     
     # ------------------------------------------------------------------
     # Project management
@@ -661,6 +790,10 @@ class KiAssistAPI:
             if not p.exists():
                 return {"success": False, "error": f"Path does not exist: {path}"}
             self._current_project_path = str(p)
+            # Clear prompt cache so project context refreshes
+            self._prompt_builder.clear_cache()
+            # Start a new session for the new project
+            self.current_session_id = None
             return {"success": True}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -790,6 +923,15 @@ class KiAssistAPI:
                 if project_path:
                     normalized = os.path.normpath(os.path.abspath(project_path))
                     if normalized not in open_paths:
+                        # Enrich with pcb_path/schematic_path from disk
+                        if not project.get('pcb_path') or not project.get('schematic_path'):
+                            project_dir = Path(project_path).parent if project_path.endswith('.kicad_pro') else Path(project_path)
+                            proj_name = project.get('name', Path(project_path).stem)
+                            if project_dir.is_dir():
+                                if not project.get('pcb_path'):
+                                    project['pcb_path'] = find_file_in_dir(project_dir, '.kicad_pcb', proj_name)
+                                if not project.get('schematic_path'):
+                                    project['schematic_path'] = find_file_in_dir(project_dir, '.kicad_sch', proj_name)
                         recent_projects.append(project)
             
             return {
