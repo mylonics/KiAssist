@@ -115,6 +115,14 @@ class SystemPromptBuilder:
     # Public API
     # ------------------------------------------------------------------
 
+    # Maximum character budget for the assembled system prompt.
+    # Token-to-char ratio varies by content; KiCad context (paths,
+    # component refs, footprints) tokenizes at ~1.7 chars/token.
+    # Use 2 chars/token as a conservative estimate.
+    # Budget: ~5000 tokens × 2 = 10000 chars leaves headroom for
+    # conversation history within a 16384-token context window.
+    _MAX_PROMPT_CHARS = 10_000
+
     def build(
         self,
         project_path: Optional[str | Path] = None,
@@ -151,7 +159,31 @@ class SystemPromptBuilder:
                 f"## Current Session Context\n\n{dynamic_context.strip()}"
             )
 
-        return "\n\n---\n\n".join(sections)
+        prompt = "\n\n---\n\n".join(sections)
+
+        # Guard: truncate the project-context layer when the assembled
+        # prompt would overflow the character budget.
+        if len(prompt) > self._MAX_PROMPT_CHARS and len(sections) > 1:
+            original_len = len(prompt)
+            budget = self._MAX_PROMPT_CHARS
+            # Keep base and dynamic layers in full; shrink project context.
+            base_len = len(sections[0]) if sections else 0
+            dynamic_len = len(sections[-1]) if len(sections) > 2 else 0
+            separator_overhead = (len(sections) - 1) * len("\n\n---\n\n")
+            available = budget - base_len - dynamic_len - separator_overhead
+            if available > 200 and len(sections) > 1:
+                idx = 1  # project context section index
+                truncated = sections[idx][:available].rsplit("\n", 1)[0]
+                truncated += "\n\n*(project context truncated to fit context window)*"
+                sections[idx] = truncated
+                prompt = "\n\n---\n\n".join(sections)
+                logger.warning(
+                    "System prompt truncated from %d to %d chars to fit context window.",
+                    original_len,
+                    len(prompt),
+                )
+
+        return prompt
 
     def clear_cache(self, project_path: Optional[str | Path] = None) -> None:
         """Invalidate the project-context cache.

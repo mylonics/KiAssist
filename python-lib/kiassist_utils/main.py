@@ -134,6 +134,8 @@ class KiAssistAPI:
         # Streaming state
         self._stream_lock = threading.Lock()
         self._stream_buffer = ""
+        self._stream_thinking_buffer = ""
+        self._stream_in_thinking = False
         self._stream_done = True
         self._stream_error = None
         # Persistent event loop for async streaming (avoids closing the loop
@@ -258,11 +260,19 @@ class KiAssistAPI:
             if not status["running"]:
                 start_result = self._local_model_manager.start_server(model)
                 if not start_result.get("success"):
-                    raise RuntimeError(
-                        start_result.get("error", "Failed to start Gemma 4 server.")
-                    )
+                    # If the port is already in use (orphan server from a
+                    # previous session), try to connect to it anyway.
+                    err = start_result.get("error", "")
+                    if "already in use" in err:
+                        logger.info(
+                            "Port in use but manager unaware; adopting existing server."
+                        )
+                    else:
+                        raise RuntimeError(
+                            err or "Failed to start Gemma 4 server."
+                        )
                 status = self._local_model_manager.get_server_status()
-            base_url = status["url"]
+            base_url = status["url"] or f"http://127.0.0.1:{status['port']}/v1"
             try:
                 return OllamaProvider(model=model, base_url=base_url)
             except ImportError as exc:
@@ -668,7 +678,7 @@ class KiAssistAPI:
     def start_gemma_server(
         self,
         model_id: str,
-        n_ctx: int = 4096,
+        n_ctx: int = 16384,
         n_gpu_layers: int = -1,
     ) -> Dict[str, Any]:
         """Start the local Gemma 4 inference server.
@@ -678,7 +688,7 @@ class KiAssistAPI:
 
         Args:
             model_id: Variant ID of the downloaded model to serve.
-            n_ctx: Context window size in tokens (default 4096).
+            n_ctx: Context window size in tokens (default 16384).
             n_gpu_layers: GPU layers to offload (-1 = all available).
 
         Returns:
@@ -857,6 +867,8 @@ class KiAssistAPI:
 
             with self._stream_lock:
                 self._stream_buffer = ""
+                self._stream_thinking_buffer = ""
+                self._stream_in_thinking = False
                 self._stream_done = False
                 self._stream_error = None
 
@@ -873,7 +885,7 @@ class KiAssistAPI:
                         ):
                             if chunk.text:
                                 with self._stream_lock:
-                                    self._stream_buffer += chunk.text
+                                    self._process_stream_chunk(chunk.text)
                     except Exception as exc:
                         with self._stream_lock:
                             self._stream_error = str(exc)
@@ -908,12 +920,51 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": f"Stream error: {exc}"}
 
+    def _process_stream_chunk(self, text: str) -> None:
+        """Route incoming stream text into thinking or response buffers.
+
+        Parses ``<think>`` / ``</think>`` tags that Gemma and similar models
+        emit for chain-of-thought reasoning.  Content inside the tags goes to
+        ``_stream_thinking_buffer``; everything else goes to
+        ``_stream_buffer``.
+
+        Must be called while holding ``_stream_lock``.
+        """
+        remaining = text
+        while remaining:
+            if self._stream_in_thinking:
+                # Look for the closing </think> tag
+                end_idx = remaining.find("</think>")
+                if end_idx == -1:
+                    # Still inside thinking — buffer all remaining text
+                    self._stream_thinking_buffer += remaining
+                    remaining = ""
+                else:
+                    # Found closing tag — split at the boundary
+                    self._stream_thinking_buffer += remaining[:end_idx]
+                    self._stream_in_thinking = False
+                    remaining = remaining[end_idx + len("</think>"):]
+            else:
+                # Look for an opening <think> tag
+                start_idx = remaining.find("<think>")
+                if start_idx == -1:
+                    # No thinking tag — all goes to regular output
+                    self._stream_buffer += remaining
+                    remaining = ""
+                else:
+                    # Emit text before the tag as regular output
+                    if start_idx > 0:
+                        self._stream_buffer += remaining[:start_idx]
+                    self._stream_in_thinking = True
+                    remaining = remaining[start_idx + len("<think>"):]
+
     def poll_stream(self) -> dict:
         """Poll for new streaming content."""
         with self._stream_lock:
             return {
                 "success": True,
                 "text": self._stream_buffer,
+                "thinking": self._stream_thinking_buffer,
                 "done": self._stream_done,
                 "error": self._stream_error,
             }

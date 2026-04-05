@@ -33,6 +33,7 @@ export interface SendMessageResult extends ApiResult {
 
 export interface StreamPollResult extends ApiResult {
   text?: string;
+  thinking?: string;
   done?: boolean;
 }
 

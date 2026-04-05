@@ -11,6 +11,8 @@ from .gemini import GeminiAPI
 from .kicad_ipc import detect_kicad_instances, KiCadInstance, get_open_project_paths, is_project_open
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path
 
+_loading_main = False
+
 
 def __getattr__(name: str):
     """Lazy-load main module symbols to avoid importing kiassist_utils.main
@@ -18,8 +20,17 @@ def __getattr__(name: str):
     ``python -m kiassist_utils.main``, an eager import causes a
     RuntimeWarning because the module appears in sys.modules before it is
     executed as ``__main__``."""
+    global _loading_main
     if name in ("KiAssistAPI", "main"):
-        from . import main as _main_mod  # noqa: F811
+        if _loading_main:
+            # Prevent infinite recursion: _handle_fromlist re-enters
+            # __getattr__("main") while the submodule is being imported.
+            raise AttributeError(name)
+        _loading_main = True
+        try:
+            from . import main as _main_mod  # noqa: F811
+        finally:
+            _loading_main = False
         return getattr(_main_mod, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

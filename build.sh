@@ -5,12 +5,18 @@ set -e
 
 echo "Building KiAssist for distribution..."
 
-# Step 1: Install dependencies
-echo "Step 1: Installing dependencies..."
-npm install
-cd python-lib
-pip install -e ".[dev]"
-cd ..
+# Step 1: Setup environment
+echo "Step 1: Setting up environment..."
+if [[ ! -d "venv" ]]; then
+    ./setup_env.sh
+else
+    source venv/bin/activate
+    echo "Checking Python dependencies..."
+    cd python-lib
+    python -m pip install -e ".[dev,ai]" -q
+    cd ..
+    npm install
+fi
 
 # Step 2: Build the frontend
 echo "Step 2: Building frontend..."

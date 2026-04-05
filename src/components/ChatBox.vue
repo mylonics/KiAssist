@@ -82,6 +82,7 @@ interface Message {
   sender: 'user' | 'assistant';
   timestamp: Date;
   isStreaming?: boolean;
+  thinking?: string;
 }
 
 const STORAGE_KEY = 'kiassist-chat-messages';
@@ -212,6 +213,7 @@ function saveMessages() {
         text: m.text,
         sender: m.sender,
         timestamp: m.timestamp.toISOString(),
+        ...(m.thinking ? { thinking: m.thinking } : {}),
       }));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
   } catch (e) {
@@ -228,6 +230,7 @@ function loadMessages() {
         ...m,
         timestamp: new Date(m.timestamp),
         isStreaming: false,
+        thinking: m.thinking || undefined,
       }));
     }
   } catch (e) {
@@ -749,6 +752,9 @@ async function sendMessageWithText(messageText: string) {
           );
           if (poll.success && messages.value[streamIdx]) {
             messages.value[streamIdx].text = poll.text || '';
+            if (poll.thinking) {
+              messages.value[streamIdx].thinking = poll.thinking;
+            }
 
             if (poll.done) {
               clearInterval(pollInterval);
@@ -1402,6 +1408,19 @@ onMounted(() => {
           </div>
           <!-- Normal display -->
           <template v-else>
+            <!-- Thinking/reasoning block (collapsible) -->
+            <details
+              v-if="message.thinking && message.sender === 'assistant'"
+              class="thinking-block"
+              :open="message.isStreaming"
+            >
+              <summary class="thinking-summary">
+                <span class="material-icons thinking-icon">psychology</span>
+                <span>{{ message.isStreaming ? 'Thinking...' : 'Thought process' }}</span>
+                <span v-if="message.isStreaming" class="thinking-pulse"></span>
+              </summary>
+              <div class="thinking-content" v-html="renderMarkdown(message.thinking)"></div>
+            </details>
             <div
               v-if="message.sender === 'assistant'"
               class="message-text markdown-content"
@@ -1790,6 +1809,59 @@ onMounted(() => {
 @keyframes pulse {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 1; }
+}
+
+/* Thinking/Reasoning Block */
+.thinking-block {
+  margin-bottom: 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background-color: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.thinking-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.thinking-summary:hover {
+  color: var(--text-primary);
+}
+
+.thinking-icon {
+  font-size: 1rem;
+  color: var(--accent-color);
+}
+
+.thinking-pulse {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: var(--accent-color);
+  animation: pulse 1s infinite;
+  margin-left: 0.25rem;
+}
+
+.thinking-content {
+  padding: 0.4rem 0.6rem 0.6rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border-color);
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.thinking-content :deep(p) {
+  margin: 0.25rem 0;
 }
 
 /* Edit Area */

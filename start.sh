@@ -5,27 +5,31 @@ set -e
 
 echo "Starting KiAssist..."
 
-# Create virtual environment if it doesn't exist
-if [ ! -d "venv" ]; then
-    echo "Creating Python virtual environment..."
-    python3 -m venv venv
+# Bootstrap environment if venv doesn't exist
+if [[ ! -d "venv" ]]; then
+    echo "No virtual environment found – running first-time setup..."
+    ./setup_env.sh
 fi
 
 # Activate virtual environment
 source venv/bin/activate
 
+# Quick sanity check – correct Python version?
+python -c 'import sys; v=sys.version_info; exit(0 if v.minor==12 and v.major==3 else 1)' || {
+    echo "Error: venv uses an incompatible Python. Python 3.12 is required."
+    echo "       Delete venv/ and re-run setup_env.sh."
+    exit 1
+}
+
+# Install / update Python dependencies
+echo "Checking Python dependencies..."
+cd python-lib
+python -m pip install -e ".[ai]" -q 2>/dev/null || echo "Warning: pip install failed."
+cd ..
+
 # Build frontend
 echo "Building frontend..."
 npm run build
-
-# Install Python dependencies if needed
-echo "Checking Python dependencies..."
-cd python-lib
-if ! pip install -e . > /dev/null 2>&1; then
-    echo "Warning: Failed to install Python dependencies. Trying without --editable..."
-    pip install .
-fi
-cd ..
 
 # Run the Python application
 echo "Launching application..."

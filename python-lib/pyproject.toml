@@ -7,13 +7,16 @@ name = "kiassist-utils"
 version = "0.1.0"
 description = "Utility library for KiAssist - KiCAD AI Assistant"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "pywebview>=5.0",
     "google-genai>=1.70.0",
     "keyring>=24.0.0",
     "kicad-python>=0.6.0",
     "mcp>=1.0.0",
+    # charset-normalizer 3.4.2+ crashes on import with Python 3.12;
+    # keep pinned until upstream fixes the regression.
+    "charset-normalizer>=3.0,<3.4.2",
 ]
 authors = [
     {name = "KiAssist Contributors"}
@@ -22,10 +25,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 
@@ -41,9 +40,12 @@ dev = [
 ai = [
     "anthropic>=0.30.0",
     "openai>=1.30.0",
+    # pydantic 2.12+ has a schema-generation regression that breaks
+    # anthropic's Pydantic models on import (Python 3.12).
+    "pydantic>=2.10,<2.12",
 ]
 local-llm = [
-    "llama-cpp-python[server]>=0.3.0",
+    "llama-cpp-python[server]>=0.3.8",
 ]
 
 [project.scripts]

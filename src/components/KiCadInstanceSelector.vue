@@ -300,9 +300,24 @@ function onRequirementsSaved(files: string[]) {
   checkRequirementsFile();
 }
 
-// Watch for project changes to update requirements status
-watch(selectedProject, () => {
+// Watch for project changes to update requirements status and notify backend
+watch(selectedProject, async (newProject) => {
   checkRequirementsFile();
+
+  // Notify the backend of the selected project so board/schematic context
+  // is included in the system prompt when the user sends a message.
+  if (newProject && window.pywebview?.api) {
+    const projectPath = 'socket_path' in newProject
+      ? newProject.project_path
+      : newProject.path;
+    if (projectPath) {
+      try {
+        await window.pywebview.api.set_project_path(projectPath);
+      } catch (err) {
+        console.error('Failed to set project path on backend:', err);
+      }
+    }
+  }
 }, { immediate: true });
 
 onMounted(() => {

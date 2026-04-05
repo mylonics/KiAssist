@@ -469,7 +469,7 @@ class LocalModelManager:
     def start_server(
         self,
         model_id: str,
-        n_ctx: int = 4096,
+        n_ctx: int = 16384,
         n_gpu_layers: int = -1,
     ) -> Dict[str, Any]:
         """Start the local ``llama-cpp-python`` inference server.
@@ -479,7 +479,7 @@ class LocalModelManager:
 
         Args:
             model_id: The variant ID to serve (must be downloaded).
-            n_ctx: Context size in tokens (default 4096).
+            n_ctx: Context size in tokens (default 16384).
             n_gpu_layers: Number of layers to offload to GPU (-1 = all).
 
         Returns:
@@ -696,6 +696,9 @@ class LocalModelManager:
     def get_server_status(self) -> Dict[str, Any]:
         """Return the current server status.
 
+        Checks both the tracked subprocess *and* the actual health
+        endpoint, so orphan servers from a previous session are detected.
+
         Returns:
             Dictionary with ``running``, ``url``, ``model_id``, ``port``.
         """
@@ -709,6 +712,21 @@ class LocalModelManager:
                 self._server_process = None
                 self._server_model_id = None
                 self._server_ready.clear()
+
+        # If we don't own a process, probe the port to detect an orphan
+        # server left behind by a previous session.
+        if not running and self._is_port_in_use(self._server_port):
+            try:
+                url = f"http://127.0.0.1:{self._server_port}/v1/models"
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    if resp.status == 200:
+                        running = True
+                        logger.info(
+                            "Detected orphan LLM server on port %s",
+                            self._server_port,
+                        )
+            except Exception:
+                pass
 
         return {
             "running": running,
