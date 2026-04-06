@@ -96,7 +96,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-e2b-q4_k_m",
         "name": "Gemma 4 E2B (Q4_K_M)",
-        "ollama_tag": "gemma3:4b",
+        "ollama_tag": "gemma4:e2b",
         "filename": "google_gemma-4-E2B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-E2B-it-GGUF",
         "size_label": "~3.5 GB",
@@ -107,7 +107,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-e4b-q4_k_m",
         "name": "Gemma 4 E4B (Q4_K_M)",
-        "ollama_tag": "gemma3:12b",
+        "ollama_tag": "gemma4:e4b",
         "filename": "google_gemma-4-E4B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-E4B-it-GGUF",
         "size_label": "~5.4 GB",
@@ -118,7 +118,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-26b-a4b-q4_k_m",
         "name": "Gemma 4 26B-A4B (Q4_K_M)",
-        "ollama_tag": "gemma3:27b",
+        "ollama_tag": "gemma4:26b",
         "filename": "google_gemma-4-26B-A4B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-26B-A4B-it-GGUF",
         "size_label": "~17.0 GB",
@@ -129,7 +129,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-31b-q4_k_m",
         "name": "Gemma 4 31B (Q4_K_M)",
-        "ollama_tag": "gemma3:27b-it-q4_K_M",
+        "ollama_tag": "gemma4:31b",
         "filename": "google_gemma-4-31B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-31B-it-GGUF",
         "size_label": "~19.6 GB",

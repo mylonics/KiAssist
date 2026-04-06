@@ -284,7 +284,7 @@ class TestOllamaListModels:
         import json
         mock_data = json.dumps({
             "models": [
-                {"name": "gemma3:4b"},
+                {"name": "gemma4:e2b"},
                 {"name": "llama3.2:latest"},
             ]
         }).encode()
@@ -296,7 +296,7 @@ class TestOllamaListModels:
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
             models = LocalModelManager.ollama_list_models()
-            assert "gemma3:4b" in models
+            assert "gemma4:e2b" in models
             assert "llama3.2:latest" in models
 
     def test_list_models_unreachable(self):
@@ -310,19 +310,19 @@ class TestOllamaModelPulled:
 
     def test_model_pulled_exact_match(self, manager):
         with patch.object(LocalModelManager, "ollama_list_models",
-                          return_value=["gemma3:4b", "llama3.2:latest"]):
-            assert manager._ollama_model_pulled("gemma3:4b") is True
+                          return_value=["gemma4:e2b", "llama3.2:latest"]):
+            assert manager._ollama_model_pulled("gemma4:e2b") is True
 
     def test_model_not_pulled(self, manager):
         with patch.object(LocalModelManager, "ollama_list_models",
                           return_value=["llama3.2:latest"]):
-            assert manager._ollama_model_pulled("gemma3:4b") is False
+            assert manager._ollama_model_pulled("gemma4:e2b") is False
 
     def test_model_pulled_bare_name(self, manager):
         """Bare name matches any tag of that model."""
         with patch.object(LocalModelManager, "ollama_list_models",
-                          return_value=["gemma3:4b"]):
-            assert manager._ollama_model_pulled("gemma3") is True
+                          return_value=["gemma4:e2b"]):
+            assert manager._ollama_model_pulled("gemma4") is True
 
 
 class TestOllamaPull:
@@ -330,13 +330,13 @@ class TestOllamaPull:
 
     def test_pull_not_installed(self, manager):
         with patch.object(LocalModelManager, "is_ollama_available", return_value=False):
-            result = manager.ollama_pull("gemma3:4b")
+            result = manager.ollama_pull("gemma4:e2b")
             assert result["success"] is False
             assert "not installed" in result["error"].lower()
 
     def test_pull_starts_thread(self, manager):
         with patch.object(LocalModelManager, "is_ollama_available", return_value=True):
-            result = manager.ollama_pull("gemma3:4b")
+            result = manager.ollama_pull("gemma4:e2b")
             assert result["success"] is True
             assert "pulling" in result["message"].lower()
             # Clean up: wait for thread to finish (it will fail since ollama
@@ -382,7 +382,7 @@ class TestDownloadModelPrefsOllama:
                           return_value={"success": True, "message": "pulling..."}) as mock_pull:
             result = manager.download_model("gemma4-e2b-q4_k_m")
             assert result["success"] is True
-            mock_pull.assert_called_once_with("gemma3:4b", None)
+            mock_pull.assert_called_once_with("gemma4:e2b", None)
 
     def test_download_already_in_ollama(self, manager):
         with patch.object(LocalModelManager, "is_ollama_available", return_value=True), \
@@ -452,7 +452,7 @@ class TestGetAvailableModelsWithOllama:
     def test_models_show_backend_ollama_when_pulled(self, manager):
         with patch.object(LocalModelManager, "is_ollama_available", return_value=True), \
              patch.object(LocalModelManager, "ollama_list_models",
-                          return_value=["gemma3:4b"]):
+                          return_value=["gemma4:e2b"]):
             models = manager.get_available_models()
             e2b = next(m for m in models if m["id"] == "gemma4-e2b-q4_k_m")
             assert e2b["downloaded"] is True
