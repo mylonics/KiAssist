@@ -21,7 +21,13 @@ from .history import ConversationStore
 from .memory import ProjectMemory
 from .project_context import get_raw_context, get_llm_synthesized_context
 from .prompts import SystemPromptBuilder
-from .requirements import ComponentChange, ContextState, FileChange, ProjectRequirements, RequirementsManager
+from .requirements import (
+    ComponentChange,
+    ContextState,
+    FileChange,
+    ProjectRequirements,
+    RequirementsManager,
+)
 from .tokens import ContextWindowManager, usage_to_tokens
 
 __all__ = [

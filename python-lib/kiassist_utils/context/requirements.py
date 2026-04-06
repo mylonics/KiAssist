@@ -32,7 +32,7 @@ Example::
     req = manager.start_raw_context_generation()
     manager.set_raw_context(req, raw_context_string)
     manager.set_auto_context(req, synthesized_context, pending_questions=[])
-    manager.mark_up_to_date(req)
+    # state is now UP_TO_DATE (no questions → set_auto_context transitions directly)
 
     # Later — check for PCB changes
     if manager.detect_and_handle_pcb_change(req):
@@ -388,7 +388,8 @@ class RequirementsManager:
 
     def __init__(self, project_path: str | Path) -> None:
         p = Path(project_path)
-        self._project_dir: Path = p.parent if p.is_file() else p
+        is_project_file = p.suffix == ".kicad_pro" or (p.exists() and p.is_file())
+        self._project_dir: Path = p.parent if is_project_file else p
         self._state_dir: Path = self._project_dir / self.KIASSIST_DIR
         self._state_path: Path = self._state_dir / self.STATE_FILE
 

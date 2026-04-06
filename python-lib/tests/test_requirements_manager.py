@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import List
 
 import pytest
 
@@ -282,6 +281,25 @@ class TestRequirementsManagerPersistence:
         req = manager.load_or_create()
         assert req.state == ContextState.GETTING_RAW_CONTEXT
         assert req.user_requirements == ""
+
+    def test_init_with_existing_kicad_pro_path(self, tmp_path: Path):
+        """A .kicad_pro path that exists resolves to its parent directory."""
+        pro_file = tmp_path / "board.kicad_pro"
+        pro_file.write_text("", encoding="utf-8")
+        manager = RequirementsManager(pro_file)
+        assert manager.project_dir == tmp_path
+
+    def test_init_with_nonexistent_kicad_pro_path(self, tmp_path: Path):
+        """A .kicad_pro path that doesn't exist yet resolves to its parent directory."""
+        pro_file = tmp_path / "board.kicad_pro"
+        # File does NOT exist — suffix-based detection must still work
+        manager = RequirementsManager(pro_file)
+        assert manager.project_dir == tmp_path
+
+    def test_init_with_directory(self, tmp_path: Path):
+        """A plain directory path is used as the project directory directly."""
+        manager = RequirementsManager(tmp_path)
+        assert manager.project_dir == tmp_path
 
     def test_save_and_reload(self, tmp_path: Path):
         manager = RequirementsManager(tmp_path)
