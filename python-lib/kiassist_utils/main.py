@@ -192,6 +192,8 @@ class KiAssistAPI:
                 # Include server status so the frontend knows whether the
                 # local inference server is running and which model is loaded.
                 entry["server_status"] = self._local_model_manager.get_server_status()
+                entry["backend"] = self._local_model_manager.get_backend()
+                entry["ollama_available"] = self._local_model_manager.is_ollama_available()
             else:
                 entry["has_key"] = self.api_key_store.has_api_key(info["id"])
             providers.append(entry)
@@ -253,9 +255,28 @@ class KiAssistAPI:
                 ) from exc
 
         if provider_name == "gemma4":
-            # Gemma 4 uses the local llama-cpp-python server managed by
-            # LocalModelManager.  If the server is running, connect to it;
-            # otherwise auto-start it with the requested model.
+            # Gemma 4 prefers Ollama (automatic GPU support, cross-platform).
+            # Falls back to the llama-cpp-python server via LocalModelManager
+            # when Ollama is not installed.
+            if self._local_model_manager.is_ollama_available():
+                # Resolve the Ollama model tag for this variant
+                ollama_tag = self._resolve_ollama_tag(model)
+                ensure_result = self._local_model_manager.ensure_ollama_running()
+                if not ensure_result.get("success"):
+                    raise RuntimeError(
+                        ensure_result.get("error", "Failed to start Ollama.")
+                    )
+                base_url = ensure_result["url"]
+                try:
+                    from .ai.ollama import OllamaProvider  # optional dep
+                    return OllamaProvider(model=ollama_tag, base_url=base_url)
+                except ImportError as exc:
+                    raise ImportError(
+                        "The 'openai' package is required to use Gemma 4 local models. "
+                        "Install it with: pip install openai"
+                    ) from exc
+
+            # Fallback: llama-cpp-python
             status = self._local_model_manager.get_server_status()
             if not status["running"]:
                 start_result = self._local_model_manager.start_server(model)
@@ -299,6 +320,20 @@ class KiAssistAPI:
             return OpenAIProvider(api_key, model)
 
         return None
+
+    @staticmethod
+    def _resolve_ollama_tag(model_id: str) -> str:
+        """Map a KiAssist model ID to its Ollama tag.
+
+        Looks up the ``ollama_tag`` field in :data:`_PROVIDER_REGISTRY` for the
+        ``gemma4`` provider, falling back to the model ID itself when no
+        mapping exists.
+        """
+        from .local_llm import _KNOWN_MODEL_VARIANTS
+        for variant in _KNOWN_MODEL_VARIANTS:
+            if variant["id"] == model_id:
+                return variant.get("ollama_tag", model_id)
+        return model_id
 
     def _get_local_base_url(self) -> str:
         """Return the configured local model server base URL.
@@ -685,13 +720,15 @@ class KiAssistAPI:
     ) -> Dict[str, Any]:
         """Start the local Gemma 4 inference server.
 
-        Launches a ``llama-cpp-python`` server to serve the requested model
-        on ``http://127.0.0.1:{port}/v1``.
+        Prefers Ollama when available (automatic GPU acceleration), falling
+        back to ``llama-cpp-python`` otherwise.
 
         Args:
             model_id: Variant ID of the downloaded model to serve.
-            n_ctx: Context window size in tokens (default 16384).
-            n_gpu_layers: GPU layers to offload (-1 = all available).
+            n_ctx: Context window size in tokens (default 16384,
+                llama-cpp-python only).
+            n_gpu_layers: GPU layers to offload (-1 = all available,
+                llama-cpp-python only).
 
         Returns:
             Result dictionary with ``url`` on success.

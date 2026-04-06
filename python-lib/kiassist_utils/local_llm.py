@@ -1,16 +1,26 @@
-"""Local LLM model manager for downloading and serving Gemma 4 GGUF models.
+"""Local LLM model manager for downloading and serving Gemma 4 models.
 
 This module provides:
 
-* Discovery of available Gemma 4 model variants from Hugging Face Hub.
-* Download management with progress tracking.
-* Lifecycle control for a local ``llama-cpp-python`` inference server that
-  exposes an OpenAI-compatible ``/v1`` API so the existing
+* Discovery of available Gemma 4 model variants.
+* Download / pull management with progress tracking.
+* Lifecycle control for a local inference server that exposes an
+  OpenAI-compatible ``/v1`` API so the existing
   :class:`~kiassist_utils.ai.ollama.OllamaProvider` can connect seamlessly.
 
-Models are downloaded from Hugging Face (public GGUF repos) and stored
-under ``~/.kiassist/models/`` by default.  The storage directory can be
-overridden via the ``KIASSIST_MODELS_DIR`` environment variable.
+Two backends are supported, tried in order:
+
+1. **Ollama** (recommended) – cross-platform, automatic GPU acceleration.
+   Models are pulled via ``ollama pull <tag>`` and served by the Ollama
+   daemon on ``http://localhost:11434/v1``.
+2. **llama-cpp-python** (fallback) – models are downloaded as GGUF files
+   from Hugging Face Hub and served by an embedded HTTP server.
+
+The backend selection is automatic: if Ollama is detected on ``$PATH``
+the manager prefers it; otherwise it falls back to llama-cpp-python.
+
+Models directory (GGUF fallback): ``~/.kiassist/models/`` (override via
+``KIASSIST_MODELS_DIR`` environment variable).
 
 Usage example::
 
@@ -22,11 +32,11 @@ Usage example::
     for m in mgr.get_available_models():
         print(m["id"], m["size_label"], m["downloaded"])
 
-    # Download a model (blocks, updates progress)
-    mgr.download_model("gemma4-4b-q4_k_m")
+    # Pull / download a model (Ollama preferred)
+    mgr.download_model("gemma4-e2b-q4_k_m")
 
     # Start serving
-    mgr.start_server("gemma4-4b-q4_k_m")
+    mgr.start_server("gemma4-e2b-q4_k_m")
     print(mgr.get_server_status())  # {"running": True, "url": "...", ...}
 
     # Stop when done
@@ -56,15 +66,18 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Default directory for downloaded models
+# Default directory for downloaded models (GGUF fallback only)
 _DEFAULT_MODELS_DIR = Path.home() / ".kiassist" / "models"
 
-# Hugging Face Hub base URL for resolving model downloads.
-# Models are fetched from: https://huggingface.co/{repo_id}/resolve/main/{filename}
+# Hugging Face Hub base URL for resolving model downloads (GGUF fallback).
 _HF_BASE_URL = "https://huggingface.co"
 
-# Port for the local llama-cpp-python server
+# Port used by the llama-cpp-python fallback server.
 _DEFAULT_SERVER_PORT = 8741
+
+# Default Ollama server endpoint.
+_DEFAULT_OLLAMA_PORT = 11434
+_DEFAULT_OLLAMA_URL = f"http://localhost:{_DEFAULT_OLLAMA_PORT}/v1"
 
 # How often to poll download progress (bytes between updates)
 _PROGRESS_UPDATE_INTERVAL = 1024 * 1024  # 1 MiB
@@ -74,14 +87,16 @@ _PROGRESS_UPDATE_INTERVAL = 1024 * 1024  # 1 MiB
 # Model variant definitions
 # ---------------------------------------------------------------------------
 
-# These define the *known* Gemma 4 model variants that KiAssist can download
-# and serve.  Each entry points to a public GGUF file on Hugging Face Hub.
-# Additional variants discovered at runtime in the models directory are merged in.
+# Each entry contains both the Ollama tag (preferred) and the Hugging Face
+# GGUF coordinates (fallback).  ``ollama_tag`` is passed to ``ollama pull``
+# when Ollama is available; ``filename`` / ``hf_repo`` are used for the
+# legacy GGUF download path.
 
 _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-e2b-q4_k_m",
         "name": "Gemma 4 E2B (Q4_K_M)",
+        "ollama_tag": "gemma3:4b",
         "filename": "google_gemma-4-E2B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-E2B-it-GGUF",
         "size_label": "~3.5 GB",
@@ -92,6 +107,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-e4b-q4_k_m",
         "name": "Gemma 4 E4B (Q4_K_M)",
+        "ollama_tag": "gemma3:12b",
         "filename": "google_gemma-4-E4B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-E4B-it-GGUF",
         "size_label": "~5.4 GB",
@@ -102,6 +118,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-26b-a4b-q4_k_m",
         "name": "Gemma 4 26B-A4B (Q4_K_M)",
+        "ollama_tag": "gemma3:27b",
         "filename": "google_gemma-4-26B-A4B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-26B-A4B-it-GGUF",
         "size_label": "~17.0 GB",
@@ -112,6 +129,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
     {
         "id": "gemma4-31b-q4_k_m",
         "name": "Gemma 4 31B (Q4_K_M)",
+        "ollama_tag": "gemma3:27b-it-q4_K_M",
         "filename": "google_gemma-4-31B-it-Q4_K_M.gguf",
         "hf_repo": "bartowski/google_gemma-4-31B-it-GGUF",
         "size_label": "~19.6 GB",
@@ -156,7 +174,10 @@ class DownloadProgress:
 # ---------------------------------------------------------------------------
 
 class LocalModelManager:
-    """Manages downloading, storing, and serving local Gemma 4 GGUF models.
+    """Manages downloading, storing, and serving local Gemma 4 models.
+
+    Prefers Ollama when available (automatic GPU acceleration, cross-platform).
+    Falls back to llama-cpp-python GGUF serving when Ollama is not installed.
 
     Thread-safe.  All public methods are safe to call from any thread.
     """
@@ -180,12 +201,241 @@ class LocalModelManager:
         self._download_thread: Optional[threading.Thread] = None
         self._download_cancel = threading.Event()
 
-        # Server state
+        # Server state (llama-cpp-python fallback)
         self._server_lock = threading.Lock()
         self._server_process: Optional[subprocess.Popen] = None
         self._server_model_id: Optional[str] = None
         self._server_ready = threading.Event()
         self._server_log_file: Optional[Path] = None
+
+        # Ollama state
+        self._ollama_model_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Ollama detection & management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_ollama_available() -> bool:
+        """Return ``True`` if the ``ollama`` CLI is found on ``$PATH``."""
+        return shutil.which("ollama") is not None
+
+    @staticmethod
+    def is_ollama_running() -> bool:
+        """Return ``True`` if the Ollama daemon is reachable."""
+        try:
+            url = f"http://localhost:{_DEFAULT_OLLAMA_PORT}/api/tags"
+            with urllib.request.urlopen(url, timeout=3):
+                return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def ollama_list_models() -> List[str]:
+        """Return model tags currently available in the local Ollama library.
+
+        Returns an empty list when Ollama is not running or unreachable.
+        """
+        try:
+            url = f"http://localhost:{_DEFAULT_OLLAMA_PORT}/api/tags"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        except Exception:
+            return []
+
+    def ollama_pull(
+        self,
+        ollama_tag: str,
+        progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
+    ) -> Dict[str, Any]:
+        """Pull a model into the local Ollama library.
+
+        Runs ``ollama pull <tag>`` in a background thread.  The caller can
+        monitor progress via :meth:`get_download_progress` or the optional
+        *progress_callback*.
+
+        Args:
+            ollama_tag: Ollama model tag (e.g. ``"gemma3:4b"``).
+            progress_callback: Optional callback invoked periodically.
+
+        Returns:
+            Result dict with ``success`` and optional ``error``.
+        """
+        if not self.is_ollama_available():
+            return {
+                "success": False,
+                "error": (
+                    "Ollama is not installed. "
+                    "Install it from https://ollama.com and try again."
+                ),
+            }
+
+        with self._download_lock:
+            if (
+                self._download_thread is not None
+                and self._download_thread.is_alive()
+            ):
+                return {
+                    "success": False,
+                    "error": "Another download is already in progress.",
+                }
+
+            self._download_cancel.clear()
+            self._download_progress = DownloadProgress(
+                model_id=ollama_tag,
+                filename=ollama_tag,
+                status="downloading",
+            )
+            self._download_thread = threading.Thread(
+                target=self._ollama_pull_worker,
+                args=(ollama_tag, progress_callback),
+                daemon=True,
+            )
+            self._download_thread.start()
+
+        return {"success": True, "message": f"Pulling {ollama_tag} via Ollama…"}
+
+    def _ollama_pull_worker(
+        self,
+        ollama_tag: str,
+        callback: Optional[Callable[[DownloadProgress], None]],
+    ) -> None:
+        """Background worker that runs ``ollama pull``."""
+        try:
+            proc = subprocess.Popen(
+                ["ollama", "pull", ollama_tag],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+
+            while True:
+                if self._download_cancel.is_set():
+                    proc.terminate()
+                    self._download_progress.status = "cancelled"
+                    return
+
+                line = proc.stdout.readline() if proc.stdout else ""
+                if not line and proc.poll() is not None:
+                    break
+
+                # Ollama prints progress like "pulling abc123... 45% ▕████░░░▏ 1.2 GB/3.5 GB"
+                if "%" in line:
+                    try:
+                        pct_str = line.split("%")[0].rsplit(None, 1)[-1]
+                        pct = float(pct_str)
+                        self._download_progress.downloaded_bytes = int(pct)
+                        self._download_progress.total_bytes = 100
+                    except (ValueError, IndexError):
+                        pass
+
+                if callback:
+                    callback(self._download_progress)
+
+            if proc.returncode == 0:
+                self._download_progress.status = "completed"
+                self._download_progress.downloaded_bytes = 100
+                self._download_progress.total_bytes = 100
+                logger.info("Ollama pull completed for %s", ollama_tag)
+            else:
+                self._download_progress.status = "error"
+                self._download_progress.error = (
+                    f"ollama pull exited with code {proc.returncode}"
+                )
+
+        except Exception as exc:
+            self._download_progress.status = "error"
+            self._download_progress.error = str(exc)
+            logger.error("Ollama pull failed for %s: %s", ollama_tag, exc)
+
+        if callback:
+            callback(self._download_progress)
+
+    def _ollama_model_pulled(self, ollama_tag: str) -> bool:
+        """Return ``True`` if *ollama_tag* is already pulled locally."""
+        available = self.ollama_list_models()
+        # Ollama tags may include ":latest" implicitly
+        for name in available:
+            if name == ollama_tag or name.startswith(ollama_tag + ":"):
+                return True
+            # Check without the ":latest" suffix
+            base = name.split(":")[0]
+            tag_base = ollama_tag.split(":")[0]
+            if base == tag_base and (
+                ollama_tag == tag_base  # user asked for bare name
+                or name == ollama_tag
+            ):
+                return True
+        return False
+
+    def ensure_ollama_running(self) -> Dict[str, Any]:
+        """Ensure the Ollama daemon is running.
+
+        If Ollama is installed but the daemon is not reachable, attempts to
+        start it with ``ollama serve`` in the background.
+
+        Returns:
+            Result dict with ``success``, ``url``, and ``already_running``.
+        """
+        if not self.is_ollama_available():
+            return {
+                "success": False,
+                "error": (
+                    "Ollama is not installed. "
+                    "Install it from https://ollama.com and try again."
+                ),
+            }
+
+        if self.is_ollama_running():
+            return {
+                "success": True,
+                "url": _DEFAULT_OLLAMA_URL,
+                "already_running": True,
+            }
+
+        # Attempt to start the Ollama daemon
+        try:
+            kwargs: Dict[str, Any] = {
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if sys.platform == "win32":
+                kwargs["creationflags"] = (
+                    subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+                )
+
+            subprocess.Popen(["ollama", "serve"], **kwargs)
+            logger.info("Started Ollama daemon via 'ollama serve'.")
+
+            # Wait for the daemon to become reachable
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if self.is_ollama_running():
+                    return {
+                        "success": True,
+                        "url": _DEFAULT_OLLAMA_URL,
+                        "already_running": False,
+                    }
+                time.sleep(0.5)
+
+            return {
+                "success": False,
+                "error": "Started 'ollama serve' but daemon did not become reachable within 15 seconds.",
+            }
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "error": "Ollama binary not found despite being detected earlier.",
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def get_backend(self) -> str:
+        """Return the active backend name: ``"ollama"`` or ``"llama-cpp-python"``."""
+        if self.is_ollama_available():
+            return "ollama"
+        return "llama-cpp-python"
 
     # ------------------------------------------------------------------
     # Model discovery
@@ -196,24 +446,44 @@ class LocalModelManager:
 
         Each entry contains:
 
-        * ``id`` – unique identifier (e.g. ``"gemma4-4b-q4_k_m"``)
+        * ``id`` – unique identifier (e.g. ``"gemma4-e2b-q4_k_m"``)
         * ``name`` – human-readable name
+        * ``ollama_tag`` – Ollama model tag for ``ollama pull``
         * ``filename`` – GGUF filename on disk / in the release
         * ``size_label`` – human-readable size string
         * ``description`` – one-liner describing the variant
-        * ``downloaded`` – whether the file exists locally
-        * ``path`` – full path to the local file (may not exist yet)
+        * ``downloaded`` – whether the model is ready (Ollama pulled or GGUF exists)
+        * ``path`` – full path to the local GGUF file (may not exist)
+        * ``backend`` – ``"ollama"`` or ``"gguf"`` indicating readiness source
 
         This merges the built-in variant list with any extra models
         discovered in the models directory.
         """
         models: List[Dict[str, Any]] = []
+        use_ollama = self.is_ollama_available()
+        ollama_models = self.ollama_list_models() if use_ollama else []
 
         for variant in _KNOWN_MODEL_VARIANTS:
             entry = dict(variant)
             local_path = self._models_dir / variant["filename"]
-            entry["downloaded"] = local_path.is_file()
+            gguf_exists = local_path.is_file()
+
+            ollama_tag = variant.get("ollama_tag", "")
+            ollama_ready = False
+            if ollama_tag and ollama_models:
+                for name in ollama_models:
+                    if name == ollama_tag or name.startswith(ollama_tag + ":"):
+                        ollama_ready = True
+                        break
+                    base = name.split(":")[0]
+                    tag_base = ollama_tag.split(":")[0]
+                    if base == tag_base and ollama_tag == tag_base:
+                        ollama_ready = True
+                        break
+
+            entry["downloaded"] = ollama_ready or gguf_exists
             entry["path"] = str(local_path)
+            entry["backend"] = "ollama" if ollama_ready else ("gguf" if gguf_exists else "none")
             models.append(entry)
 
         # Also discover any extra .gguf files in the models directory that
@@ -224,6 +494,7 @@ class LocalModelManager:
                 models.append({
                     "id": gguf_file.stem,
                     "name": gguf_file.stem,
+                    "ollama_tag": "",
                     "filename": gguf_file.name,
                     "size_label": _human_readable_size(gguf_file.stat().st_size),
                     "size_bytes": gguf_file.stat().st_size,
@@ -232,6 +503,7 @@ class LocalModelManager:
                     "hf_repo": "",
                     "downloaded": True,
                     "path": str(gguf_file),
+                    "backend": "gguf",
                 })
 
         return models
@@ -287,7 +559,10 @@ class LocalModelManager:
         model_id: str,
         progress_callback: Optional[Callable[[DownloadProgress], None]] = None,
     ) -> Dict[str, Any]:
-        """Start downloading a model variant in the background.
+        """Start downloading / pulling a model variant in the background.
+
+        When Ollama is available, delegates to :meth:`ollama_pull`.
+        Otherwise falls back to downloading the GGUF file from Hugging Face.
 
         Args:
             model_id: The variant ID to download.
@@ -301,6 +576,14 @@ class LocalModelManager:
         if not variant:
             return {"success": False, "error": f"Unknown model: {model_id}"}
 
+        # -- Prefer Ollama when available --
+        ollama_tag = variant.get("ollama_tag", "")
+        if ollama_tag and self.is_ollama_available():
+            if self._ollama_model_pulled(ollama_tag):
+                return {"success": True, "message": "Model already available in Ollama."}
+            return self.ollama_pull(ollama_tag, progress_callback)
+
+        # -- GGUF fallback --
         local_path = self._models_dir / variant["filename"]
         if local_path.is_file():
             return {"success": True, "message": "Model already downloaded."}
@@ -472,15 +755,20 @@ class LocalModelManager:
         n_ctx: int = 16384,
         n_gpu_layers: int = -1,
     ) -> Dict[str, Any]:
-        """Start the local ``llama-cpp-python`` inference server.
+        """Start a local inference server for the given model.
+
+        When Ollama is available, ensures the daemon is running and the model
+        is pulled, then returns the Ollama endpoint URL.  Otherwise falls
+        back to launching a ``llama-cpp-python`` server subprocess.
 
         The server exposes an OpenAI-compatible API at
         ``http://localhost:{port}/v1``.
 
         Args:
-            model_id: The variant ID to serve (must be downloaded).
-            n_ctx: Context size in tokens (default 16384).
-            n_gpu_layers: Number of layers to offload to GPU (-1 = all).
+            model_id: The variant ID to serve (must be downloaded / pulled).
+            n_ctx: Context size in tokens (default 16384, llama-cpp-python only).
+            n_gpu_layers: Number of layers to offload to GPU (-1 = all,
+                llama-cpp-python only).
 
         Returns:
             Result dict with ``url`` on success.
@@ -489,6 +777,54 @@ class LocalModelManager:
         if not variant:
             return {"success": False, "error": f"Unknown model: {model_id}"}
 
+        # -- Prefer Ollama --
+        ollama_tag = variant.get("ollama_tag", "")
+        if ollama_tag and self.is_ollama_available():
+            return self._start_server_ollama(model_id, ollama_tag)
+
+        # -- Fallback: llama-cpp-python --
+        return self._start_server_llama_cpp(model_id, variant, n_ctx, n_gpu_layers)
+
+    def _start_server_ollama(
+        self, model_id: str, ollama_tag: str
+    ) -> Dict[str, Any]:
+        """Start serving via Ollama (ensure daemon + pull model)."""
+        # 1. Make sure the daemon is running
+        ensure_result = self.ensure_ollama_running()
+        if not ensure_result.get("success"):
+            return ensure_result
+
+        # 2. Pull the model if not already available
+        if not self._ollama_model_pulled(ollama_tag):
+            pull_result = self.ollama_pull(ollama_tag)
+            if not pull_result.get("success"):
+                return pull_result
+            # Wait for the pull to finish (synchronously, up to 10 min)
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                progress = self.get_download_progress()
+                if progress.get("status") in ("completed", "error", "cancelled"):
+                    break
+                time.sleep(2)
+            if progress.get("status") != "completed":
+                return {
+                    "success": False,
+                    "error": f"Model pull did not complete: {progress.get('error', progress.get('status', 'unknown'))}",
+                }
+
+        self._ollama_model_id = model_id
+        url = _DEFAULT_OLLAMA_URL
+        logger.info("Ollama serving model %s (%s) at %s", model_id, ollama_tag, url)
+        return {"success": True, "url": url, "model_id": model_id, "backend": "ollama"}
+
+    def _start_server_llama_cpp(
+        self,
+        model_id: str,
+        variant: Dict[str, Any],
+        n_ctx: int,
+        n_gpu_layers: int,
+    ) -> Dict[str, Any]:
+        """Fallback: start a ``llama-cpp-python`` server."""
         model_path = self._models_dir / variant["filename"]
         if not model_path.is_file():
             return {
@@ -660,7 +996,16 @@ class LocalModelManager:
         return False
 
     def stop_server(self) -> Dict[str, Any]:
-        """Stop the local LLM server if running."""
+        """Stop the local LLM server if running.
+
+        For Ollama-backed models this simply clears the tracked model ID
+        (the Ollama daemon continues running for other clients).
+        For llama-cpp-python it terminates the child process.
+        """
+        # Clear Ollama tracking (we don't stop the daemon itself)
+        if self._ollama_model_id is not None:
+            self._ollama_model_id = None
+
         with self._server_lock:
             return self._stop_server_locked()
 
@@ -696,12 +1041,34 @@ class LocalModelManager:
     def get_server_status(self) -> Dict[str, Any]:
         """Return the current server status.
 
-        Checks both the tracked subprocess *and* the actual health
-        endpoint, so orphan servers from a previous session are detected.
+        Checks Ollama first, then the tracked llama-cpp-python subprocess,
+        and finally probes the fallback port for an orphan server.
 
         Returns:
-            Dictionary with ``running``, ``url``, ``model_id``, ``port``.
+            Dictionary with ``running``, ``url``, ``model_id``, ``port``,
+            and ``backend``.
         """
+        # -- Ollama path --
+        if self._ollama_model_id is not None and self.is_ollama_running():
+            return {
+                "running": True,
+                "url": _DEFAULT_OLLAMA_URL,
+                "model_id": self._ollama_model_id,
+                "port": _DEFAULT_OLLAMA_PORT,
+                "backend": "ollama",
+            }
+
+        # Check if Ollama is running even without a tracked model (external start)
+        if self.is_ollama_available() and self.is_ollama_running():
+            return {
+                "running": True,
+                "url": _DEFAULT_OLLAMA_URL,
+                "model_id": self._ollama_model_id,
+                "port": _DEFAULT_OLLAMA_PORT,
+                "backend": "ollama",
+            }
+
+        # -- llama-cpp-python path --
         with self._server_lock:
             running = (
                 self._server_process is not None
@@ -733,6 +1100,7 @@ class LocalModelManager:
             "url": f"http://127.0.0.1:{self._server_port}/v1" if running else None,
             "model_id": self._server_model_id if running else None,
             "port": self._server_port,
+            "backend": "llama-cpp-python" if running else None,
         }
 
     # ------------------------------------------------------------------
