@@ -12,6 +12,8 @@ Provides four key subsystems:
   (design decisions, preferences, constraints).
 * :mod:`~kiassist_utils.context.file_cache` — LRU cache tracking which files
   the AI has already "seen", with mtime-based invalidation.
+* :mod:`~kiassist_utils.context.requirements` — Structured context &
+  requirements lifecycle (state machine, change detection, diff generation).
 """
 
 from .file_cache import FileStateCache
@@ -19,13 +21,25 @@ from .history import ConversationStore
 from .memory import ProjectMemory
 from .project_context import get_raw_context, get_llm_synthesized_context
 from .prompts import SystemPromptBuilder
+from .requirements import (
+    ComponentChange,
+    ContextState,
+    FileChange,
+    ProjectRequirements,
+    RequirementsManager,
+)
 from .tokens import ContextWindowManager, usage_to_tokens
 
 __all__ = [
     "ConversationStore",
+    "ComponentChange",
+    "ContextState",
     "ContextWindowManager",
+    "FileChange",
     "FileStateCache",
     "ProjectMemory",
+    "ProjectRequirements",
+    "RequirementsManager",
     "SystemPromptBuilder",
     "get_raw_context",
     "get_llm_synthesized_context",
