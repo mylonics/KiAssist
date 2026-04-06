@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from ..kicad_parser.symbol_lib import SymbolDef, SymbolLibrary
 from .models import ComponentCandidate
@@ -269,7 +269,7 @@ def find_library_files(search_paths: List[Path]) -> List[Path]:
     Returns:
         Deduplicated list of ``.kicad_sym`` :class:`~pathlib.Path` objects.
     """
-    seen: set[Path] = set()
+    seen: Set[Path] = set()
     libs: List[Path] = []
     for root in search_paths:
         if root.is_file() and root.suffix == ".kicad_sym":
