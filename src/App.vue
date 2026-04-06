@@ -3,9 +3,12 @@ import { ref } from 'vue';
 import ChatBox from './components/ChatBox.vue';
 import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
+import LlmActivityPanel from './components/LlmActivityPanel.vue';
+import ProjectContextPanel from './components/ProjectContextPanel.vue';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const rightPanelCollapsed = ref(false);
+const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
 </script>
 
 <template>
@@ -19,12 +22,42 @@ const rightPanelCollapsed = ref(false);
     <button
       class="panel-toggle-btn"
       @click="rightPanelCollapsed = !rightPanelCollapsed"
-      :title="rightPanelCollapsed ? 'Show API Activity' : 'Hide API Activity'"
+      :title="rightPanelCollapsed ? 'Show Debug Panel' : 'Hide Debug Panel'"
     >
       <span class="material-icons">{{ rightPanelCollapsed ? 'chevron_left' : 'chevron_right' }}</span>
     </button>
     <aside v-show="!rightPanelCollapsed" class="right-panel">
-      <ApiActivityPanel ref="activityPanel" />
+      <div class="right-panel-tabs">
+        <button
+          :class="['tab-btn', { active: rightPanelTab === 'context' }]"
+          @click="rightPanelTab = 'context'"
+          title="Project context (schematic hierarchy, BOM, netlist)"
+        >
+          <span class="material-icons tab-icon">account_tree</span>
+          Context
+        </button>
+        <button
+          :class="['tab-btn', { active: rightPanelTab === 'llm' }]"
+          @click="rightPanelTab = 'llm'"
+          title="LLM interactions (backend ↔ AI)"
+        >
+          <span class="material-icons tab-icon">psychology</span>
+          LLM
+        </button>
+        <button
+          :class="['tab-btn', { active: rightPanelTab === 'api' }]"
+          @click="rightPanelTab = 'api'"
+          title="API calls (frontend ↔ backend)"
+        >
+          <span class="material-icons tab-icon">swap_horiz</span>
+          API
+        </button>
+      </div>
+      <div class="right-panel-content">
+        <ProjectContextPanel v-show="rightPanelTab === 'context'" />
+        <LlmActivityPanel v-show="rightPanelTab === 'llm'" />
+        <ApiActivityPanel v-show="rightPanelTab === 'api'" ref="activityPanel" />
+      </div>
     </aside>
   </div>
 </template>
@@ -155,5 +188,51 @@ body {
   overflow: hidden;
   flex-shrink: 0;
   box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+}
+
+.right-panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.tab-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 0.5rem 0.5rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border-bottom: 2px solid transparent;
+}
+
+.tab-btn:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.tab-btn.active {
+  color: var(--accent-color);
+  border-bottom-color: var(--accent-color);
+  background-color: var(--bg-secondary);
+}
+
+.tab-icon {
+  font-size: 1rem;
+}
+
+.right-panel-content {
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
 }
 </style>

@@ -17,6 +17,9 @@ dependencies = [
     # charset-normalizer 3.4.2+ crashes on import with Python 3.12;
     # keep pinned until upstream fixes the regression.
     "charset-normalizer>=3.0,<3.4.2",
+    # cffi 2.0 breaks clr_loader (used by pythonnet/pywebview winforms);
+    # pin until clr_loader is updated for cffi 2.x.
+    "cffi>=1.15,<2.0; sys_platform == 'win32'",
 ]
 authors = [
     {name = "KiAssist Contributors"}
@@ -36,6 +39,7 @@ Repository = "https://github.com/mylonics/NewKiAssist"
 dev = [
     "pytest>=7.0.0",
     "pyinstaller>=6.0.0",
+    "debugpy>=1.8.0",
 ]
 ai = [
     "anthropic>=0.30.0",
@@ -43,15 +47,13 @@ ai = [
     "pydantic>=2.10",
 ]
 local-llm = [
-    "llama-cpp-python[server]>=0.3.16",
+    "llama-cpp-python[server]>=0.3.20",
 ]
 
-# NOTE: For CUDA GPU acceleration on Windows, use pre-built wheels from:
-#   https://github.com/dougeeai/llama-cpp-python-wheels/releases
-#   Example (RTX 40 series, Python 3.12, CUDA 12.1):
-#   pip install https://github.com/dougeeai/llama-cpp-python-wheels/releases/download/v0.3.16-cuda12.1-sm89-py312/llama_cpp_python-0.3.16%2Bcuda12.1.sm89.ada-cp312-cp312-win_amd64.whl
-# Or build from source:
-#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python[server] --force-reinstall --no-binary llama-cpp-python
+# NOTE: For CUDA GPU acceleration, build from source with:
+#   Windows: run build_cuda.bat (sets MSVC env + Ninja + CUDA flags)
+#   Linux:   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python[server] --force-reinstall --no-binary llama-cpp-python
+# Requires: CUDA Toolkit, C++ compiler (MSVC on Windows, gcc on Linux), Ninja
 
 [project.scripts]
 kiassist = "kiassist_utils.main:main"

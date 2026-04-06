@@ -169,50 +169,52 @@ if "%HAS_CUDA%"=="1" (
         set "PY_TAG=cp%%a%%b"
     )
 
-    REM Strategy 1: Try pre-built CUDA wheel from dougeeai/llama-cpp-python-wheels (fast, no compile)
-    if defined GPU_ARCH (
-        set "WHEEL_BASE=https://github.com/dougeeai/llama-cpp-python-wheels/releases/download"
-        set "WHEEL_NAME=llama_cpp_python-0.3.16+cuda12.1.!WHEEL_ARCH!-!PY_TAG!-!PY_TAG!-win_amd64.whl"
-        set "WHEEL_TAG=v0.3.16-cuda12.1-!GPU_ARCH!-py!PY_TAG:cp=!"
-        echo   Trying pre-built CUDA wheel: !WHEEL_NAME!
-        python -m pip install "!WHEEL_BASE!/!WHEEL_TAG!/!WHEEL_NAME!" --force-reinstall 2>nul
-        if !errorlevel!==0 (
-            REM Install server extras
-            python -m pip install uvicorn fastapi sse-starlette starlette-context pydantic-settings 2>nul
-            REM Verify GPU offload
-            python -c "import llama_cpp; assert llama_cpp.llama_supports_gpu_offload(), 'no gpu'" 2>nul
-            if !errorlevel!==0 (
-                echo   Pre-built CUDA wheel installed with GPU offload!
-                goto :llama_done
-            )
-            echo   Pre-built wheel did not enable GPU offload.
-            python -m pip uninstall llama-cpp-python -y >nul 2>&1
-        ) else (
-            echo   Pre-built wheel not available for this configuration.
-        )
-    )
-
-    REM Strategy 2: Build from source with CUDA flags (requires nvcc)
+    REM Strategy 1: Build from source with CUDA + Ninja (parallel, fast)
     where nvcc >nul 2>&1
     if !errorlevel!==0 (
-        echo   Building from source with CUDA support (this may take 10-30 minutes^)...
-        set "CMAKE_ARGS=-DGGML_CUDA=on"
+        echo   Building from source with CUDA support using Ninja (parallel build^)...
+        echo   This may take 10-20 minutes on first build.
+
+        REM Set up MSVC environment for Ninja (cl.exe must be in PATH)
+        set "MSVC_ENV="
+        for /f "delims=" %%V in ('dir /b /s "C:\Program Files ^(x86^)\Microsoft Visual Studio\*vcvarsall.bat" 2^>nul') do (
+            set "MSVC_ENV=%%V"
+        )
+        if defined MSVC_ENV (
+            echo   Initializing MSVC environment...
+            call "!MSVC_ENV!" x64 >nul 2>&1
+        )
+
+        REM Install build dependencies
+        python -m pip install scikit-build-core cmake ninja >nul 2>&1
+
+        REM Detect GPU arch for targeted build
+        set "CUDA_ARCH_FLAG="
+        if defined GPU_CAP (
+            set "GPU_CAP_CLEAN=!GPU_CAP:.=!"
+            set "CUDA_ARCH_FLAG=-DCMAKE_CUDA_ARCHITECTURES=!GPU_CAP_CLEAN!"
+        )
+
+        set "CMAKE_ARGS=-DGGML_CUDA=on !CUDA_ARCH_FLAG!"
+        set "CMAKE_GENERATOR=Ninja"
         set "FORCE_CMAKE=1"
-        python -m pip install "llama-cpp-python[server]>=0.3.16" --force-reinstall --no-binary llama-cpp-python --no-cache-dir
+        python -m pip install "llama-cpp-python[server]>=0.3.20" --force-reinstall --no-binary llama-cpp-python --no-cache-dir --no-build-isolation
         if !errorlevel!==0 (
             echo   CUDA source build completed!
             set "CMAKE_ARGS="
+            set "CMAKE_GENERATOR="
             set "FORCE_CMAKE="
             goto :llama_done
         )
         echo   WARNING: CUDA build failed.
         set "CMAKE_ARGS="
+        set "CMAKE_GENERATOR="
         set "FORCE_CMAKE="
     )
 
-    REM Strategy 3: Fall back to CPU wheel
+    REM Strategy 2: Fall back to CPU wheel
     echo   Falling back to CPU-only wheel...
-    python -m pip install "llama-cpp-python[server]>=0.3.16"
+    python -m pip install "llama-cpp-python[server]>=0.3.20"
     if errorlevel 1 (
         echo WARNING: llama-cpp-python installation failed.
         echo          Local LLM features will not be available.
@@ -220,7 +222,7 @@ if "%HAS_CUDA%"=="1" (
 ) else (
     echo.
     echo Installing llama-cpp-python (CPU-only^)...
-    python -m pip install "llama-cpp-python[server]>=0.3.16"
+    python -m pip install "llama-cpp-python[server]>=0.3.20"
     if errorlevel 1 (
         echo WARNING: llama-cpp-python installation failed.
         echo          Local LLM features will not be available.

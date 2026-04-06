@@ -17,6 +17,7 @@ Provides four key subsystems:
 from .file_cache import FileStateCache
 from .history import ConversationStore
 from .memory import ProjectMemory
+from .project_context import get_raw_context, get_llm_synthesized_context
 from .prompts import SystemPromptBuilder
 from .tokens import ContextWindowManager, usage_to_tokens
 
@@ -26,5 +27,7 @@ __all__ = [
     "FileStateCache",
     "ProjectMemory",
     "SystemPromptBuilder",
+    "get_raw_context",
+    "get_llm_synthesized_context",
     "usage_to_tokens",
 ]

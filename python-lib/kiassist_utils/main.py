@@ -27,6 +27,7 @@ from .requirements_wizard import (
 from .kicad_schematic import inject_test_note, is_schematic_api_available
 from .context.history import ConversationStore
 from .context.prompts import SystemPromptBuilder
+from .ai.llm_logger import llm_logger
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,9 @@ class KiAssistAPI:
         self._current_project_path: Optional[str] = None
         # System prompt builder for injecting project/PCB context
         self._prompt_builder = SystemPromptBuilder()
+        # Project context caches (cleared on project switch / new session)
+        self._raw_context_cache: Optional[str] = None
+        self._synthesized_context_cache: Optional[str] = None
         # Streaming state
         self._stream_lock = threading.Lock()
         self._stream_buffer = ""
@@ -356,8 +360,24 @@ class KiAssistAPI:
                 "No AI provider configured. Please add an API key via Settings."
             )
         msgs = [AIMessage(role="user", content=prompt)]
-        response = provider.chat(msgs)
-        return response.content
+
+        log_id = llm_logger.start(
+            provider=self.current_provider_name,
+            model=model or self.current_model,
+            messages=msgs,
+            is_stream=False,
+        )
+        try:
+            response = provider.chat(msgs)
+            llm_logger.finish(
+                log_id,
+                response_text=response.content,
+                usage=response.usage,
+            )
+            return response.content
+        except Exception as exc:
+            llm_logger.finish(log_id, error=str(exc))
+            raise
 
     def _build_system_prompt(self) -> Optional[str]:
         """Build a system prompt including project/PCB context.
@@ -392,6 +412,12 @@ class KiAssistAPI:
         if self._current_project_path:
             dynamic_parts.append(
                 f"**Active project:** `{self._current_project_path}`"
+            )
+
+        # Include synthesized context if available (more compact than raw)
+        if self._synthesized_context_cache:
+            dynamic_parts.append(
+                "## Synthesized Project Context\n\n" + self._synthesized_context_cache
             )
 
         dynamic_context = "\n\n".join(dynamic_parts) if dynamic_parts else None
@@ -826,8 +852,24 @@ class KiAssistAPI:
             msgs = self._build_conversation_messages(store, self.current_session_id)
             system_prompt = self._build_system_prompt()
 
-            response = provider.chat(msgs, system_prompt=system_prompt)
-            response_text = response.content
+            log_id = llm_logger.start(
+                provider=self.current_provider_name,
+                model=model or self.current_model,
+                messages=msgs,
+                system_prompt=system_prompt,
+                is_stream=False,
+            )
+            try:
+                response = provider.chat(msgs, system_prompt=system_prompt)
+                response_text = response.content
+                llm_logger.finish(
+                    log_id,
+                    response_text=response_text,
+                    usage=response.usage,
+                )
+            except Exception as exc:
+                llm_logger.finish(log_id, error=str(exc))
+                raise
 
             assistant_msg = AIMessage(role="assistant", content=response_text)
             store.append(self.current_session_id, assistant_msg)
@@ -881,9 +923,18 @@ class KiAssistAPI:
             system_prompt = self._build_system_prompt()
             cancel_event = self._stream_cancel
 
+            log_id = llm_logger.start(
+                provider=self.current_provider_name,
+                model=model or self.current_model,
+                messages=msgs,
+                system_prompt=system_prompt,
+                is_stream=True,
+            )
+
             def _run_stream():
                 async def _async_stream():
                     try:
+                        last_usage = {}
                         async for chunk in provider.chat_stream(
                             msgs, system_prompt=system_prompt
                         ):
@@ -892,9 +943,13 @@ class KiAssistAPI:
                             if chunk.text:
                                 with self._stream_lock:
                                     self._process_stream_chunk(chunk.text)
+                            if chunk.usage:
+                                last_usage = chunk.usage
                     except Exception as exc:
                         with self._stream_lock:
                             self._stream_error = str(exc)
+                        llm_logger.finish(log_id, error=str(exc))
+                        return
                     finally:
                         with self._stream_lock:
                             self._stream_done = True
@@ -912,6 +967,13 @@ class KiAssistAPI:
                                     "Failed to persist assistant response: %s",
                                     persist_exc,
                                 )
+
+                    # Log the completed stream
+                    llm_logger.finish(
+                        log_id,
+                        response_text=final_text,
+                        usage=last_usage,
+                    )
 
                 # Schedule the coroutine on the persistent event loop
                 future = asyncio.run_coroutine_threadsafe(
@@ -974,6 +1036,38 @@ class KiAssistAPI:
                 "done": self._stream_done,
                 "error": self._stream_error,
             }
+
+    # ------------------------------------------------------------------
+    # LLM interaction log
+    # ------------------------------------------------------------------
+
+    def get_llm_log(self, since_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return logged LLM interactions for debugging.
+
+        Each entry captures the full context sent to and received from the AI
+        provider: messages, system prompt, token usage, timing, etc.
+
+        Args:
+            since_id: If provided, only entries recorded *after* this ID are
+                      returned (for incremental polling).
+
+        Returns:
+            Dictionary with ``entries`` list.
+        """
+        try:
+            entries = llm_logger.get_entries(since_id=since_id)
+            return {"success": True, "entries": entries}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "entries": []}
+
+    def clear_llm_log(self) -> Dict[str, Any]:
+        """Clear all logged LLM interactions.
+
+        Returns:
+            Dictionary with ``success`` status.
+        """
+        llm_logger.clear()
+        return {"success": True}
 
     def steer_stream(self, message: str, model: Optional[str] = None) -> dict:
         """Interrupt the active stream and start a new one with an additional user message.
@@ -1043,6 +1137,9 @@ class KiAssistAPI:
         self.current_session_id = None
         # Also clear the prompt cache so the next message rebuilds context
         self._prompt_builder.clear_cache()
+        # Clear project context caches so they are rebuilt for the new session
+        self._raw_context_cache = None
+        self._synthesized_context_cache = None
         return {"success": True}
     
     # ------------------------------------------------------------------
@@ -1065,11 +1162,104 @@ class KiAssistAPI:
             self._current_project_path = str(p)
             # Clear prompt cache so project context refreshes
             self._prompt_builder.clear_cache()
+            # Clear cached project context
+            self._raw_context_cache = None
+            self._synthesized_context_cache = None
             # Start a new session for the new project
             self.current_session_id = None
             return {"success": True}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Project context (raw + LLM-synthesized)
+    # ------------------------------------------------------------------
+
+    def get_raw_project_context(self) -> Dict[str, Any]:
+        """Build and return the raw project context for the active project.
+
+        The raw context includes schematic/board file listing, hierarchical
+        sheet references, a component BOM, and a netlist.
+
+        Returns:
+            Dictionary with ``context`` string or ``error``.
+        """
+        if not self._current_project_path:
+            return {"success": False, "error": "No project selected."}
+
+        try:
+            from .context.project_context import get_raw_context
+            ctx = get_raw_context(self._current_project_path)
+            self._raw_context_cache = ctx
+            return {"success": True, "context": ctx}
+        except Exception as exc:
+            logger.error("get_raw_project_context failed: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
+    def get_synthesized_project_context(self) -> Dict[str, Any]:
+        """Use the LLM to synthesize a compact summary of the project context.
+
+        First builds the raw context (if not cached), then sends it to the
+        active AI provider for synthesis into a clean, structured summary.
+
+        Returns:
+            Dictionary with ``context`` string or ``error``.
+        """
+        if not self._current_project_path:
+            return {"success": False, "error": "No project selected."}
+
+        try:
+            # Get or build raw context
+            if self._raw_context_cache is None:
+                from .context.project_context import get_raw_context
+                self._raw_context_cache = get_raw_context(self._current_project_path)
+
+            # Get a provider for synthesis
+            provider = self._get_or_create_provider()
+            if not provider:
+                return {
+                    "success": False,
+                    "error": "No AI provider configured. Please add an API key or start a local model.",
+                }
+
+            from .context.project_context import get_llm_synthesized_context
+            from .ai.llm_logger import llm_logger
+            from .ai.base import AIMessage
+
+            log_id = llm_logger.start(
+                provider=self.current_provider_name,
+                model=self.current_model,
+                messages=[AIMessage(role="user", content="[Context synthesis request]")],
+                system_prompt="[Context synthesis]",
+                is_stream=False,
+            )
+
+            try:
+                synthesized = get_llm_synthesized_context(
+                    self._raw_context_cache, provider
+                )
+                llm_logger.finish(log_id, response_text=synthesized)
+            except Exception as exc:
+                llm_logger.finish(log_id, error=str(exc))
+                raise
+
+            self._synthesized_context_cache = synthesized
+            return {"success": True, "context": synthesized}
+        except Exception as exc:
+            logger.error("get_synthesized_project_context failed: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
+    def get_cached_project_context(self) -> Dict[str, Any]:
+        """Return any cached raw and synthesized context without re-computing.
+
+        Returns:
+            Dictionary with ``raw`` and ``synthesized`` strings (may be null).
+        """
+        return {
+            "success": True,
+            "raw": self._raw_context_cache,
+            "synthesized": self._synthesized_context_cache,
+        }
 
     def get_recent_projects(self) -> List[Dict[str, Any]]:
         """Get list of recently opened projects.

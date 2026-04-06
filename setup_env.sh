@@ -119,62 +119,58 @@ if [[ "$HAS_CUDA" -eq 1 ]]; then
     echo ""
     echo "Installing llama-cpp-python with CUDA GPU support..."
 
-    # Strategy 1: Try pre-built CUDA wheel from dougeeai/llama-cpp-python-wheels (Windows only)
-    if [[ "$(uname -s)" == *"MINGW"* ]] || [[ "$(uname -s)" == *"MSYS"* ]] || [[ "$(uname -s)" == *"CYGWIN"* ]] || [[ "$(uname -s)" == *"Windows"* ]]; then
-        GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
-        GPU_ARCH=""
-        WHEEL_ARCH=""
-        case "${GPU_CAP}" in
-            8.9*) GPU_ARCH="sm89"; WHEEL_ARCH="sm89.ada" ;;
-            8.6*) GPU_ARCH="sm86"; WHEEL_ARCH="sm86.ampere" ;;
-            7.5*) GPU_ARCH="sm75"; WHEEL_ARCH="sm75.turing" ;;
-            10.0*) GPU_ARCH="sm100"; WHEEL_ARCH="sm100.blackwell" ;;
-        esac
-        PY_VER=$(python -c "import sys; print(f'{sys.version_info.major}{sys.version_info.minor}')")
-        PY_TAG="cp${PY_VER}"
-        if [[ -n "$GPU_ARCH" ]]; then
-            WHEEL_BASE="https://github.com/dougeeai/llama-cpp-python-wheels/releases/download"
-            WHEEL_NAME="llama_cpp_python-0.3.16+cuda12.1.${WHEEL_ARCH}-${PY_TAG}-${PY_TAG}-win_amd64.whl"
-            WHEEL_TAG="v0.3.16-cuda12.1-${GPU_ARCH}-py${PY_VER:1}" # e.g. py312
-            echo "  Trying pre-built CUDA wheel: $WHEEL_NAME"
-            if python -m pip install "${WHEEL_BASE}/${WHEEL_TAG}/${WHEEL_NAME}" --force-reinstall 2>/dev/null; then
-                python -m pip install uvicorn fastapi sse-starlette starlette-context pydantic-settings 2>/dev/null
-                if python -c "import llama_cpp; assert llama_cpp.llama_supports_gpu_offload()" 2>/dev/null; then
-                    echo "  Pre-built CUDA wheel installed with GPU offload!"
-                    LLAMA_OK=1
-                else
-                    echo "  Pre-built wheel did not enable GPU offload."
-                    python -m pip uninstall llama-cpp-python -y &>/dev/null
-                fi
-            else
-                echo "  Pre-built wheel not available for this configuration."
-            fi
-        fi
+    # Auto-detect GPU architecture for optimal CUDA kernels
+    GPU_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')
+    if [[ -n "$GPU_CAP" ]]; then
+        CUDA_ARCH="$GPU_CAP"
+        echo "  GPU compute capability: ${GPU_CAP:0:1}.${GPU_CAP:1} → CUDA arch ${CUDA_ARCH}"
+    else
+        # Default: build for common architectures (Turing, Ampere, Ada, Hopper, Blackwell)
+        CUDA_ARCH="75;80;86;89;90;100"
+        echo "  Could not detect GPU arch – building for all common architectures"
     fi
 
-    # Strategy 2: Build from source with CUDA flags (requires nvcc)
-    if [[ "$LLAMA_OK" -eq 0 ]] && command -v nvcc &>/dev/null; then
-        echo "  Building from source with CUDA support (this may take 10-30 minutes)..."
-        CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 \
-            python -m pip install "llama-cpp-python[server]>=0.3.16" \
-                --force-reinstall --no-binary llama-cpp-python --no-cache-dir && LLAMA_OK=1
+    # Strategy 1: Build from source with CUDA + Ninja (requires nvcc)
+    if command -v nvcc &>/dev/null; then
+        echo "  Installing build dependencies..."
+        python -m pip install scikit-build-core cmake ninja -q
+
+        # Use Ninja for fast parallel CUDA compilation
+        GENERATOR="Ninja"
+        if ! command -v ninja &>/dev/null; then
+            # ninja not on PATH – fall back to Unix Makefiles
+            echo "  ninja not found, using Unix Makefiles (slower)"
+            GENERATOR="Unix Makefiles"
+        fi
+
+        echo "  Building from source with CUDA support (Ninja parallel build)..."
+        echo "  This may take 5-15 minutes on first build..."
+        CMAKE_ARGS="-DGGML_CUDA=on -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}" \
+        CMAKE_GENERATOR="${GENERATOR}" \
+        FORCE_CMAKE=1 \
+            python -m pip install "llama-cpp-python[server]>=0.3.20" \
+                --force-reinstall --no-binary llama-cpp-python --no-cache-dir \
+                --no-build-isolation && LLAMA_OK=1
         if [[ "$LLAMA_OK" -eq 1 ]]; then
             echo "  CUDA source build completed!"
         else
             echo "  WARNING: CUDA build failed."
         fi
+    else
+        echo "  nvcc not found – cannot build with CUDA."
+        echo "  Install the CUDA Toolkit: https://developer.nvidia.com/cuda-downloads"
     fi
 
-    # Strategy 3: Fall back to CPU wheel
+    # Strategy 2: Fall back to CPU wheel
     if [[ "$LLAMA_OK" -eq 0 ]]; then
         echo "  Falling back to CPU-only wheel..."
-        python -m pip install "llama-cpp-python[server]>=0.3.16" || \
+        python -m pip install "llama-cpp-python[server]>=0.3.20" || \
             echo "WARNING: llama-cpp-python installation failed. Local LLM features disabled."
     fi
 else
     echo ""
     echo "Installing llama-cpp-python (CPU-only)..."
-    python -m pip install "llama-cpp-python[server]>=0.3.16" || \
+    python -m pip install "llama-cpp-python[server]>=0.3.20" || \
         echo "WARNING: llama-cpp-python installation failed. Local LLM features disabled."
 fi
 

@@ -92,6 +92,11 @@ async function refreshProjectsList() {
       if (result.open_projects.length === 1 && !selectedProject.value) {
         selectedProject.value = result.open_projects[0];
       }
+      
+      // If no KiCad instance is detected and nothing selected, open the last recent project
+      if (result.open_projects.length === 0 && !selectedProject.value && result.recent_projects.length > 0) {
+        selectedProject.value = result.recent_projects[0];
+      }
     } else {
       error.value = result.error || 'Failed to get projects list';
     }

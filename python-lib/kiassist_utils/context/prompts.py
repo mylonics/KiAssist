@@ -119,9 +119,10 @@ class SystemPromptBuilder:
     # Token-to-char ratio varies by content; KiCad context (paths,
     # component refs, footprints) tokenizes at ~1.7 chars/token.
     # Use 2 chars/token as a conservative estimate.
-    # Budget: ~5000 tokens × 2 = 10000 chars leaves headroom for
-    # conversation history within a 16384-token context window.
-    _MAX_PROMPT_CHARS = 10_000
+    # Gemma 4 models support 32768-token context windows.  We
+    # allocate 55000 chars (~27500 tokens) for the system prompt,
+    # leaving headroom for conversation history and the response.
+    _MAX_PROMPT_CHARS = 55_000
 
     def build(
         self,
@@ -249,33 +250,39 @@ class SystemPromptBuilder:
 
         lines.append(f"\n**Project directory:** `{project_dir}`")
 
-        # --- Schematic component summary ---
-        schematics = sorted(project_dir.rglob("*.kicad_sch"))
-        if schematics:
-            lines.append(f"\n**Schematics ({len(schematics)}):**")
-            bom_rows: List[str] = []
-            for sch_path in schematics:
-                # If the file cache reports the AI already has this file
-                # and it hasn't changed, skip the full component list.
-                if self._file_cache is not None and self._file_cache.is_fresh(sch_path):
-                    lines.append(f"- `{sch_path.name}` — {_ALREADY_IN_CONTEXT_MSG}")
-                    continue
-                try:
-                    from ..kicad_parser.schematic import Schematic  # lazy import
+        # --- Rich project context (hierarchy, BOM, netlist) ---
+        try:
+            from .project_context import get_raw_context
+            rich_context = get_raw_context(project_dir)
+            if rich_context:
+                lines.append("\n" + rich_context)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Rich project context failed, falling back: %s", exc)
+            # Fallback: basic schematic component summary
+            schematics = sorted(project_dir.rglob("*.kicad_sch"))
+            if schematics:
+                lines.append(f"\n**Schematics ({len(schematics)}):**")
+                bom_rows: List[str] = []
+                for sch_path in schematics:
+                    if self._file_cache is not None and self._file_cache.is_fresh(sch_path):
+                        lines.append(f"- `{sch_path.name}` — {_ALREADY_IN_CONTEXT_MSG}")
+                        continue
+                    try:
+                        from ..kicad_parser.schematic import Schematic  # lazy import
 
-                    sch = Schematic.load(sch_path)
-                    lines.append(f"- `{sch_path.name}` — {len(sch.symbols)} symbol(s)")
-                    for sym in sch.symbols:
-                        bom_rows.append(
-                            f"  - {sym.reference}: {sym.value}"
-                            + (f" [{sym.footprint}]" if sym.footprint else "")
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Failed to parse schematic %s: %s", sch_path, exc)
-                    lines.append(f"- `{sch_path.name}` (parse error)")
-            if bom_rows:
-                lines.append("\n**Component list:**")
-                lines.extend(bom_rows)
+                        sch = Schematic.load(sch_path)
+                        lines.append(f"- `{sch_path.name}` — {len(sch.symbols)} symbol(s)")
+                        for sym in sch.symbols:
+                            bom_rows.append(
+                                f"  - {sym.reference}: {sym.value}"
+                                + (f" [{sym.footprint}]" if sym.footprint else "")
+                            )
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.debug("Failed to parse schematic %s: %s", sch_path, exc2)
+                        lines.append(f"- `{sch_path.name}` (parse error)")
+                if bom_rows:
+                    lines.append("\n**Component list:**")
+                    lines.extend(bom_rows)
 
         # --- Library paths ---
         try:

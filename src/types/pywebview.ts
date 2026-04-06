@@ -37,6 +37,33 @@ export interface StreamPollResult extends ApiResult {
   done?: boolean;
 }
 
+export interface LLMLogEntry {
+  id: string;
+  timestamp: number;
+  provider: string;
+  model: string;
+  system_prompt: string;
+  messages: Array<{
+    role: string;
+    content: string;
+    tool_calls?: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
+    tool_results?: Array<{ tool_call_id: string; content: string; is_error: boolean }>;
+  }>;
+  tool_count: number;
+  tool_names: string[];
+  response_text: string;
+  response_tool_calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
+  usage: Record<string, number>;
+  duration_ms: number;
+  is_stream: boolean;
+  error: string;
+  done: boolean;
+}
+
+export interface LLMLogResult extends ApiResult {
+  entries: LLMLogEntry[];
+}
+
 export interface ProjectValidationResult extends ApiResult {
   valid?: boolean;
   project_path?: string;
@@ -235,6 +262,9 @@ export interface PyWebViewAPI {
   start_stream_message: (message: string, model?: string) => Promise<ApiResult>;
   poll_stream: () => Promise<StreamPollResult>;
   steer_stream: (message: string, model?: string) => Promise<ApiResult>;
+  // LLM interaction log
+  get_llm_log: (sinceId?: string | null) => Promise<LLMLogResult>;
+  clear_llm_log: () => Promise<ApiResult>;
   // Session reset
   new_chat_session: () => Promise<ApiResult>;
   // Project API
