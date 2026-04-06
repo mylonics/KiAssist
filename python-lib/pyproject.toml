@@ -46,6 +46,12 @@ local-llm = [
     "llama-cpp-python[server]>=0.3.16",
 ]
 
+# NOTE: Ollama (https://ollama.com) is the RECOMMENDED backend for local
+# models.  It provides automatic GPU acceleration, cross-platform support,
+# and model management.  When Ollama is installed, KiAssist will use it
+# automatically.  The llama-cpp-python dependency above is only needed as a
+# fallback when Ollama is not available.
+
 # NOTE: For CUDA GPU acceleration on Windows, use pre-built wheels from:
 #   https://github.com/dougeeai/llama-cpp-python-wheels/releases
 #   Example (RTX 40 series, Python 3.12, CUDA 12.1):
