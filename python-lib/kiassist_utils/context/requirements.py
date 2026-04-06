@@ -36,12 +36,18 @@ Example::
 
     # Later — check for PCB changes
     if manager.detect_and_handle_pcb_change(req):
-        # state is now PCB_CHANGED; req.file_changes lists each added/modified/removed file
-        # Pass req.file_changes + req.auto_context to the context generator so it can
-        # produce a targeted update describing only what changed.
-        change_summary = manager.format_file_change_list(req.file_changes)
+        # state is now PCB_CHANGED
+        # req.file_changes     — which files were added/modified/removed
+        # req.component_changes — which components were added/removed/modified
+        # Pass both summaries alongside req.auto_context to the context generator
+        # so it can produce a targeted update describing only what changed.
+        change_summary = (
+            manager.format_file_change_list(req.file_changes)
+            + "\n\n"
+            + manager.format_component_changes(req.component_changes)
+        )
         manager.start_context_update(req)
-        manager.set_raw_context(req, new_raw_context)
+        manager.set_raw_context(req, new_raw_context)  # also snapshots component list
         manager.set_auto_context(req, new_context, pending_questions=["Q?"])
         # state is now QUERYING_USER
         manager.submit_user_answers(req, approved_requirements)
@@ -179,6 +185,50 @@ class FileChange:
 
 
 @dataclass
+class ComponentChange:
+    """Record of a single component-level change between two project snapshots.
+
+    Attributes:
+        reference:     Component reference designator (e.g., ``"R1"``).
+        change_type:   ``"added"``, ``"removed"``, or ``"modified"``.
+        old_value:     Component value before the change (``None`` for new
+                       components).
+        new_value:     Component value after the change (``None`` for removed
+                       components).
+        old_footprint: Footprint assignment before the change.
+        new_footprint: Footprint assignment after the change.
+    """
+
+    reference: str
+    change_type: str  # "added" | "modified" | "removed"
+    old_value: Optional[str] = None
+    new_value: Optional[str] = None
+    old_footprint: Optional[str] = None
+    new_footprint: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "reference": self.reference,
+            "change_type": self.change_type,
+            "old_value": self.old_value,
+            "new_value": self.new_value,
+            "old_footprint": self.old_footprint,
+            "new_footprint": self.new_footprint,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "ComponentChange":
+        return cls(
+            reference=d["reference"],
+            change_type=d["change_type"],
+            old_value=d.get("old_value"),
+            new_value=d.get("new_value"),
+            old_footprint=d.get("old_footprint"),
+            new_footprint=d.get("new_footprint"),
+        )
+
+
+@dataclass
 class ProjectRequirements:
     """Stateful container for project context and user-defined requirements.
 
@@ -201,6 +251,15 @@ class ProjectRequirements:
                              ``UPDATING_CONTEXT`` phase so the context generator
                              can produce a targeted delta rather than a full
                              re-parse.
+        component_snapshot:  Snapshot of all placed schematic components at the
+                             time the last raw context was captured, as a
+                             mapping of ``reference → {"value": …, "footprint": …}``.
+                             Populated by :meth:`~RequirementsManager.set_raw_context`.
+        component_changes:   Semantic list of component-level changes (added/
+                             removed/modified individual components) detected on
+                             the most recent PCB change event.  Populated
+                             alongside :attr:`file_changes` by
+                             :meth:`~RequirementsManager.detect_and_handle_pcb_change`.
         state_history:       Ordered log of all state transitions.
         created_at:          ISO-8601 timestamp of first creation.
         updated_at:          ISO-8601 timestamp of most recent modification.
@@ -214,6 +273,8 @@ class ProjectRequirements:
     pcb_file_hashes: Dict[str, str] = field(default_factory=dict)
     context_diff: str = ""
     file_changes: List[FileChange] = field(default_factory=list)
+    component_snapshot: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    component_changes: List[ComponentChange] = field(default_factory=list)
     state_history: List[StateTransition] = field(default_factory=list)
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -237,6 +298,10 @@ class ProjectRequirements:
             "pcb_file_hashes": dict(self.pcb_file_hashes),
             "context_diff": self.context_diff,
             "file_changes": [fc.to_dict() for fc in self.file_changes],
+            "component_snapshot": {
+                ref: dict(info) for ref, info in self.component_snapshot.items()
+            },
+            "component_changes": [cc.to_dict() for cc in self.component_changes],
             "state_history": [t.to_dict() for t in self.state_history],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -247,6 +312,9 @@ class ProjectRequirements:
         """Deserialise from a plain dict (as stored in JSON)."""
         history = [StateTransition.from_dict(t) for t in d.get("state_history", [])]
         file_changes = [FileChange.from_dict(fc) for fc in d.get("file_changes", [])]
+        component_changes = [
+            ComponentChange.from_dict(cc) for cc in d.get("component_changes", [])
+        ]
         return cls(
             state=ContextState(d.get("state", ContextState.GETTING_RAW_CONTEXT)),
             user_requirements=d.get("user_requirements", ""),
@@ -256,6 +324,8 @@ class ProjectRequirements:
             pcb_file_hashes=dict(d.get("pcb_file_hashes", {})),
             context_diff=d.get("context_diff", ""),
             file_changes=file_changes,
+            component_snapshot=dict(d.get("component_snapshot", {})),
+            component_changes=component_changes,
             state_history=history,
             created_at=d.get("created_at", datetime.now(timezone.utc).isoformat()),
             updated_at=d.get("updated_at", datetime.now(timezone.utc).isoformat()),
@@ -540,6 +610,155 @@ class RequirementsManager:
                 lines.append(f"- **Modified**: `{fc.path}`")
         return "\n".join(lines)
 
+    def compute_component_snapshot(self) -> Dict[str, Dict[str, str]]:
+        """Parse all schematic files and return a component snapshot.
+
+        Each entry maps a component reference to a dict containing its
+        ``"value"`` and ``"footprint"`` strings.  Only fully-assigned
+        references (i.e. the reference does **not** end with ``"?"``) are
+        included; power symbols and other non-component symbols that carry
+        a trailing ``"?"`` are excluded.
+
+        The snapshot is used as a baseline for
+        :meth:`compute_component_changes` — differences between the stored
+        snapshot and a freshly computed one reveal which components were
+        added, removed, or modified.
+
+        Returns:
+            Mapping of ``{reference: {"value": …, "footprint": …}}``.
+        """
+        snapshot: Dict[str, Dict[str, str]] = {}
+        try:
+            from ..kicad_parser.schematic import Schematic  # lazy import
+        except ImportError:
+            logger.debug(
+                "kicad_parser.schematic not available; skipping component snapshot"
+            )
+            return snapshot
+
+        for sch_path in sorted(self._project_dir.rglob("*.kicad_sch")):
+            try:
+                sch = Schematic.load(sch_path)
+                for sym in sch.symbols:
+                    ref = sym.reference
+                    if not ref or ref.endswith("?"):
+                        continue
+                    snapshot[ref] = {
+                        "value": sym.value or "",
+                        "footprint": sym.footprint or "",
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to parse schematic %s for component snapshot: %s",
+                    sch_path,
+                    exc,
+                )
+        return snapshot
+
+    def compute_component_changes(
+        self,
+        old_snapshot: Dict[str, Dict[str, str]],
+        new_snapshot: Dict[str, Dict[str, str]],
+    ) -> List[ComponentChange]:
+        """Compare two component snapshots and return a list of changes.
+
+        Each entry describes one component that was added, removed, or had its
+        value or footprint modified between *old_snapshot* and *new_snapshot*.
+        Unchanged components are omitted.
+
+        Args:
+            old_snapshot: Component snapshot from before the change (from
+                          :attr:`~ProjectRequirements.component_snapshot`).
+            new_snapshot: Current snapshot produced by
+                          :meth:`compute_component_snapshot`.
+
+        Returns:
+            Ordered list of :class:`ComponentChange` records (sorted by
+            reference designator).
+        """
+        changes: List[ComponentChange] = []
+        all_refs = sorted(set(old_snapshot) | set(new_snapshot))
+        for ref in all_refs:
+            old_info = old_snapshot.get(ref)
+            new_info = new_snapshot.get(ref)
+            if old_info is None:
+                changes.append(
+                    ComponentChange(
+                        reference=ref,
+                        change_type="added",
+                        new_value=new_info.get("value", ""),
+                        new_footprint=new_info.get("footprint", ""),
+                    )
+                )
+            elif new_info is None:
+                changes.append(
+                    ComponentChange(
+                        reference=ref,
+                        change_type="removed",
+                        old_value=old_info.get("value", ""),
+                        old_footprint=old_info.get("footprint", ""),
+                    )
+                )
+            elif old_info != new_info:
+                changes.append(
+                    ComponentChange(
+                        reference=ref,
+                        change_type="modified",
+                        old_value=old_info.get("value", ""),
+                        new_value=new_info.get("value", ""),
+                        old_footprint=old_info.get("footprint", ""),
+                        new_footprint=new_info.get("footprint", ""),
+                    )
+                )
+        return changes
+
+    def format_component_changes(
+        self, component_changes: List[ComponentChange]
+    ) -> str:
+        """Format *component_changes* as a human-readable Markdown summary.
+
+        The resulting string is intended to be passed alongside
+        :meth:`format_file_change_list` output and the previous
+        :attr:`~ProjectRequirements.auto_context` to the context generator so
+        it can generate a focused update for individual component changes
+        rather than re-analysing the full project.
+
+        Args:
+            component_changes: List of :class:`ComponentChange` records
+                               (typically ``req.component_changes`` after a
+                               PCB-change event).
+
+        Returns:
+            A Markdown-formatted component change summary, or an empty string
+            when *component_changes* is empty.
+        """
+        if not component_changes:
+            return ""
+        lines: List[str] = ["## Component Changes\n"]
+        for cc in component_changes:
+            if cc.change_type == "added":
+                detail = f"{cc.new_value or '—'}"
+                if cc.new_footprint:
+                    detail += f" [{cc.new_footprint}]"
+                lines.append(f"- **Added** `{cc.reference}`: {detail}")
+            elif cc.change_type == "removed":
+                detail = f"{cc.old_value or '—'}"
+                if cc.old_footprint:
+                    detail += f" [{cc.old_footprint}]"
+                lines.append(f"- **Removed** `{cc.reference}`: {detail}")
+            else:
+                parts: List[str] = []
+                if cc.old_value != cc.new_value:
+                    parts.append(f"value {cc.old_value!r} → {cc.new_value!r}")
+                if cc.old_footprint != cc.new_footprint:
+                    parts.append(
+                        f"footprint {cc.old_footprint!r} → {cc.new_footprint!r}"
+                    )
+                lines.append(
+                    f"- **Modified** `{cc.reference}`: " + ", ".join(parts)
+                )
+        return "\n".join(lines)
+
     def detect_and_handle_pcb_change(self, req: ProjectRequirements) -> bool:
         """Check for PCB changes and, if found, transition to :attr:`~ContextState.PCB_CHANGED`.
 
@@ -548,13 +767,18 @@ class RequirementsManager:
         1. Computes the current file hashes.
         2. Builds a :class:`FileChange` list (added/modified/removed files) and
            stores it on :attr:`~ProjectRequirements.file_changes`.
-        3. Transitions the state to ``PCB_CHANGED``.
+        3. Computes the current component snapshot and diffs it against the
+           stored :attr:`~ProjectRequirements.component_snapshot` to produce a
+           :class:`ComponentChange` list stored on
+           :attr:`~ProjectRequirements.component_changes`.
+        4. Transitions the state to ``PCB_CHANGED``.
 
-        The :attr:`~ProjectRequirements.file_changes` list remains available
-        throughout the ``UPDATING_CONTEXT`` phase and can be formatted via
-        :meth:`format_file_change_list` to pass a targeted change summary
-        alongside the previous :attr:`~ProjectRequirements.auto_context` to
-        the raw-context generator.
+        Both :attr:`~ProjectRequirements.file_changes` and
+        :attr:`~ProjectRequirements.component_changes` remain available
+        throughout the ``UPDATING_CONTEXT`` phase.  Use
+        :meth:`format_file_change_list` and :meth:`format_component_changes` to
+        render Markdown summaries suitable for passing alongside the previous
+        :attr:`~ProjectRequirements.auto_context` to the context generator.
 
         This method is safe to call only when *req* is in
         :attr:`~ContextState.UP_TO_DATE` state.
@@ -574,6 +798,11 @@ class RequirementsManager:
             return False
         req.file_changes = self.compute_file_change_list(
             req.pcb_file_hashes, current_hashes
+        )
+        # Component-level semantic diff
+        new_snapshot = self.compute_component_snapshot()
+        req.component_changes = self.compute_component_changes(
+            req.component_snapshot, new_snapshot
         )
         self.transition(
             req,
@@ -637,8 +866,8 @@ class RequirementsManager:
     ) -> None:
         """Store *raw_context* and advance to :attr:`~ContextState.GENERATING_REQUIREMENTS`.
 
-        Also snapshots the current file hashes so that future change
-        detection has a baseline.
+        Also snapshots the current file hashes and component list so that
+        future change detection has a baseline.
 
         Args:
             req:         The requirements object (must be in
@@ -656,6 +885,7 @@ class RequirementsManager:
             )
         req.raw_context = raw_context
         req.pcb_file_hashes = self.compute_file_hashes()
+        req.component_snapshot = self.compute_component_snapshot()
         self.transition(
             req,
             ContextState.GENERATING_REQUIREMENTS,

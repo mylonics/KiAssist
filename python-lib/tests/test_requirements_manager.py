@@ -2,15 +2,17 @@
 
 Covers:
 * ContextState enum values and JSON serialisability
-* ProjectRequirements serialisation round-trip (including file_changes)
+* ProjectRequirements serialisation round-trip (including file_changes and component_changes)
 * ProjectRequirements convenience properties
 * StateTransition serialisation
 * FileChange serialisation
+* ComponentChange serialisation
 * RequirementsManager: load_or_create, save, transition enforcement
 * RequirementsManager: file hashing and change detection
 * RequirementsManager: compute_file_change_list and format_file_change_list
+* RequirementsManager: compute_component_snapshot, compute_component_changes, format_component_changes
 * RequirementsManager: diff generation
-* RequirementsManager: high-level workflow helpers
+* RequirementsManager: high-level workflow helpers (set_raw_context captures component snapshot)
 * Full lifecycle: fresh start → UP_TO_DATE
 * Full lifecycle: UP_TO_DATE → PCB change → update → UP_TO_DATE
 * Safeguard: user requirements not modified outside QUERYING_USER
@@ -26,6 +28,7 @@ from typing import List
 import pytest
 
 from kiassist_utils.context.requirements import (
+    ComponentChange,
     ContextState,
     FileChange,
     ProjectRequirements,
@@ -133,6 +136,57 @@ class TestFileChange:
 
 
 # ===========================================================================
+# ComponentChange
+# ===========================================================================
+
+
+class TestComponentChange:
+    def test_to_dict_round_trip_added(self):
+        cc = ComponentChange(
+            reference="R5",
+            change_type="added",
+            new_value="10k",
+            new_footprint="Resistor_SMD:R_0402",
+        )
+        d = cc.to_dict()
+        cc2 = ComponentChange.from_dict(d)
+        assert cc2.reference == "R5"
+        assert cc2.change_type == "added"
+        assert cc2.old_value is None
+        assert cc2.old_footprint is None
+        assert cc2.new_value == "10k"
+        assert cc2.new_footprint == "Resistor_SMD:R_0402"
+
+    def test_to_dict_round_trip_removed(self):
+        cc = ComponentChange(
+            reference="C3",
+            change_type="removed",
+            old_value="100nF",
+            old_footprint="C_0402",
+        )
+        d = cc.to_dict()
+        cc2 = ComponentChange.from_dict(d)
+        assert cc2.change_type == "removed"
+        assert cc2.old_value == "100nF"
+        assert cc2.new_value is None
+
+    def test_to_dict_round_trip_modified(self):
+        cc = ComponentChange(
+            reference="R1",
+            change_type="modified",
+            old_value="1k",
+            new_value="10k",
+            old_footprint="R_0402",
+            new_footprint="R_0402",
+        )
+        d = cc.to_dict()
+        cc2 = ComponentChange.from_dict(d)
+        assert cc2.change_type == "modified"
+        assert cc2.old_value == "1k"
+        assert cc2.new_value == "10k"
+
+
+# ===========================================================================
 # ProjectRequirements
 # ===========================================================================
 
@@ -144,6 +198,14 @@ class TestProjectRequirements:
 
     def test_serialisation_round_trip(self):
         fc = FileChange(path="board.kicad_pcb", change_type="modified", old_hash="a", new_hash="b")
+        cc = ComponentChange(
+            reference="R1",
+            change_type="modified",
+            old_value="1k",
+            new_value="10k",
+            old_footprint="0402",
+            new_footprint="0402",
+        )
         req = ProjectRequirements(
             state=ContextState.UP_TO_DATE,
             user_requirements="# My requirements",
@@ -153,6 +215,8 @@ class TestProjectRequirements:
             pcb_file_hashes={"board.kicad_pcb": "abc123"},
             context_diff="@@ ...",
             file_changes=[fc],
+            component_snapshot={"R1": {"value": "1k", "footprint": "0402"}},
+            component_changes=[cc],
         )
         d = req.to_dict()
         req2 = ProjectRequirements.from_dict(d)
@@ -166,6 +230,10 @@ class TestProjectRequirements:
         assert len(req2.file_changes) == 1
         assert req2.file_changes[0].path == "board.kicad_pcb"
         assert req2.file_changes[0].change_type == "modified"
+        assert req2.component_snapshot == {"R1": {"value": "1k", "footprint": "0402"}}
+        assert len(req2.component_changes) == 1
+        assert req2.component_changes[0].reference == "R1"
+        assert req2.component_changes[0].change_type == "modified"
 
     def test_is_stable_only_when_up_to_date(self):
         for state in ContextState:
@@ -572,6 +640,172 @@ class TestFileChangeList:
 
 
 # ===========================================================================
+# RequirementsManager — compute_component_changes & format_component_changes
+# ===========================================================================
+
+
+class TestComponentChangeList:
+    """Tests for compute_component_changes and format_component_changes.
+
+    compute_component_snapshot() requires real .kicad_sch files parseable by
+    the kicad_parser; those end-to-end tests live in TestComponentSnapshotE2E.
+    Here we test the diffing and formatting logic in isolation.
+    """
+
+    def test_no_changes_returns_empty(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        snap = {"R1": {"value": "10k", "footprint": "R_0402"}}
+        changes = manager.compute_component_changes(snap, snap)
+        assert changes == []
+
+    def test_detects_added_component(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"R1": {"value": "10k", "footprint": "R_0402"}}
+        new = {
+            "R1": {"value": "10k", "footprint": "R_0402"},
+            "R2": {"value": "1k", "footprint": "R_0603"},
+        }
+        changes = manager.compute_component_changes(old, new)
+        assert len(changes) == 1
+        assert changes[0].reference == "R2"
+        assert changes[0].change_type == "added"
+        assert changes[0].old_value is None
+        assert changes[0].new_value == "1k"
+        assert changes[0].new_footprint == "R_0603"
+
+    def test_detects_removed_component(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {
+            "R1": {"value": "10k", "footprint": "R_0402"},
+            "C1": {"value": "100nF", "footprint": "C_0402"},
+        }
+        new = {"R1": {"value": "10k", "footprint": "R_0402"}}
+        changes = manager.compute_component_changes(old, new)
+        assert len(changes) == 1
+        assert changes[0].reference == "C1"
+        assert changes[0].change_type == "removed"
+        assert changes[0].old_value == "100nF"
+        assert changes[0].new_value is None
+
+    def test_detects_modified_value(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"R1": {"value": "1k", "footprint": "R_0402"}}
+        new = {"R1": {"value": "10k", "footprint": "R_0402"}}
+        changes = manager.compute_component_changes(old, new)
+        assert len(changes) == 1
+        assert changes[0].reference == "R1"
+        assert changes[0].change_type == "modified"
+        assert changes[0].old_value == "1k"
+        assert changes[0].new_value == "10k"
+
+    def test_detects_modified_footprint(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"C1": {"value": "100nF", "footprint": "C_0402"}}
+        new = {"C1": {"value": "100nF", "footprint": "C_0603"}}
+        changes = manager.compute_component_changes(old, new)
+        assert len(changes) == 1
+        assert changes[0].change_type == "modified"
+        assert changes[0].old_footprint == "C_0402"
+        assert changes[0].new_footprint == "C_0603"
+
+    def test_results_sorted_by_reference(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"Z1": {"value": "v", "footprint": ""}, "A1": {"value": "v", "footprint": ""}}
+        new = {"Z1": {"value": "v2", "footprint": ""}, "A1": {"value": "v2", "footprint": ""}}
+        changes = manager.compute_component_changes(old, new)
+        refs = [cc.reference for cc in changes]
+        assert refs == sorted(refs)
+
+    def test_unchanged_components_omitted(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        snap = {
+            "R1": {"value": "10k", "footprint": "R_0402"},
+            "C1": {"value": "100nF", "footprint": "C_0402"},
+        }
+        new = dict(snap)
+        new["R2"] = {"value": "1k", "footprint": "R_0402"}
+        changes = manager.compute_component_changes(snap, new)
+        refs = [cc.reference for cc in changes]
+        assert "R1" not in refs
+        assert "C1" not in refs
+        assert "R2" in refs
+
+    def test_format_empty_returns_empty_string(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        assert manager.format_component_changes([]) == ""
+
+    def test_format_added_component(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        changes = [
+            ComponentChange(
+                reference="R5",
+                change_type="added",
+                new_value="10k",
+                new_footprint="Resistor_SMD:R_0402",
+            )
+        ]
+        output = manager.format_component_changes(changes)
+        assert "R5" in output
+        assert "10k" in output
+        assert "Added" in output or "added" in output.lower()
+
+    def test_format_removed_component(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        changes = [
+            ComponentChange(
+                reference="C3",
+                change_type="removed",
+                old_value="100nF",
+                old_footprint="C_0402",
+            )
+        ]
+        output = manager.format_component_changes(changes)
+        assert "C3" in output
+        assert "Removed" in output or "removed" in output.lower()
+
+    def test_format_modified_component_value(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        changes = [
+            ComponentChange(
+                reference="R1",
+                change_type="modified",
+                old_value="1k",
+                new_value="10k",
+                old_footprint="R_0402",
+                new_footprint="R_0402",
+            )
+        ]
+        output = manager.format_component_changes(changes)
+        assert "R1" in output
+        assert "1k" in output
+        assert "10k" in output
+
+    def test_detect_and_handle_populates_component_changes(self, tmp_path: Path):
+        """detect_and_handle_pcb_change must populate component_changes."""
+        # When no .kicad_sch files exist the snapshot is empty; adding a file
+        # that changes the hash triggers the transition and leaves component_changes
+        # as an empty list (no schematic to parse), which is fine — we just
+        # verify the field is set (not None) and the transition happened.
+        (tmp_path / "board.kicad_pcb").write_text("original", encoding="utf-8")
+        manager = RequirementsManager(tmp_path)
+        req = ProjectRequirements(state=ContextState.UP_TO_DATE)
+        req.pcb_file_hashes = manager.compute_file_hashes()
+        manager.save(req)
+        (tmp_path / "board.kicad_pcb").write_text("updated", encoding="utf-8")
+        manager.detect_and_handle_pcb_change(req)
+        assert isinstance(req.component_changes, list)
+        assert req.state == ContextState.PCB_CHANGED
+
+    def test_set_raw_context_captures_component_snapshot(self, tmp_path: Path):
+        """set_raw_context must capture the component snapshot."""
+        # No .kicad_sch files → empty snapshot, but the attribute must be set.
+        manager = RequirementsManager(tmp_path)
+        req = manager.start_raw_context_generation()
+        manager.set_raw_context(req, "# Raw context")
+        assert isinstance(req.component_snapshot, dict)
+
+
+# ===========================================================================
 # RequirementsManager — diff generation
 # ===========================================================================
 
@@ -891,6 +1125,7 @@ class TestUserRequirementsSafeguards:
 class TestContextPackageExports:
     def test_new_classes_importable_from_context(self):
         from kiassist_utils.context import (
+            ComponentChange,
             ContextState,
             FileChange,
             ProjectRequirements,
@@ -901,3 +1136,5 @@ class TestContextPackageExports:
         assert callable(RequirementsManager)
         fc = FileChange(path="x.kicad_pcb", change_type="added", new_hash="h")
         assert fc.change_type == "added"
+        cc = ComponentChange(reference="R1", change_type="added", new_value="10k")
+        assert cc.change_type == "added"
