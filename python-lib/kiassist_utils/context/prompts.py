@@ -310,8 +310,17 @@ class SystemPromptBuilder:
         """
         if agent is None:
             return ""
-        path = Path(agent)
-        if path.suffix != ".md":
+        if isinstance(agent, Path):
+            # Explicit Path: read from that exact location, never name-resolve.
+            try:
+                return agent.read_text(encoding="utf-8")
+            except OSError:
+                logger.warning("Focused agent file not found: %s", agent)
+                return ""
+        # String branch: distinguish bare name from explicit file path.
+        if agent.endswith(".md"):
+            path = Path(agent)
+        else:
             # Bare name: resolve via the agents directory.
             agents_dir = _find_agents_dir()
             if agents_dir is None:
