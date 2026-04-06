@@ -26,9 +26,7 @@ for reading and modifying KiCad project files.
 
 - Project context (including any `KIASSIST.md` content) is automatically provided with
   each query — you do not need to read it manually.
-- When the user makes a significant design decision, offer to record it in `KIASSIST.md`
-  using `project_write_memory` so it is included in future context.
-- Never overwrite KIASSIST.md without the user's consent.
+- Do not edit `KIASSIST.md` or any project context file directly.
 
 ## Safety
 
