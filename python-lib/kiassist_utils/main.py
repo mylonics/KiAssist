@@ -11,8 +11,6 @@ import webview
 
 from .api_key import ApiKeyStore
 from .ai.base import AIProvider, AIMessage
-from .ai.gemini import GeminiProvider
-from .ai.ollama import OllamaProvider
 from .local_llm import LocalModelManager
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path, find_file_in_dir
@@ -138,6 +136,7 @@ class KiAssistAPI:
         self._stream_in_thinking = False
         self._stream_done = True
         self._stream_error = None
+        self._stream_cancel = threading.Event()
         # Persistent event loop for async streaming (avoids closing the loop
         # between calls which would destroy the genai client's async session)
         self._async_loop = asyncio.new_event_loop()
@@ -245,6 +244,7 @@ class KiAssistAPI:
         if provider_name == "local":
             base_url = self._get_local_base_url()
             try:
+                from .ai.ollama import OllamaProvider  # optional dep
                 return OllamaProvider(model=model, base_url=base_url)
             except ImportError as exc:
                 raise ImportError(
@@ -274,6 +274,7 @@ class KiAssistAPI:
                 status = self._local_model_manager.get_server_status()
             base_url = status["url"] or f"http://127.0.0.1:{status['port']}/v1"
             try:
+                from .ai.ollama import OllamaProvider  # optional dep
                 return OllamaProvider(model=model, base_url=base_url)
             except ImportError as exc:
                 raise ImportError(
@@ -286,6 +287,7 @@ class KiAssistAPI:
             return None
 
         if provider_name == "gemini":
+            from .ai.gemini import GeminiProvider  # optional dep
             return GeminiProvider(api_key, model)
 
         if provider_name == "claude":
@@ -865,6 +867,7 @@ class KiAssistAPI:
             session_id = self.current_session_id
             store.append(session_id, AIMessage(role="user", content=message))
 
+            self._stream_cancel.clear()
             with self._stream_lock:
                 self._stream_buffer = ""
                 self._stream_thinking_buffer = ""
@@ -876,6 +879,7 @@ class KiAssistAPI:
             # already persisted above and will be included)
             msgs = self._build_conversation_messages(store, session_id)
             system_prompt = self._build_system_prompt()
+            cancel_event = self._stream_cancel
 
             def _run_stream():
                 async def _async_stream():
@@ -883,6 +887,8 @@ class KiAssistAPI:
                         async for chunk in provider.chat_stream(
                             msgs, system_prompt=system_prompt
                         ):
+                            if cancel_event.is_set():
+                                break
                             if chunk.text:
                                 with self._stream_lock:
                                     self._process_stream_chunk(chunk.text)
@@ -968,6 +974,62 @@ class KiAssistAPI:
                 "done": self._stream_done,
                 "error": self._stream_error,
             }
+
+    def steer_stream(self, message: str, model: Optional[str] = None) -> dict:
+        """Interrupt the active stream and start a new one with an additional user message.
+
+        The partial assistant response accumulated so far is persisted to the
+        conversation history, followed by the new *steer* user message.  A
+        fresh streaming call is then started so the model can incorporate the
+        steering instruction.
+
+        Args:
+            message: The steering message to inject.
+            model: Optional model override.
+
+        Returns:
+            ``{"success": True}`` on successful start, or an error dict.
+        """
+        try:
+            # 1. Signal the running stream to stop
+            self._stream_cancel.set()
+
+            # 2. Wait briefly for the stream to acknowledge cancellation
+            #    (the background thread will set _stream_done once it exits)
+            deadline = 5.0  # seconds
+            step = 0.05
+            waited = 0.0
+            while waited < deadline:
+                with self._stream_lock:
+                    if self._stream_done:
+                        break
+                import time
+                time.sleep(step)
+                waited += step
+
+            # 3. Persist the partial assistant response (if any)
+            with self._stream_lock:
+                partial_text = self._stream_buffer.strip()
+
+            store = self._get_session_store()
+            if not self.current_session_id:
+                self.current_session_id = store.new_session()
+            session_id = self.current_session_id
+
+            if partial_text:
+                try:
+                    store.append(
+                        session_id,
+                        AIMessage(role="assistant", content=partial_text),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to persist partial response on steer: %s", exc)
+
+            # 4. Now start a new stream with the steer message
+            return self.start_stream_message(message, model)
+
+        except Exception as exc:
+            return {"success": False, "error": f"Steer error: {exc}"}
 
     def new_chat_session(self) -> dict:
         """Start a new chat session, discarding the current session ID.

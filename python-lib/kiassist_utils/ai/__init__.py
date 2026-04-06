@@ -22,11 +22,31 @@ from .base import (
     AIToolResult,
     ToolSchema,
 )
-from .gemini import GeminiProvider
-from .claude import ClaudeProvider
-from .openai import OpenAIProvider
-from .ollama import OllamaProvider
 from .tool_executor import ToolExecutor
+
+# Provider implementations are lazily imported to avoid pulling in heavy
+# optional dependencies (anthropic, openai) at package-load time.  This
+# prevents debugger/pydantic crashes when a dependency isn't needed yet.
+
+_PROVIDER_MAP = {
+    "GeminiProvider": (".gemini", "GeminiProvider"),
+    "ClaudeProvider": (".claude", "ClaudeProvider"),
+    "OpenAIProvider": (".openai", "OpenAIProvider"),
+    "OllamaProvider": (".ollama", "OllamaProvider"),
+}
+
+
+def __getattr__(name: str):
+    if name in _PROVIDER_MAP:
+        module_path, attr = _PROVIDER_MAP[name]
+        import importlib
+        mod = importlib.import_module(module_path, __package__)
+        val = getattr(mod, attr)
+        # Cache on the module so __getattr__ isn't called again
+        globals()[name] = val
+        return val
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Data types
@@ -37,7 +57,7 @@ __all__ = [
     "AIToolCall",
     "AIToolResult",
     "ToolSchema",
-    # Providers
+    # Providers (lazy)
     "GeminiProvider",
     "ClaudeProvider",
     "OpenAIProvider",

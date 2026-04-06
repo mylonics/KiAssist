@@ -40,13 +40,18 @@ dev = [
 ai = [
     "anthropic>=0.30.0",
     "openai>=1.30.0",
-    # pydantic 2.12+ has a schema-generation regression that breaks
-    # anthropic's Pydantic models on import (Python 3.12).
-    "pydantic>=2.10,<2.12",
+    "pydantic>=2.10",
 ]
 local-llm = [
-    "llama-cpp-python[server]>=0.3.8",
+    "llama-cpp-python[server]>=0.3.16",
 ]
+
+# NOTE: For CUDA GPU acceleration on Windows, use pre-built wheels from:
+#   https://github.com/dougeeai/llama-cpp-python-wheels/releases
+#   Example (RTX 40 series, Python 3.12, CUDA 12.1):
+#   pip install https://github.com/dougeeai/llama-cpp-python-wheels/releases/download/v0.3.16-cuda12.1-sm89-py312/llama_cpp_python-0.3.16%2Bcuda12.1.sm89.ada-cp312-cp312-win_amd64.whl
+# Or build from source:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python[server] --force-reinstall --no-binary llama-cpp-python
 
 [project.scripts]
 kiassist = "kiassist_utils.main:main"

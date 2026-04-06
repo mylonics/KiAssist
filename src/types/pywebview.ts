@@ -234,6 +234,7 @@ export interface PyWebViewAPI {
   // Streaming API
   start_stream_message: (message: string, model?: string) => Promise<ApiResult>;
   poll_stream: () => Promise<StreamPollResult>;
+  steer_stream: (message: string, model?: string) => Promise<ApiResult>;
   // Session reset
   new_chat_session: () => Promise<ApiResult>;
   // Project API

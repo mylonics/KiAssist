@@ -23,7 +23,7 @@ const rightPanelCollapsed = ref(false);
     >
       <span class="material-icons">{{ rightPanelCollapsed ? 'chevron_left' : 'chevron_right' }}</span>
     </button>
-    <aside v-if="!rightPanelCollapsed" class="right-panel">
+    <aside v-show="!rightPanelCollapsed" class="right-panel">
       <ApiActivityPanel ref="activityPanel" />
     </aside>
   </div>

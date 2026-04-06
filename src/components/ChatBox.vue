@@ -95,6 +95,7 @@ const copiedMessageId = ref<string | null>(null);
 const copiedChatHistory = ref(false);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
+const queuedMessage = ref<string | null>(null);
 const selectedProvider = ref('gemma4');
 const selectedModel = ref('gemma4-e2b-q4_k_m');
 // Quick (lightweight/cheap) model
@@ -767,6 +768,7 @@ async function sendMessageWithText(messageText: string) {
                 messages.value[streamIdx].text = 'No response received.';
               }
               saveMessages();
+              processQueue();
             }
           }
         } catch (e) {
@@ -813,6 +815,121 @@ async function sendMessage() {
   await sendMessageWithText(messageText);
 }
 
+// Steer: interrupt the current stream and redirect the model with a new message
+async function steerMessage() {
+  if (!inputMessage.value.trim() || !isLoading.value) return;
+  if (!window.pywebview?.api) return;
+
+  const steerText = inputMessage.value;
+  inputMessage.value = '';
+
+  // Show the steer message as a user message in the chat
+  messages.value.push({
+    id: generateMessageId(),
+    text: steerText,
+    sender: 'user',
+    timestamp: new Date(),
+  });
+
+  // The backend will cancel the current stream, persist partial response,
+  // and start a new stream with the steer message
+  try {
+    const result = await trackedApiCall('steer_stream', [steerText, selectedModel.value], () =>
+      window.pywebview!.api.steer_stream(steerText, selectedModel.value)
+    );
+    if (!result.success) {
+      messages.value.push({
+        id: generateMessageId(),
+        text: `Steer failed: ${result.error || 'Unknown error'}`,
+        sender: 'assistant',
+        timestamp: new Date(),
+      });
+      return;
+    }
+
+    // Mark any current streaming message as done (partial)
+    const currentStreamMsg = messages.value.find(m => m.isStreaming);
+    if (currentStreamMsg) {
+      currentStreamMsg.isStreaming = false;
+    }
+
+    // Create new streaming assistant message for the steered response
+    messages.value.push({
+      id: generateMessageId(),
+      text: '',
+      sender: 'assistant',
+      timestamp: new Date(),
+      isStreaming: true,
+    });
+    const streamIdx = messages.value.length - 1;
+
+    // Poll for new streamed response
+    const pollInterval = setInterval(async () => {
+      try {
+        const poll = await trackedApiCall('poll_stream', [], () =>
+          window.pywebview!.api.poll_stream(), true
+        );
+        if (poll.success && messages.value[streamIdx]) {
+          messages.value[streamIdx].text = poll.text || '';
+          if (poll.thinking) {
+            messages.value[streamIdx].thinking = poll.thinking;
+          }
+          if (poll.done) {
+            clearInterval(pollInterval);
+            messages.value[streamIdx].isStreaming = false;
+            isLoading.value = false;
+            if (poll.error) {
+              messages.value[streamIdx].text = `Sorry, I encountered an error: ${poll.error}`;
+            } else if (!messages.value[streamIdx].text.trim()) {
+              messages.value[streamIdx].text = 'No response received.';
+            }
+            saveMessages();
+            processQueue();
+          }
+        }
+      } catch (e) {
+        clearInterval(pollInterval);
+        if (messages.value[streamIdx]) {
+          messages.value[streamIdx].isStreaming = false;
+          messages.value[streamIdx].text = `Sorry, I encountered an error: ${e}`;
+        }
+        isLoading.value = false;
+      }
+    }, 100);
+
+  } catch (error) {
+    messages.value.push({
+      id: generateMessageId(),
+      text: `Steer error: ${error}`,
+      sender: 'assistant',
+      timestamp: new Date(),
+    });
+  }
+}
+
+// Queue: enqueue a message to be sent automatically after the current stream completes
+function queueMessage() {
+  if (!inputMessage.value.trim()) return;
+  queuedMessage.value = inputMessage.value;
+  inputMessage.value = '';
+}
+
+// Process queued messages after a stream finishes
+async function processQueue() {
+  if (queuedMessage.value && !isLoading.value) {
+    const queued = queuedMessage.value;
+    queuedMessage.value = null;
+    const userMessage: Message = {
+      id: generateMessageId(),
+      text: queued,
+      sender: 'user',
+      timestamp: new Date(),
+    };
+    messages.value.push(userMessage);
+    await sendMessageWithText(queued);
+  }
+}
+
 // Message actions
 async function regenerateMessage(messageIndex: number) {
   const msg = messages.value[messageIndex];
@@ -853,7 +970,16 @@ async function saveEdit(messageIndex: number) {
 function handleKeyPress(event: KeyboardEvent) {
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
-    sendMessage();
+    if (isLoading.value) {
+      // While streaming: Ctrl+Enter = steer, plain Enter = queue
+      if (event.ctrlKey) {
+        steerMessage();
+      } else {
+        queueMessage();
+      }
+    } else {
+      sendMessage();
+    }
   }
 }
 
@@ -1473,17 +1599,34 @@ onMounted(() => {
       </div>
     </div>
 
+    <div v-if="queuedMessage" class="queued-banner">
+      <span class="material-icons queued-icon">schedule</span>
+      <span class="queued-text">Queued: {{ queuedMessage.length > 60 ? queuedMessage.substring(0, 60) + '…' : queuedMessage }}</span>
+      <button class="queued-cancel" @click="queuedMessage = null" title="Cancel queued message">
+        <span class="material-icons">close</span>
+      </button>
+    </div>
+
     <div class="chat-input">
       <textarea
         v-model="inputMessage"
         @keypress="handleKeyPress"
-        placeholder="Type your message here... (Press Enter to send)"
+        :placeholder="isLoading ? 'Enter to queue · Ctrl+Enter to steer' : 'Type your message here... (Press Enter to send)'"
         rows="2"
-        :disabled="isLoading"
       />
-      <button @click="sendMessage" :disabled="!inputMessage.trim() || isLoading" class="send-btn" :title="isLoading ? 'Sending...' : 'Send message'">
-        <span class="material-icons">{{ isLoading ? 'hourglass_empty' : 'send' }}</span>
-      </button>
+      <div v-if="!isLoading" class="send-actions">
+        <button @click="sendMessage" :disabled="!inputMessage.trim()" class="send-btn" title="Send message">
+          <span class="material-icons">send</span>
+        </button>
+      </div>
+      <div v-else class="send-actions">
+        <button @click="steerMessage()" :disabled="!inputMessage.trim()" class="send-btn steer-btn" title="Steer: interrupt and redirect the model (Ctrl+Enter)">
+          <span class="material-icons">alt_route</span>
+        </button>
+        <button @click="queueMessage()" :disabled="!inputMessage.trim()" class="send-btn queue-btn" title="Queue: send after current response finishes (Enter)">
+          <span class="material-icons">queue</span>
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -2053,6 +2196,60 @@ button:disabled {
 
 .send-btn:active:not(:disabled) {
   transform: translateY(0);
+}
+
+.send-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.steer-btn {
+  background: linear-gradient(135deg, #e67e22 0%, #d35400 100%);
+}
+
+.queue-btn {
+  background: linear-gradient(135deg, #27ae60 0%, #1e8449 100%);
+}
+
+.queued-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 1rem;
+  background-color: rgba(39, 174, 96, 0.1);
+  border-top: 1px solid rgba(39, 174, 96, 0.3);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.queued-icon {
+  font-size: 1rem;
+  color: #27ae60;
+}
+
+.queued-text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queued-cancel {
+  padding: 0.125rem;
+  background: none;
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+.queued-cancel:hover {
+  opacity: 1;
+  color: #e74c3c;
+}
+
+.queued-cancel .material-icons {
+  font-size: 1rem;
 }
 
 .send-btn .material-icons {
