@@ -36,7 +36,10 @@ Example::
 
     # Later — check for PCB changes
     if manager.detect_and_handle_pcb_change(req):
-        # state is now PCB_CHANGED
+        # state is now PCB_CHANGED; req.file_changes lists each added/modified/removed file
+        # Pass req.file_changes + req.auto_context to the context generator so it can
+        # produce a targeted update describing only what changed.
+        change_summary = manager.format_file_change_list(req.file_changes)
         manager.start_context_update(req)
         manager.set_raw_context(req, new_raw_context)
         manager.set_auto_context(req, new_context, pending_questions=["Q?"])
@@ -142,6 +145,40 @@ class StateTransition:
 
 
 @dataclass
+class FileChange:
+    """Record of a single file-level change detected between two snapshots.
+
+    Attributes:
+        path:       POSIX path relative to the project directory.
+        change_type: ``"added"``, ``"modified"``, or ``"removed"``.
+        old_hash:   SHA-256 digest before the change (``None`` for new files).
+        new_hash:   SHA-256 digest after the change (``None`` for removed files).
+    """
+
+    path: str
+    change_type: str  # "added" | "modified" | "removed"
+    old_hash: Optional[str] = None
+    new_hash: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "path": self.path,
+            "change_type": self.change_type,
+            "old_hash": self.old_hash,
+            "new_hash": self.new_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "FileChange":
+        return cls(
+            path=d["path"],
+            change_type=d["change_type"],
+            old_hash=d.get("old_hash"),
+            new_hash=d.get("new_hash"),
+        )
+
+
+@dataclass
 class ProjectRequirements:
     """Stateful container for project context and user-defined requirements.
 
@@ -156,6 +193,14 @@ class ProjectRequirements:
         pcb_file_hashes:     SHA-256 hash of each tracked KiCad file, keyed
                              by file path relative to the project directory.
         context_diff:        Diff of context changes on a PCB update (if any).
+        file_changes:        Structured list of file-level changes detected on
+                             the most recent PCB change event (added/modified/
+                             removed files).  Populated by
+                             :meth:`~RequirementsManager.detect_and_handle_pcb_change`
+                             and available throughout the
+                             ``UPDATING_CONTEXT`` phase so the context generator
+                             can produce a targeted delta rather than a full
+                             re-parse.
         state_history:       Ordered log of all state transitions.
         created_at:          ISO-8601 timestamp of first creation.
         updated_at:          ISO-8601 timestamp of most recent modification.
@@ -168,6 +213,7 @@ class ProjectRequirements:
     pending_questions: List[str] = field(default_factory=list)
     pcb_file_hashes: Dict[str, str] = field(default_factory=dict)
     context_diff: str = ""
+    file_changes: List[FileChange] = field(default_factory=list)
     state_history: List[StateTransition] = field(default_factory=list)
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -190,6 +236,7 @@ class ProjectRequirements:
             "pending_questions": list(self.pending_questions),
             "pcb_file_hashes": dict(self.pcb_file_hashes),
             "context_diff": self.context_diff,
+            "file_changes": [fc.to_dict() for fc in self.file_changes],
             "state_history": [t.to_dict() for t in self.state_history],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -199,6 +246,7 @@ class ProjectRequirements:
     def from_dict(cls, d: Dict) -> "ProjectRequirements":
         """Deserialise from a plain dict (as stored in JSON)."""
         history = [StateTransition.from_dict(t) for t in d.get("state_history", [])]
+        file_changes = [FileChange.from_dict(fc) for fc in d.get("file_changes", [])]
         return cls(
             state=ContextState(d.get("state", ContextState.GETTING_RAW_CONTEXT)),
             user_requirements=d.get("user_requirements", ""),
@@ -207,6 +255,7 @@ class ProjectRequirements:
             pending_questions=list(d.get("pending_questions", [])),
             pcb_file_hashes=dict(d.get("pcb_file_hashes", {})),
             context_diff=d.get("context_diff", ""),
+            file_changes=file_changes,
             state_history=history,
             created_at=d.get("created_at", datetime.now(timezone.utc).isoformat()),
             updated_at=d.get("updated_at", datetime.now(timezone.utc).isoformat()),
@@ -419,13 +468,96 @@ class RequirementsManager:
         current = self.compute_file_hashes()
         return current != req.pcb_file_hashes
 
+    def compute_file_change_list(
+        self,
+        old_hashes: Dict[str, str],
+        new_hashes: Dict[str, str],
+    ) -> List[FileChange]:
+        """Compare two hash snapshots and return a list of :class:`FileChange` records.
+
+        Each entry describes one file that was added, modified, or removed
+        between the *old_hashes* and *new_hashes* snapshots.  Files that are
+        identical in both snapshots are omitted.
+
+        Args:
+            old_hashes: Hash snapshot taken before the change (from
+                        :attr:`~ProjectRequirements.pcb_file_hashes`).
+            new_hashes: Current hash snapshot produced by
+                        :meth:`compute_file_hashes`.
+
+        Returns:
+            Ordered list of :class:`FileChange` records (sorted by path).
+        """
+        changes: List[FileChange] = []
+        all_paths = sorted(set(old_hashes) | set(new_hashes))
+        for path in all_paths:
+            old_h = old_hashes.get(path)
+            new_h = new_hashes.get(path)
+            if old_h is None:
+                changes.append(
+                    FileChange(path=path, change_type="added", new_hash=new_h)
+                )
+            elif new_h is None:
+                changes.append(
+                    FileChange(path=path, change_type="removed", old_hash=old_h)
+                )
+            elif old_h != new_h:
+                changes.append(
+                    FileChange(
+                        path=path,
+                        change_type="modified",
+                        old_hash=old_h,
+                        new_hash=new_h,
+                    )
+                )
+        return changes
+
+    def format_file_change_list(self, file_changes: List[FileChange]) -> str:
+        """Format *file_changes* as a human-readable Markdown summary.
+
+        The resulting string is intended to be passed alongside the previous
+        :attr:`~ProjectRequirements.auto_context` to the context generator so
+        it can produce a targeted update describing only what changed rather
+        than a full re-parse.
+
+        Args:
+            file_changes: List of :class:`FileChange` records (typically
+                          ``req.file_changes`` after a PCB-change event).
+
+        Returns:
+            A Markdown-formatted change summary, or an empty string when
+            *file_changes* is empty.
+        """
+        if not file_changes:
+            return ""
+        lines: List[str] = ["## PCB File Changes\n"]
+        for fc in file_changes:
+            if fc.change_type == "added":
+                lines.append(f"- **Added**: `{fc.path}`")
+            elif fc.change_type == "removed":
+                lines.append(f"- **Removed**: `{fc.path}`")
+            else:
+                lines.append(f"- **Modified**: `{fc.path}`")
+        return "\n".join(lines)
+
     def detect_and_handle_pcb_change(self, req: ProjectRequirements) -> bool:
         """Check for PCB changes and, if found, transition to :attr:`~ContextState.PCB_CHANGED`.
 
+        When a change is detected this method:
+
+        1. Computes the current file hashes.
+        2. Builds a :class:`FileChange` list (added/modified/removed files) and
+           stores it on :attr:`~ProjectRequirements.file_changes`.
+        3. Transitions the state to ``PCB_CHANGED``.
+
+        The :attr:`~ProjectRequirements.file_changes` list remains available
+        throughout the ``UPDATING_CONTEXT`` phase and can be formatted via
+        :meth:`format_file_change_list` to pass a targeted change summary
+        alongside the previous :attr:`~ProjectRequirements.auto_context` to
+        the raw-context generator.
+
         This method is safe to call only when *req* is in
-        :attr:`~ContextState.UP_TO_DATE` state.  If any tracked file has
-        changed, it records the new hashes for diff purposes and transitions
-        the state.
+        :attr:`~ContextState.UP_TO_DATE` state.
 
         Args:
             req: The current requirements state (must be ``UP_TO_DATE``).
@@ -435,12 +567,21 @@ class RequirementsManager:
         """
         if req.state != ContextState.UP_TO_DATE:
             return False
-        if not self.check_for_pcb_changes(req):
+        if not req.pcb_file_hashes:
             return False
+        current_hashes = self.compute_file_hashes()
+        if current_hashes == req.pcb_file_hashes:
+            return False
+        req.file_changes = self.compute_file_change_list(
+            req.pcb_file_hashes, current_hashes
+        )
         self.transition(
             req,
             ContextState.PCB_CHANGED,
-            reason="Tracked KiCad file hash changed",
+            reason=(
+                f"{len(req.file_changes)} tracked KiCad file(s) changed: "
+                + ", ".join(fc.path for fc in req.file_changes)
+            ),
         )
         return True
 

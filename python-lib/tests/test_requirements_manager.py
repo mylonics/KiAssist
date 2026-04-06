@@ -2,11 +2,13 @@
 
 Covers:
 * ContextState enum values and JSON serialisability
-* ProjectRequirements serialisation round-trip
+* ProjectRequirements serialisation round-trip (including file_changes)
 * ProjectRequirements convenience properties
 * StateTransition serialisation
+* FileChange serialisation
 * RequirementsManager: load_or_create, save, transition enforcement
 * RequirementsManager: file hashing and change detection
+* RequirementsManager: compute_file_change_list and format_file_change_list
 * RequirementsManager: diff generation
 * RequirementsManager: high-level workflow helpers
 * Full lifecycle: fresh start → UP_TO_DATE
@@ -25,6 +27,7 @@ import pytest
 
 from kiassist_utils.context.requirements import (
     ContextState,
+    FileChange,
     ProjectRequirements,
     RequirementsManager,
     StateTransition,
@@ -93,6 +96,43 @@ class TestStateTransition:
 
 
 # ===========================================================================
+# FileChange
+# ===========================================================================
+
+
+class TestFileChange:
+    def test_to_dict_round_trip_added(self):
+        fc = FileChange(path="board.kicad_pcb", change_type="added", new_hash="abc")
+        d = fc.to_dict()
+        fc2 = FileChange.from_dict(d)
+        assert fc2.path == "board.kicad_pcb"
+        assert fc2.change_type == "added"
+        assert fc2.old_hash is None
+        assert fc2.new_hash == "abc"
+
+    def test_to_dict_round_trip_modified(self):
+        fc = FileChange(
+            path="schema.kicad_sch",
+            change_type="modified",
+            old_hash="old",
+            new_hash="new",
+        )
+        d = fc.to_dict()
+        fc2 = FileChange.from_dict(d)
+        assert fc2.change_type == "modified"
+        assert fc2.old_hash == "old"
+        assert fc2.new_hash == "new"
+
+    def test_to_dict_round_trip_removed(self):
+        fc = FileChange(path="old.kicad_pcb", change_type="removed", old_hash="xyz")
+        d = fc.to_dict()
+        fc2 = FileChange.from_dict(d)
+        assert fc2.change_type == "removed"
+        assert fc2.old_hash == "xyz"
+        assert fc2.new_hash is None
+
+
+# ===========================================================================
 # ProjectRequirements
 # ===========================================================================
 
@@ -103,6 +143,7 @@ class TestProjectRequirements:
         assert req.state == ContextState.GETTING_RAW_CONTEXT
 
     def test_serialisation_round_trip(self):
+        fc = FileChange(path="board.kicad_pcb", change_type="modified", old_hash="a", new_hash="b")
         req = ProjectRequirements(
             state=ContextState.UP_TO_DATE,
             user_requirements="# My requirements",
@@ -111,6 +152,7 @@ class TestProjectRequirements:
             pending_questions=["Q1?", "Q2?"],
             pcb_file_hashes={"board.kicad_pcb": "abc123"},
             context_diff="@@ ...",
+            file_changes=[fc],
         )
         d = req.to_dict()
         req2 = ProjectRequirements.from_dict(d)
@@ -121,6 +163,9 @@ class TestProjectRequirements:
         assert req2.pending_questions == req.pending_questions
         assert req2.pcb_file_hashes == req.pcb_file_hashes
         assert req2.context_diff == req.context_diff
+        assert len(req2.file_changes) == 1
+        assert req2.file_changes[0].path == "board.kicad_pcb"
+        assert req2.file_changes[0].change_type == "modified"
 
     def test_is_stable_only_when_up_to_date(self):
         for state in ContextState:
@@ -367,6 +412,163 @@ class TestRequirementsManagerHashing:
         (tmp_path / "board.kicad_pcb").write_text("changed", encoding="utf-8")
         changed = manager.detect_and_handle_pcb_change(req)
         assert changed is False
+
+    def test_detect_and_handle_populates_file_changes(self, tmp_path: Path):
+        """file_changes must be populated when a PCB change is detected."""
+        self._make_kicad_files(tmp_path)
+        manager = RequirementsManager(tmp_path)
+        req = ProjectRequirements(state=ContextState.UP_TO_DATE)
+        req.pcb_file_hashes = manager.compute_file_hashes()
+        manager.save(req)
+        (tmp_path / "board.kicad_pcb").write_text("changed", encoding="utf-8")
+        manager.detect_and_handle_pcb_change(req)
+        assert len(req.file_changes) == 1
+        assert req.file_changes[0].path == "board.kicad_pcb"
+        assert req.file_changes[0].change_type == "modified"
+
+    def test_detect_and_handle_file_changes_lists_added_file(self, tmp_path: Path):
+        self._make_kicad_files(tmp_path)
+        manager = RequirementsManager(tmp_path)
+        req = ProjectRequirements(state=ContextState.UP_TO_DATE)
+        req.pcb_file_hashes = manager.compute_file_hashes()
+        manager.save(req)
+        (tmp_path / "new_sheet.kicad_sch").write_text("new sheet data", encoding="utf-8")
+        manager.detect_and_handle_pcb_change(req)
+        added = [fc for fc in req.file_changes if fc.change_type == "added"]
+        assert any(fc.path == "new_sheet.kicad_sch" for fc in added)
+
+    def test_detect_and_handle_file_changes_lists_removed_file(self, tmp_path: Path):
+        self._make_kicad_files(tmp_path)
+        manager = RequirementsManager(tmp_path)
+        req = ProjectRequirements(state=ContextState.UP_TO_DATE)
+        req.pcb_file_hashes = manager.compute_file_hashes()
+        manager.save(req)
+        (tmp_path / "board.kicad_pcb").unlink()
+        manager.detect_and_handle_pcb_change(req)
+        removed = [fc for fc in req.file_changes if fc.change_type == "removed"]
+        assert any(fc.path == "board.kicad_pcb" for fc in removed)
+
+    def test_detect_and_handle_transition_reason_names_changed_files(self, tmp_path: Path):
+        """The transition reason should name which file(s) changed."""
+        self._make_kicad_files(tmp_path)
+        manager = RequirementsManager(tmp_path)
+        req = ProjectRequirements(state=ContextState.UP_TO_DATE)
+        req.pcb_file_hashes = manager.compute_file_hashes()
+        manager.save(req)
+        (tmp_path / "board.kicad_pcb").write_text("changed", encoding="utf-8")
+        manager.detect_and_handle_pcb_change(req)
+        last_transition = req.state_history[-1]
+        assert "board.kicad_pcb" in last_transition.reason
+
+
+# ===========================================================================
+# RequirementsManager — compute_file_change_list & format_file_change_list
+# ===========================================================================
+
+
+class TestFileChangeList:
+    def test_no_changes_returns_empty(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        hashes = {"a.kicad_pcb": "h1", "b.kicad_sch": "h2"}
+        changes = manager.compute_file_change_list(hashes, hashes)
+        assert changes == []
+
+    def test_detects_added_file(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"a.kicad_pcb": "h1"}
+        new = {"a.kicad_pcb": "h1", "b.kicad_sch": "h2"}
+        changes = manager.compute_file_change_list(old, new)
+        assert len(changes) == 1
+        assert changes[0].path == "b.kicad_sch"
+        assert changes[0].change_type == "added"
+        assert changes[0].old_hash is None
+        assert changes[0].new_hash == "h2"
+
+    def test_detects_removed_file(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"a.kicad_pcb": "h1", "b.kicad_sch": "h2"}
+        new = {"a.kicad_pcb": "h1"}
+        changes = manager.compute_file_change_list(old, new)
+        assert len(changes) == 1
+        assert changes[0].path == "b.kicad_sch"
+        assert changes[0].change_type == "removed"
+        assert changes[0].old_hash == "h2"
+        assert changes[0].new_hash is None
+
+    def test_detects_modified_file(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"a.kicad_pcb": "old_hash"}
+        new = {"a.kicad_pcb": "new_hash"}
+        changes = manager.compute_file_change_list(old, new)
+        assert len(changes) == 1
+        assert changes[0].path == "a.kicad_pcb"
+        assert changes[0].change_type == "modified"
+        assert changes[0].old_hash == "old_hash"
+        assert changes[0].new_hash == "new_hash"
+
+    def test_detects_multiple_changes(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"a.kicad_pcb": "h1", "b.kicad_sch": "h2", "c.kicad_pro": "h3"}
+        new = {"a.kicad_pcb": "h1_mod", "c.kicad_pro": "h3", "d.kicad_sym": "h4"}
+        changes = manager.compute_file_change_list(old, new)
+        change_map = {fc.path: fc.change_type for fc in changes}
+        assert change_map["a.kicad_pcb"] == "modified"
+        assert change_map["b.kicad_sch"] == "removed"
+        assert change_map["d.kicad_sym"] == "added"
+        assert "c.kicad_pro" not in change_map
+
+    def test_results_sorted_by_path(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        old = {"z.kicad_pcb": "h1", "a.kicad_sch": "h2"}
+        new = {"z.kicad_pcb": "h1_mod", "a.kicad_sch": "h2_mod"}
+        changes = manager.compute_file_change_list(old, new)
+        paths = [fc.path for fc in changes]
+        assert paths == sorted(paths)
+
+    def test_format_empty_returns_empty_string(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        assert manager.format_file_change_list([]) == ""
+
+    def test_format_includes_added_file(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        changes = [FileChange(path="new.kicad_sch", change_type="added", new_hash="h")]
+        output = manager.format_file_change_list(changes)
+        assert "new.kicad_sch" in output
+        assert "Added" in output or "added" in output.lower()
+
+    def test_format_includes_removed_file(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        changes = [FileChange(path="old.kicad_pcb", change_type="removed", old_hash="h")]
+        output = manager.format_file_change_list(changes)
+        assert "old.kicad_pcb" in output
+        assert "Removed" in output or "removed" in output.lower()
+
+    def test_format_includes_modified_file(self, tmp_path: Path):
+        manager = RequirementsManager(tmp_path)
+        changes = [
+            FileChange(
+                path="board.kicad_pcb",
+                change_type="modified",
+                old_hash="a",
+                new_hash="b",
+            )
+        ]
+        output = manager.format_file_change_list(changes)
+        assert "board.kicad_pcb" in output
+        assert "Modified" in output or "modified" in output.lower()
+
+    def test_format_change_list_round_trips_after_pcb_change(self, tmp_path: Path):
+        """The change list produced after detect_and_handle_pcb_change should
+        format without error and contain the modified file name."""
+        (tmp_path / "board.kicad_pcb").write_text("original")
+        manager = RequirementsManager(tmp_path)
+        req = ProjectRequirements(state=ContextState.UP_TO_DATE)
+        req.pcb_file_hashes = manager.compute_file_hashes()
+        manager.save(req)
+        (tmp_path / "board.kicad_pcb").write_text("updated")
+        manager.detect_and_handle_pcb_change(req)
+        formatted = manager.format_file_change_list(req.file_changes)
+        assert "board.kicad_pcb" in formatted
 
 
 # ===========================================================================
@@ -690,9 +892,12 @@ class TestContextPackageExports:
     def test_new_classes_importable_from_context(self):
         from kiassist_utils.context import (
             ContextState,
+            FileChange,
             ProjectRequirements,
             RequirementsManager,
         )
         assert ContextState.UP_TO_DATE.value == "up_to_date"
         assert ProjectRequirements().state == ContextState.GETTING_RAW_CONTEXT
         assert callable(RequirementsManager)
+        fc = FileChange(path="x.kicad_pcb", change_type="added", new_hash="h")
+        assert fc.change_type == "added"
