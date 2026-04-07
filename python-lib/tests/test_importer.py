@@ -441,3 +441,167 @@ def test_package_exports():
     assert callable(imp.commit_import)
     assert callable(imp.search_symbols)
     assert callable(imp.search_footprints)
+    # AI helpers
+    assert callable(imp.suggest_symbol)
+    assert callable(imp.map_pins)
+    assert callable(imp.generate_symbol)
+    assert callable(imp.extract_pins_from_symbol)
+    assert callable(imp.apply_pin_mapping)
+
+
+# ===========================================================================
+# ai_symbol helpers
+# ===========================================================================
+
+MINIMAL_SYM_PINS = """\
+(kicad_symbol_lib (version 20231120) (generator test)
+  (symbol "NE555D"
+    (in_bom yes) (on_board yes)
+    (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+    (property "Value" "NE555D" (at 0 -2 0) (effects (font (size 1.27 1.27))))
+    (symbol "NE555D_1_1"
+      (pin power_in line (at 0 0 0) (length 2.54)
+        (name "GND" (effects (font (size 1.27 1.27))))
+        (number "1" (effects (font (size 1.27 1.27))))
+      )
+      (pin output line (at 0 2.54 0) (length 2.54)
+        (name "OUT" (effects (font (size 1.27 1.27))))
+        (number "3" (effects (font (size 1.27 1.27))))
+      )
+      (pin power_in line (at 0 5.08 0) (length 2.54)
+        (name "VCC" (effects (font (size 1.27 1.27))))
+        (number "8" (effects (font (size 1.27 1.27))))
+      )
+    )
+  )
+)
+"""
+
+
+class TestAiSymbolHelpers:
+    """Tests for the ai_symbol module (no real AI calls)."""
+
+    def _dummy_caller(self, system: str, user: str) -> str:
+        """Return a dummy AI response based on content keywords."""
+        if '"mapping"' in system:
+            return '{"mapping": {"1": "1", "3": "3", "8": "8"}, "notes": "direct match", "warnings": []}'
+        if '"library"' in system:
+            return '[{"library": "Timer", "name": "NE555", "reason": "Functionally identical 8-pin timer", "confidence": "high"}]'
+        if "(symbol" in system:
+            return '(symbol "NE555D" (in_bom yes) (on_board yes) (property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27)))) )'
+        return "{}"
+
+    def test_extract_pins_from_symbol(self):
+        from kiassist_utils.importer.ai_symbol import extract_pins_from_symbol
+        pins = extract_pins_from_symbol(MINIMAL_SYM_PINS)
+        assert len(pins) == 3
+        numbers = {p["number"] for p in pins}
+        assert numbers == {"1", "3", "8"}
+        names = {p["name"] for p in pins}
+        assert "GND" in names
+        assert "VCC" in names
+
+    def test_extract_pins_empty(self):
+        from kiassist_utils.importer.ai_symbol import extract_pins_from_symbol
+        assert extract_pins_from_symbol("") == []
+        assert extract_pins_from_symbol("(no pins here)") == []
+
+    def test_suggest_symbol_returns_list(self):
+        from kiassist_utils.importer.ai_symbol import suggest_symbol
+        suggestions, raw = suggest_symbol(
+            mpn="NE555D",
+            manufacturer="TI",
+            description="Single Timer",
+            package="DIP-8",
+            pin_summary="8 pins",
+            available_libraries=["Timer", "Device"],
+            call_ai=self._dummy_caller,
+        )
+        assert isinstance(suggestions, list)
+        assert len(suggestions) == 1
+        assert suggestions[0].library == "Timer"
+        assert suggestions[0].name == "NE555"
+        assert suggestions[0].confidence == "high"
+
+    def test_suggest_symbol_bad_json(self):
+        from kiassist_utils.importer.ai_symbol import suggest_symbol
+        suggestions, _ = suggest_symbol(
+            mpn="X", manufacturer="", description="", package="",
+            pin_summary="", available_libraries=[],
+            call_ai=lambda s, u: "not valid json",
+        )
+        assert suggestions == []
+
+    def test_map_pins_returns_mapping(self):
+        from kiassist_utils.importer.ai_symbol import map_pins, PinMapping
+        imported = [{"number": "1", "name": "GND"}, {"number": "3", "name": "OUT"}, {"number": "8", "name": "VCC"}]
+        base = [{"number": "1", "name": "GND"}, {"number": "3", "name": "OUT"}, {"number": "8", "name": "VCC"}]
+        result, raw = map_pins(
+            mpn="NE555D",
+            imported_pins=imported,
+            base_symbol_lib="Timer",
+            base_symbol_name="NE555",
+            base_pins=base,
+            call_ai=self._dummy_caller,
+        )
+        assert isinstance(result, PinMapping)
+        assert result.mapping["1"] == "1"
+        assert result.mapping["8"] == "8"
+        assert result.notes == "direct match"
+
+    def test_map_pins_bad_json_returns_empty(self):
+        from kiassist_utils.importer.ai_symbol import map_pins
+        result, _ = map_pins(
+            mpn="X", imported_pins=[], base_symbol_lib="L", base_symbol_name="S",
+            base_pins=[], call_ai=lambda s, u: "garbage",
+        )
+        assert result.mapping == {}
+        assert result.warnings  # should have a warning about parse failure
+
+    def test_apply_pin_mapping_replaces_numbers(self):
+        from kiassist_utils.importer.ai_symbol import apply_pin_mapping, PinMapping
+        sexpr = '(pin passive line (number "1") (name "A"))(pin passive line (number "2") (name "B"))'
+        pm = PinMapping(mapping={"1": "10", "2": "20"})
+        result = apply_pin_mapping(sexpr, pm)
+        assert '(number "10"' in result
+        assert '(number "20"' in result
+        assert '(number "1"' not in result
+
+    def test_apply_pin_mapping_skips_null(self):
+        from kiassist_utils.importer.ai_symbol import apply_pin_mapping, PinMapping
+        sexpr = '(pin passive line (number "3") (name "C"))'
+        pm = PinMapping(mapping={"3": None})
+        result = apply_pin_mapping(sexpr, pm)
+        # Original should be unchanged
+        assert '(number "3"' in result
+
+    def test_generate_symbol_extracts_sexpr(self):
+        from kiassist_utils.importer.ai_symbol import generate_symbol
+        sym, raw = generate_symbol(
+            mpn="NE555D", manufacturer="TI", description="Timer",
+            package="DIP-8", reference="U", datasheet="~",
+            pins=[], call_ai=self._dummy_caller,
+        )
+        assert sym.startswith("(symbol")
+
+    def test_generate_symbol_no_sexpr_returns_empty(self):
+        from kiassist_utils.importer.ai_symbol import generate_symbol
+        sym, _ = generate_symbol(
+            mpn="X", manufacturer="", description="", package="",
+            reference="U", datasheet="",
+            pins=[], call_ai=lambda s, u: "No symbol here.",
+        )
+        assert sym == ""
+
+    def test_strip_fences(self):
+        from kiassist_utils.importer.ai_symbol import _strip_fences
+        assert _strip_fences("```json\n[]\n```") == "[]"
+        assert _strip_fences("plain text") == "plain text"
+
+    def test_parse_suggestions_missing_fields(self):
+        from kiassist_utils.importer.ai_symbol import _parse_suggestions
+        raw = '[{"library": "Device", "name": "R"}]'  # missing reason/confidence
+        sug = _parse_suggestions(raw)
+        assert len(sug) == 1
+        assert sug[0].reason == ""
+        assert sug[0].confidence == "medium"

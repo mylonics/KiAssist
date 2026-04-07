@@ -1833,6 +1833,251 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc), "path": ""}
 
+    def importer_ai_suggest_symbol(
+        self,
+        mpn: str = "",
+        manufacturer: str = "",
+        description: str = "",
+        package: str = "",
+        symbol_sexpr: str = "",
+    ) -> Dict[str, Any]:
+        """Use the AI to suggest the best matching KiCad native symbol as a template.
+
+        The AI analyses the component metadata and pin topology and recommends
+        up to 5 KiCad built-in symbols that could serve as a visual base.
+
+        Args:
+            mpn: Manufacturer part number.
+            manufacturer: Manufacturer name.
+            description: Component description.
+            package: Package / footprint identifier (e.g. ``"DIP-8"``).
+            symbol_sexpr: Optional imported symbol S-expression (used to
+                extract the pin count/summary for the prompt).
+
+        Returns:
+            Dict with ``success`` and ``suggestions`` list.  Each suggestion
+            has ``library``, ``name``, ``reason``, ``confidence`` keys.
+        """
+        try:
+            from .importer.ai_symbol import (
+                suggest_symbol,
+                extract_pins_from_symbol,
+            )
+            from .kicad_parser.library import LibraryDiscovery
+
+            # Gather available library names for the prompt
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            try:
+                lib_names = [e.nickname for e in disc.list_symbol_libraries()]
+            except Exception:
+                lib_names = []
+
+            # Build a brief pin summary
+            pin_summary = ""
+            if symbol_sexpr:
+                pins = extract_pins_from_symbol(symbol_sexpr)
+                if pins:
+                    _PIN_SUMMARY_LIMIT = 8
+                    unique_types = sorted({p["type"] for p in pins})
+                    pin_summary = (
+                        f"{len(pins)} pins: "
+                        + ", ".join(f'"{p["number"]}"/"{p["name"]}"' for p in pins[:_PIN_SUMMARY_LIMIT])
+                        + (" ..." if len(pins) > _PIN_SUMMARY_LIMIT else "")
+                        + f" (types: {', '.join(unique_types)})"
+                    )
+
+            def _call_ai(system: str, user: str) -> str:
+                provider = self._get_or_create_provider()
+                if not provider:
+                    raise RuntimeError("No AI provider configured")
+                from .ai.base import AIMessage
+                msgs = [AIMessage(role="user", content=user)]
+                resp = provider.chat(msgs, system_prompt=system)
+                return resp.content
+
+            suggestions, _ = suggest_symbol(
+                mpn=mpn,
+                manufacturer=manufacturer,
+                description=description,
+                package=package,
+                pin_summary=pin_summary,
+                available_libraries=lib_names,
+                call_ai=_call_ai,
+            )
+            return {
+                "success": True,
+                "suggestions": [
+                    {
+                        "library": s.library,
+                        "name": s.name,
+                        "reason": s.reason,
+                        "confidence": s.confidence,
+                    }
+                    for s in suggestions
+                ],
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "suggestions": []}
+
+    def importer_ai_map_pins(
+        self,
+        mpn: str = "",
+        imported_symbol_sexpr: str = "",
+        base_library: str = "",
+        base_symbol_name: str = "",
+    ) -> Dict[str, Any]:
+        """Use the AI to map imported component pins onto a KiCad base symbol's pins.
+
+        Analyses both pin lists and produces a mapping table.  The resulting
+        mapped symbol S-expression has the base symbol's graphics with the
+        imported pin numbers applied.
+
+        Args:
+            mpn: Imported component MPN (for AI context).
+            imported_symbol_sexpr: Raw S-expression of the imported symbol.
+            base_library: KiCad library nickname containing the base symbol.
+            base_symbol_name: Symbol name within *base_library*.
+
+        Returns:
+            Dict with ``success``, ``mapping`` dict, ``merged_symbol_sexpr``,
+            ``notes``, and ``warnings`` list.
+        """
+        try:
+            from .importer.ai_symbol import (
+                map_pins,
+                extract_pins_from_symbol,
+                apply_pin_mapping,
+            )
+            from .kicad_parser.library import LibraryDiscovery
+            from .kicad_parser.symbol_lib import SymbolLibrary
+            from .kicad_parser.sexpr import serialize
+
+            # Load base symbol
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            base_lib_path = disc.resolve_symbol_library(base_library)
+            if not base_lib_path:
+                return {
+                    "success": False,
+                    "error": f"Library '{base_library}' not found",
+                }
+            sym_lib = SymbolLibrary.load(base_lib_path)
+            base_sym = sym_lib.find_by_name(base_symbol_name)
+            if base_sym is None:
+                return {
+                    "success": False,
+                    "error": f"Symbol '{base_symbol_name}' not found in '{base_library}'",
+                }
+            base_sym_sexpr = serialize(base_sym.to_tree())
+
+            # Extract pins
+            imported_pins = extract_pins_from_symbol(imported_symbol_sexpr) if imported_symbol_sexpr else []
+            base_pins = extract_pins_from_symbol(base_sym_sexpr)
+
+            if not base_pins:
+                return {
+                    "success": False,
+                    "error": "No pins found in base symbol",
+                }
+
+            def _call_ai(system: str, user: str) -> str:
+                provider = self._get_or_create_provider()
+                if not provider:
+                    raise RuntimeError("No AI provider configured")
+                from .ai.base import AIMessage
+                msgs = [AIMessage(role="user", content=user)]
+                resp = provider.chat(msgs, system_prompt=system)
+                return resp.content
+
+            pin_mapping, _ = map_pins(
+                mpn=mpn,
+                imported_pins=imported_pins,
+                base_symbol_lib=base_library,
+                base_symbol_name=base_symbol_name,
+                base_pins=base_pins,
+                call_ai=_call_ai,
+            )
+
+            # Apply the mapping to produce a merged symbol S-expression
+            merged_sexpr = apply_pin_mapping(base_sym_sexpr, pin_mapping)
+
+            return {
+                "success": True,
+                "mapping": pin_mapping.mapping,
+                "merged_symbol_sexpr": merged_sexpr,
+                "notes": pin_mapping.notes,
+                "warnings": pin_mapping.warnings,
+                "imported_pins": imported_pins,
+                "base_pins": base_pins,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "mapping": {}}
+
+    def importer_ai_generate_symbol(
+        self,
+        mpn: str = "",
+        manufacturer: str = "",
+        description: str = "",
+        package: str = "",
+        reference: str = "U",
+        datasheet: str = "",
+        pins: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Ask the AI to generate a KiCad 6 symbol S-expression from scratch.
+
+        Useful when no base symbol is suitable and the imported auto-symbol
+        is unsatisfactory.
+
+        Args:
+            mpn: Manufacturer part number.
+            manufacturer: Manufacturer name.
+            description: Part description.
+            package: Package (e.g. ``"DIP-8"``).
+            reference: Default reference designator prefix (e.g. ``"U"``).
+            datasheet: Datasheet URL.
+            pins: Optional list of ``{"number", "name", "direction"}`` dicts.
+                If omitted the AI generates a best-guess pin list.
+
+        Returns:
+            Dict with ``success`` and ``symbol_sexpr``.
+        """
+        try:
+            from .importer.ai_symbol import generate_symbol
+
+            def _call_ai(system: str, user: str) -> str:
+                provider = self._get_or_create_provider()
+                if not provider:
+                    raise RuntimeError("No AI provider configured")
+                from .ai.base import AIMessage
+                msgs = [AIMessage(role="user", content=user)]
+                resp = provider.chat(msgs, system_prompt=system)
+                return resp.content
+
+            sym_sexpr, raw = generate_symbol(
+                mpn=mpn,
+                manufacturer=manufacturer,
+                description=description,
+                package=package,
+                reference=reference,
+                datasheet=datasheet,
+                pins=pins or [],
+                call_ai=_call_ai,
+            )
+            if not sym_sexpr:
+                return {
+                    "success": False,
+                    "error": "AI did not produce a valid symbol S-expression",
+                    "raw_response": raw[:500] if raw else "",
+                }
+            return {"success": True, "symbol_sexpr": sym_sexpr}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "symbol_sexpr": ""}
+
     @staticmethod
     def _import_result_to_dict(result) -> Dict[str, Any]:
         """Serialise an :class:`ImportResult` for JSON transport."""

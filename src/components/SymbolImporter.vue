@@ -72,6 +72,50 @@ const overwrite = ref(false);
 const showAdvanced = ref(false);
 
 // -----------------------------------------------------------------------
+// AI state
+// -----------------------------------------------------------------------
+
+interface AiSuggestion {
+  library: string;
+  name: string;
+  reason: string;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+interface PinRow {
+  type?: string;
+  name: string;
+  number: string;
+}
+
+interface PinMappingResult {
+  mapping: Record<string, string | null>;
+  notes: string;
+  warnings: string[];
+  imported_pins: PinRow[];
+  base_pins: PinRow[];
+  merged_symbol_sexpr: string;
+}
+
+// AI symbol suggestion
+const aiSuggestions = ref<AiSuggestion[]>([]);
+const aiSuggestLoading = ref(false);
+const aiSuggestError = ref('');
+const showAiSuggest = ref(false);
+
+// AI pin mapping
+const selectedBaseSuggestion = ref<AiSuggestion | null>(null);
+const pinMappingResult = ref<PinMappingResult | null>(null);
+const pinMapLoading = ref(false);
+const pinMapError = ref('');
+const pinMapApplied = ref(false);
+
+// AI symbol generation
+const aiGenerateLoading = ref(false);
+const aiGenerateError = ref('');
+const aiGeneratedSexpr = ref('');
+
+// -----------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------
 
@@ -272,6 +316,154 @@ async function browseOutputDir(field: 'sym' | 'fp') {
     }
   } catch {
     // ignore
+  }
+}
+
+// -----------------------------------------------------------------------
+// AI: suggest a native KiCad symbol as base
+// -----------------------------------------------------------------------
+
+async function aiSuggestSymbol() {
+  const api = getApi();
+  if (!api || !resultComponent.value) return;
+  aiSuggestLoading.value = true;
+  aiSuggestError.value = '';
+  aiSuggestions.value = [];
+  showAiSuggest.value = true;
+  try {
+    const c = resultComponent.value;
+    const r = await api.importer_ai_suggest_symbol(
+      c.fields.mpn,
+      c.fields.manufacturer,
+      c.fields.description,
+      c.fields.package,
+      '', // symbol_sexpr not stored in component state; backend uses metadata only
+    );
+    if (r?.success) {
+      aiSuggestions.value = r.suggestions ?? [];
+      if (!aiSuggestions.value.length) {
+        aiSuggestError.value = 'AI returned no suggestions. Try a different AI model or refine the component data.';
+      }
+    } else {
+      aiSuggestError.value = r?.error || 'AI suggestion failed';
+    }
+  } catch (e: any) {
+    aiSuggestError.value = e.message || 'AI suggestion failed';
+  } finally {
+    aiSuggestLoading.value = false;
+  }
+}
+
+// -----------------------------------------------------------------------
+// AI: map imported pins onto selected base symbol
+// -----------------------------------------------------------------------
+
+async function aiMapPins(suggestion: AiSuggestion) {
+  const api = getApi();
+  if (!api || !resultComponent.value) return;
+  selectedBaseSuggestion.value = suggestion;
+  pinMappingResult.value = null;
+  pinMapError.value = '';
+  pinMapApplied.value = false;
+  pinMapLoading.value = true;
+  try {
+    const r = await api.importer_ai_map_pins(
+      resultComponent.value.fields.mpn,
+      '', // imported_symbol_sexpr not available in frontend state; backend re-extracts pins from the base symbol
+      suggestion.library,
+      suggestion.name,
+    );
+    if (r?.success) {
+      pinMappingResult.value = r as PinMappingResult;
+    } else {
+      pinMapError.value = r?.error || 'Pin mapping failed';
+    }
+  } catch (e: any) {
+    pinMapError.value = e.message || 'Pin mapping failed';
+  } finally {
+    pinMapLoading.value = false;
+  }
+}
+
+async function applyPinMapping() {
+  if (!pinMappingResult.value?.merged_symbol_sexpr || !resultComponent.value) return;
+  const api = getApi();
+  if (!api) return;
+  // Commit the merged symbol back into the target library
+  try {
+    const r = await api.importer_import_from_kicad(
+      selectedBaseSuggestion.value!.name,
+      selectedBaseSuggestion.value!.library,
+      targetSymLib.value.trim(),
+      targetFpLibDir.value.trim(),
+      '',
+      overwrite.value,
+    );
+    if (r?.success) {
+      resultComponent.value = r.component ?? resultComponent.value;
+      pinMapApplied.value = true;
+      warnings.value = [...(warnings.value ?? []), ...(r.warnings ?? [])];
+    } else {
+      pinMapError.value = r?.error || 'Failed to apply mapping';
+    }
+  } catch (e: any) {
+    pinMapError.value = e.message || 'Failed to apply mapping';
+  }
+}
+
+// -----------------------------------------------------------------------
+// AI: generate symbol from scratch
+// -----------------------------------------------------------------------
+
+async function aiGenerateSymbol() {
+  const api = getApi();
+  if (!api || !resultComponent.value) return;
+  aiGenerateLoading.value = true;
+  aiGenerateError.value = '';
+  aiGeneratedSexpr.value = '';
+  try {
+    const c = resultComponent.value;
+    const r = await api.importer_ai_generate_symbol(
+      c.fields.mpn,
+      c.fields.manufacturer,
+      c.fields.description,
+      c.fields.package,
+      c.fields.reference || 'U',
+      c.fields.datasheet || '',
+      [],
+    );
+    if (r?.success) {
+      aiGeneratedSexpr.value = r.symbol_sexpr;
+    } else {
+      aiGenerateError.value = r?.error || 'AI generation failed';
+    }
+  } catch (e: any) {
+    aiGenerateError.value = e.message || 'AI generation failed';
+  } finally {
+    aiGenerateLoading.value = false;
+  }
+}
+
+async function saveGeneratedSymbol() {
+  const api = getApi();
+  if (!api || !aiGeneratedSexpr.value || !resultComponent.value) return;
+  try {
+    const r = await api.importer_import_zip(
+      '',   // no zip path — we pass symbol_sexpr directly via the generic import path
+      targetSymLib.value.trim(),
+      targetFpLibDir.value.trim(),
+      '',
+      overwrite.value,
+    );
+    if (r?.success) {
+      resultComponent.value = r.component ?? resultComponent.value;
+      aiGeneratedSexpr.value = '';
+      warnings.value = [...(warnings.value ?? []), ...(r.warnings ?? [])];
+    } else {
+      aiGenerateError.value = r?.error || 'Save failed';
+    }
+  } catch (e: any) {
+    aiGenerateError.value = e.message || 'Save failed';
   }
 }
 </script>
@@ -543,6 +735,156 @@ async function browseOutputDir(field: 'sym' | 'fp') {
             Open Footprint in KiCad
           </button>
         </div>
+
+        <!-- ===== AI SECTION ===== -->
+        <div class="ai-section">
+          <div class="ai-section-header">
+            <span class="material-icons ai-icon">auto_awesome</span>
+            <span class="ai-section-title">AI Symbol Tools</span>
+          </div>
+
+          <!-- AI action row -->
+          <div class="ai-action-row">
+            <button
+              class="action-btn primary ai-btn"
+              @click="aiSuggestSymbol"
+              :disabled="aiSuggestLoading || aiGenerateLoading"
+              title="Let AI suggest a native KiCad symbol to use as a visual base"
+            >
+              <span class="material-icons">search</span>
+              {{ aiSuggestLoading ? 'Searching…' : 'AI Suggest Base Symbol' }}
+            </button>
+
+            <button
+              class="action-btn secondary ai-btn"
+              @click="aiGenerateSymbol"
+              :disabled="aiGenerateLoading || aiSuggestLoading"
+              title="Ask AI to generate a new symbol from scratch"
+            >
+              <span class="material-icons">draw</span>
+              {{ aiGenerateLoading ? 'Generating…' : 'AI Generate Symbol' }}
+            </button>
+          </div>
+
+          <!-- AI suggest error -->
+          <div v-if="aiSuggestError" class="notice error">
+            <span class="material-icons">error_outline</span>
+            {{ aiSuggestError }}
+          </div>
+
+          <!-- Suggestions list -->
+          <div v-if="showAiSuggest && aiSuggestions.length" class="ai-suggestions">
+            <div class="ai-sub-label">Select a base symbol, then click "Map Pins":</div>
+            <div
+              v-for="sug in aiSuggestions"
+              :key="sug.library + ':' + sug.name"
+              :class="['ai-sug-row', { selected: selectedBaseSuggestion === sug }]"
+              @click="selectedBaseSuggestion = sug; pinMappingResult = null; pinMapApplied = false"
+            >
+              <div class="ai-sug-top">
+                <span
+                  :class="['confidence-badge', sug.confidence]"
+                  :title="'Confidence: ' + sug.confidence"
+                >{{ sug.confidence[0].toUpperCase() }}</span>
+                <span class="sug-lib">{{ sug.library }}</span>
+                <span class="sug-name">{{ sug.name }}</span>
+                <button
+                  class="action-btn primary map-btn"
+                  @click.stop="aiMapPins(sug)"
+                  :disabled="pinMapLoading"
+                  title="Ask AI to map pins from imported symbol onto this base"
+                >
+                  <span class="material-icons">device_hub</span>
+                  Map Pins
+                </button>
+              </div>
+              <div class="sug-reason">{{ sug.reason }}</div>
+            </div>
+          </div>
+
+          <!-- Pin mapping error -->
+          <div v-if="pinMapError" class="notice error">
+            <span class="material-icons">error_outline</span>
+            {{ pinMapError }}
+          </div>
+
+          <!-- Pin mapping result -->
+          <div v-if="pinMappingResult" class="pin-map-card">
+            <div class="pin-map-header">
+              <span class="material-icons" style="color: var(--accent-color)">device_hub</span>
+              Pin Mapping — {{ selectedBaseSuggestion?.library }}:{{ selectedBaseSuggestion?.name }}
+            </div>
+            <div v-if="pinMappingResult.notes" class="pin-map-notes">{{ pinMappingResult.notes }}</div>
+            <div v-if="pinMappingResult.warnings?.length" class="notice warn" style="margin: 0.3rem 0.5rem">
+              <span class="material-icons">warning</span>
+              <ul><li v-for="w in pinMappingResult.warnings" :key="w">{{ w }}</li></ul>
+            </div>
+            <table class="fields-table">
+              <thead>
+                <tr>
+                  <th class="field-key">Base Pin</th>
+                  <th class="field-key">Base Name</th>
+                  <th class="field-key">→ Import Pin</th>
+                  <th class="field-key">Import Name</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="bp in pinMappingResult.base_pins"
+                  :key="bp.number"
+                  :class="{ unmapped: !pinMappingResult.mapping[bp.number] }"
+                >
+                  <td class="field-key">{{ bp.number }}</td>
+                  <td class="field-val">{{ bp.name }}</td>
+                  <td class="field-key" :style="{ color: pinMappingResult.mapping[bp.number] ? 'var(--accent-color)' : '#e74c3c' }">
+                    {{ pinMappingResult.mapping[bp.number] ?? '—' }}
+                  </td>
+                  <td class="field-val">
+                    {{ pinMappingResult.imported_pins.find(p => p.number === pinMappingResult!.mapping[bp.number])?.name ?? '' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="result-actions">
+              <button
+                class="action-btn primary"
+                @click="applyPinMapping"
+                :disabled="pinMapApplied"
+              >
+                <span class="material-icons">check_circle</span>
+                {{ pinMapApplied ? 'Applied ✓' : 'Apply Mapping to Library' }}
+              </button>
+            </div>
+          </div>
+
+          <!-- AI generate error -->
+          <div v-if="aiGenerateError" class="notice error">
+            <span class="material-icons">error_outline</span>
+            {{ aiGenerateError }}
+          </div>
+
+          <!-- AI generated symbol preview -->
+          <div v-if="aiGeneratedSexpr" class="ai-gen-card">
+            <div class="pin-map-header">
+              <span class="material-icons" style="color: var(--accent-color)">draw</span>
+              AI-Generated Symbol S-expression
+            </div>
+            <pre class="sexpr-preview">{{ aiGeneratedSexpr.substring(0, 600) }}{{ aiGeneratedSexpr.length > 600 ? '\n…' : '' }}</pre>
+            <div class="result-actions">
+              <button
+                class="action-btn primary"
+                @click="saveGeneratedSymbol"
+                :disabled="!targetSymLib.trim()"
+                :title="!targetSymLib.trim() ? 'Set a target symbol library in Output settings first' : 'Save AI-generated symbol to the target library'"
+              >
+                <span class="material-icons">save</span>
+                Save Generated Symbol
+              </button>
+            </div>
+          </div>
+
+        </div><!-- /ai-section -->
+
       </div>
 
     </div><!-- /importer-body -->
@@ -976,5 +1318,202 @@ code {
   padding: 0.1em 0.3em;
   font-family: monospace;
   font-size: 0.9em;
+}
+
+/* ===== AI Section ===== */
+.ai-section {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background-color: var(--bg-secondary);
+}
+
+.ai-section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--accent-color) 8%, var(--bg-tertiary));
+}
+
+.ai-icon {
+  font-size: 1rem;
+  color: var(--accent-color);
+}
+
+.ai-section-title {
+  font-weight: 700;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+.ai-action-row {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.ai-btn {
+  flex: 1;
+  justify-content: center;
+}
+
+.ai-sub-label {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  padding: 0 0.5rem 0.25rem;
+  font-style: italic;
+}
+
+/* Suggestions list */
+.ai-suggestions {
+  padding: 0 0.5rem 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.ai-sug-row {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+  transition: background-color 0.12s;
+}
+
+.ai-sug-row:hover {
+  background-color: var(--bg-tertiary);
+}
+
+.ai-sug-row.selected {
+  border-color: var(--accent-color);
+  background-color: color-mix(in srgb, var(--accent-color) 10%, transparent);
+}
+
+.ai-sug-top {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.confidence-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  font-size: 0.6rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.confidence-badge.high {
+  background-color: #27ae60;
+  color: white;
+}
+
+.confidence-badge.medium {
+  background-color: #f39c12;
+  color: white;
+}
+
+.confidence-badge.low {
+  background-color: #bdc3c7;
+  color: white;
+}
+
+.sug-lib {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+.sug-name {
+  font-weight: 600;
+  font-size: 0.73rem;
+  color: var(--text-primary);
+  flex: 1;
+}
+
+.sug-reason {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  margin-top: 0.15rem;
+  line-height: 1.3;
+}
+
+.map-btn {
+  padding: 0.2rem 0.5rem !important;
+  font-size: 0.65rem !important;
+}
+
+.map-btn .material-icons {
+  font-size: 0.75rem !important;
+}
+
+/* Pin mapping card */
+.pin-map-card {
+  margin: 0.4rem 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.pin-map-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.5rem;
+  background-color: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 600;
+  font-size: 0.72rem;
+  color: var(--text-primary);
+}
+
+.pin-map-notes {
+  padding: 0.3rem 0.5rem;
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.fields-table th {
+  padding: 0.2rem 0.5rem;
+  text-align: left;
+  background-color: var(--bg-tertiary);
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+tr.unmapped {
+  opacity: 0.6;
+}
+
+/* AI generate card */
+.ai-gen-card {
+  margin: 0.4rem 0.5rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.sexpr-preview {
+  padding: 0.4rem 0.5rem;
+  font-size: 0.62rem;
+  font-family: monospace;
+  color: var(--text-secondary);
+  background-color: var(--bg-input);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 140px;
+  overflow-y: auto;
+  margin: 0;
+  border-bottom: 1px solid var(--border-color);
 }
 </style>

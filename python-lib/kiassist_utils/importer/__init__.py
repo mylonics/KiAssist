@@ -31,6 +31,15 @@ from .kicad_lib_importer import (
     import_from_footprint_lib,
 )
 from .library_writer import commit_import
+from .ai_symbol import (
+    SymbolSuggestion,
+    PinMapping,
+    suggest_symbol,
+    map_pins,
+    generate_symbol,
+    extract_pins_from_symbol,
+    apply_pin_mapping,
+)
 
 __all__ = [
     # Models
@@ -51,4 +60,12 @@ __all__ = [
     "import_from_footprint_lib",
     # Writing
     "commit_import",
+    # AI helpers
+    "SymbolSuggestion",
+    "PinMapping",
+    "suggest_symbol",
+    "map_pins",
+    "generate_symbol",
+    "extract_pins_from_symbol",
+    "apply_pin_mapping",
 ]
