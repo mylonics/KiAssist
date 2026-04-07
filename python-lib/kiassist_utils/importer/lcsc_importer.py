@@ -13,9 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import tempfile
 from pathlib import Path
-from typing import Optional
 
 from .models import ImportedComponent, ImportMethod, ImportResult
 from .field_normalizer import normalize_fields
@@ -47,7 +45,7 @@ def is_available() -> bool:
 
 def import_lcsc(
     lcsc_id: str,
-    output_dir: Optional[str | Path] = None,
+    output_dir: str | Path,
 ) -> ImportResult:
     """Fetch a component from LCSC/EasyEDA and convert it to KiCad format.
 
@@ -56,9 +54,9 @@ def import_lcsc(
     lcsc_id:
         LCSC part number, e.g. ``"C14663"`` (with or without the leading *C*).
     output_dir:
-        Directory where the temporary files are written.  If *None* a system
-        temp directory is used.  The caller (library_writer) is responsible for
-        copying files to the final library location.
+        Directory where the temporary files are written.  The caller is
+        responsible for managing this directory's lifetime (e.g. via
+        ``tempfile.TemporaryDirectory``).
 
     Returns
     -------
@@ -79,13 +77,6 @@ def import_lcsc(
     lcsc_id = lcsc_id.strip().upper()
     if not lcsc_id.startswith("C"):
         lcsc_id = "C" + lcsc_id
-
-    if output_dir is None:
-        raise ValueError(
-            "import_lcsc requires an explicit output_dir. "
-            "Use tempfile.TemporaryDirectory() in the caller to manage the "
-            "temp directory lifetime so it is cleaned up properly."
-        )
 
     tmp_dir = Path(output_dir)
     warnings: list[str] = []

@@ -767,7 +767,7 @@ class KiAssistAPI:
         Returns:
             ``True`` if an API key exists (or the provider needs no key).
         """
-        target = provider or self.current_provider_name
+        target = (provider or self.current_provider_name).lower().strip()
         if target in self._LOCAL_PROVIDERS:
             logger.debug("check_api_key(%r) -> True (no key needed)", target)
             return True
@@ -787,7 +787,7 @@ class KiAssistAPI:
         Returns:
             The API key or ``None``.
         """
-        target = provider or self.current_provider_name
+        target = (provider or self.current_provider_name).lower().strip()
         if target in self._LOCAL_PROVIDERS:
             return None
         return self.api_key_store.get_api_key(target)
@@ -1629,8 +1629,17 @@ class KiAssistAPI:
                         models_dir=models_dir or None,
                         overwrite=overwrite,
                     )
+                    return self._import_result_to_dict(result)
 
-                return self._import_result_to_dict(result)
+                # Preview-only: the temp dir will be deleted when the context
+                # manager exits, so path fields would become stale.  Clear them
+                # and return only the S-expression data and field metadata.
+                result_dict = self._import_result_to_dict(result)
+                if result_dict.get("success") and "component" in result_dict:
+                    result_dict["component"]["symbol_path"] = ""
+                    result_dict["component"]["footprint_path"] = ""
+                    result_dict["component"]["model_paths"] = []
+                return result_dict
         except Exception as exc:
             return {"success": False, "error": str(exc), "warnings": []}
 
@@ -2308,6 +2317,8 @@ class KiAssistAPI:
                     "KiAssistAPI background thread did not stop within the timeout; "
                     "it may still be running."
                 )
+        if not self._async_loop.is_closed():
+            self._async_loop.close()
 
 
 def get_frontend_path() -> Path:

@@ -201,6 +201,28 @@ class TestApiKeyManagement:
         assert api.get_api_key("gemini") == "AIzaGemini"
         assert api.get_api_key("claude") == "sk-ant-Claude"
 
+    def test_check_api_key_local_providers_always_true(self, api):
+        """Local providers (local, gemma4) never need a key."""
+        assert api.check_api_key("local") is True
+        assert api.check_api_key("gemma4") is True
+
+    def test_check_api_key_case_insensitive(self, api):
+        """Provider names should be normalised before lookup."""
+        assert api.check_api_key("Gemma4") is True
+        assert api.check_api_key("LOCAL") is True
+        assert api.check_api_key("GEMMA4") is True
+
+    def test_get_api_key_local_providers_returns_none(self, api):
+        """Local providers return None without touching the key store."""
+        api.api_key_store.get_api_key.side_effect = Exception("should not be called")
+        assert api.get_api_key("local") is None
+        assert api.get_api_key("gemma4") is None
+
+    def test_get_api_key_case_insensitive(self, api):
+        """Mixed-case provider names should be normalised."""
+        assert api.get_api_key("Gemma4") is None
+        assert api.get_api_key("LOCAL") is None
+
 
 # ===========================================================================
 # Tests: send_message
@@ -615,3 +637,33 @@ class TestOllamaProvider:
         result = p.chat([AIMessage(role="user", content="hi")])
         assert result.content == "Hello from Ollama"
         p._delegate.chat.assert_called_once()
+
+
+# ===========================================================================
+# Tests: shutdown
+# ===========================================================================
+
+class TestShutdown:
+    def test_shutdown_stops_background_thread(self, api):
+        """shutdown() should stop the background asyncio thread."""
+        assert api._async_thread.is_alive(), "thread should be running before shutdown"
+        api.shutdown()
+        assert not api._async_thread.is_alive(), "thread should be stopped after shutdown"
+
+    def test_shutdown_closes_event_loop(self, api):
+        """shutdown() should close the event loop to release resources."""
+        assert not api._async_loop.is_closed(), "loop should be open before shutdown"
+        api.shutdown()
+        assert api._async_loop.is_closed(), "loop should be closed after shutdown"
+
+    def test_shutdown_idempotent(self, api):
+        """Calling shutdown() more than once must not raise."""
+        api.shutdown()
+        api.shutdown()  # second call must be a no-op
+
+    def test_api_fixture_does_not_leak_threads(self, api):
+        """Ensure the fixture teardown stops threads (no accumulation)."""
+        thread = api._async_thread
+        api.shutdown()
+        thread.join(timeout=2)
+        assert not thread.is_alive()

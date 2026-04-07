@@ -277,10 +277,17 @@ class ConversationStore:
         )
         tmp_path = Path(tmp_path_str)
         try:
-            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+            # Transfer ownership of tmp_fd to the file object immediately so
+            # that any failure (including errors inside fdopen itself) still
+            # results in the fd being closed via the except branch below.
+            fh = os.fdopen(tmp_fd, "w", encoding="utf-8")
+            tmp_fd = None  # ownership transferred; don't double-close
+            with fh:
                 for entry in entries:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             os.replace(tmp_path, self._history_path)
         except (OSError, IOError, ValueError):
+            if tmp_fd is not None:
+                os.close(tmp_fd)
             tmp_path.unlink(missing_ok=True)
             raise
