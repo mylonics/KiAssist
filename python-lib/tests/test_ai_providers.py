@@ -319,6 +319,79 @@ class TestGeminiProvider:
         result = p.send_message("hello")
         assert result == "Legacy response"
 
+    def test_search_grounded_query_returns_text(self):
+        """search_grounded_query() should return response_text and search_results."""
+        p = self._make_provider()
+
+        mock_resp = MagicMock()
+        mock_resp.text = "Here are some components..."
+        mock_resp.usage_metadata = None
+
+        # Build mock grounding metadata with two web chunks
+        mock_web1 = MagicMock()
+        mock_web1.title = "TXB0104 Level Shifter"
+        mock_web1.uri = "https://adafruit.com/txb0104"
+        mock_chunk1 = MagicMock()
+        mock_chunk1.web = mock_web1
+
+        mock_web2 = MagicMock()
+        mock_web2.title = "BSS138 Converter"
+        mock_web2.uri = "https://sparkfun.com/bss138"
+        mock_chunk2 = MagicMock()
+        mock_chunk2.web = mock_web2
+
+        mock_grounding = MagicMock()
+        mock_grounding.grounding_chunks = [mock_chunk1, mock_chunk2]
+
+        mock_candidate = MagicMock()
+        mock_candidate.grounding_metadata = mock_grounding
+        mock_resp.candidates = [mock_candidate]
+
+        p._client.models.generate_content = MagicMock(return_value=mock_resp)
+
+        result = p.search_grounded_query("logic level converter 3.3V to 5V")
+        assert result["response_text"] == "Here are some components..."
+        assert len(result["search_results"]) == 2
+        assert result["search_results"][0]["title"] == "TXB0104 Level Shifter"
+        assert result["search_results"][0]["url"] == "https://adafruit.com/txb0104"
+        assert result["search_results"][1]["title"] == "BSS138 Converter"
+
+    def test_search_grounded_query_passes_google_search_tool(self):
+        """The google_search tool must be included in the API call config."""
+        p = self._make_provider()
+
+        mock_resp = MagicMock()
+        mock_resp.text = "result"
+        mock_resp.candidates = []
+        mock_resp.usage_metadata = None
+        p._client.models.generate_content = MagicMock(return_value=mock_resp)
+
+        p.search_grounded_query("some query")
+
+        call_kwargs = p._client.models.generate_content.call_args
+        config = call_kwargs.kwargs.get("config") or (call_kwargs.args[2] if len(call_kwargs.args) > 2 else None)
+        assert config is not None
+        # Verify a google_search tool was included
+        tool_list = config.tools
+        assert any(
+            getattr(t, "google_search", None) is not None
+            for t in tool_list
+        )
+
+    def test_search_grounded_query_empty_grounding_metadata(self):
+        """When grounding_metadata is absent, search_results should be empty."""
+        p = self._make_provider()
+
+        mock_resp = MagicMock()
+        mock_resp.text = "No grounding info"
+        mock_resp.candidates = []  # no candidates = no grounding metadata
+        mock_resp.usage_metadata = None
+        p._client.models.generate_content = MagicMock(return_value=mock_resp)
+
+        result = p.search_grounded_query("anything")
+        assert result["response_text"] == "No grounding info"
+        assert result["search_results"] == []
+
 
 # ---------------------------------------------------------------------------
 # Claude Provider tests (mocked)

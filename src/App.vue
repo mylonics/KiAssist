@@ -5,12 +5,18 @@ import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
+import ComponentSearch from './components/ComponentSearch.vue';
 import SymbolImporter from './components/SymbolImporter.vue';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
+const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const rightPanelCollapsed = ref(false);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
-const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
+const leftPanelTab = ref<'kicad' | 'search' | 'importer'>('kicad');
+
+function handleInsertInChat(text: string) {
+  chatBox.value?.insertText(text);
+}
 </script>
 
 <template>
@@ -26,6 +32,14 @@ const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
           KiCad
         </button>
         <button
+          :class="['left-tab-btn', { active: leftPanelTab === 'search' }]"
+          @click="leftPanelTab = 'search'"
+          title="Search for components"
+        >
+          <span class="material-icons tab-icon">search</span>
+          Components
+        </button>
+        <button
           :class="['left-tab-btn', { active: leftPanelTab === 'importer' }]"
           @click="leftPanelTab = 'importer'"
           title="Symbol / Footprint Importer"
@@ -36,11 +50,15 @@ const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
       </div>
       <div class="left-panel-content">
         <KiCadInstanceSelector v-show="leftPanelTab === 'kicad'" />
+        <ComponentSearch
+          v-show="leftPanelTab === 'search'"
+          @insert-in-chat="handleInsertInChat"
+        />
         <SymbolImporter v-show="leftPanelTab === 'importer'" />
       </div>
     </aside>
     <main class="chat-panel">
-      <ChatBox :activityPanel="activityPanel" />
+      <ChatBox ref="chatBox" :activityPanel="activityPanel" />
     </main>
     <button
       class="panel-toggle-btn"

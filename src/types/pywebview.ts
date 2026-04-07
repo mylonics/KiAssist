@@ -231,6 +231,21 @@ export interface ExportSessionResult extends ApiResult {
   content?: string;
 }
 
+// Web component search types
+export interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet?: string;
+}
+
+export interface ComponentSearchResult extends ApiResult {
+  response?: string;
+  search_results?: WebSearchResult[];
+  query?: string;
+  /** Which search backend was used: 'google' (Gemini grounding) or 'duckduckgo' */
+  grounding?: 'google' | 'duckduckgo';
+}
+
 export interface PyWebViewAPI {
   echo_message: (message: string) => Promise<string>;
   detect_kicad_instances: () => Promise<KiCadInstance[]>;
@@ -290,6 +305,8 @@ export interface PyWebViewAPI {
   // Schematic API
   inject_schematic_test_note: (projectPath: string) => Promise<InjectTestNoteResult>;
   is_schematic_api_available: () => Promise<boolean>;
+  // Web component search
+  web_search_components: (query: string, model?: string) => Promise<ComponentSearchResult>;
 }
 
 declare global {

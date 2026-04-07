@@ -111,6 +111,7 @@ const isLoading = ref(false);
 const apiKeyWarning = ref<string>('');
 const apiKeyError = ref<string>('');
 const messagesContainer = ref<HTMLElement | null>(null);
+const chatInputRef = ref<HTMLTextAreaElement | null>(null);
 const editingMessageId = ref<string | null>(null);
 const editingText = ref('');
 // Local model server
@@ -1093,6 +1094,16 @@ onMounted(() => {
   waitForPywebviewAndCheckApiKey();
   scrollToBottom();
 });
+
+/** Insert text into the chat input (called externally, e.g. from ComponentSearch). */
+function insertText(text: string) {
+  inputMessage.value = text;
+  nextTick(() => {
+    chatInputRef.value?.focus();
+  });
+}
+
+defineExpose({ insertText });
 </script>
 
 <template>
@@ -1609,6 +1620,7 @@ onMounted(() => {
 
     <div class="chat-input">
       <textarea
+        ref="chatInputRef"
         v-model="inputMessage"
         @keypress="handleKeyPress"
         :placeholder="isLoading ? 'Enter to queue · Ctrl+Enter to steer' : 'Type your message here... (Press Enter to send)'"

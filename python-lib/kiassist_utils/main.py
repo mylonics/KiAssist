@@ -1526,6 +1526,127 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": f"Error synthesizing requirements: {exc}"}
     
+    # ------------------------------------------------------------------
+    # Web component search
+    # ------------------------------------------------------------------
+
+    def web_search_components(
+        self,
+        query: str,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Search the web for electronic components and return AI-synthesized recommendations.
+
+        When the active provider is Gemini, uses native **Google Search
+        grounding** (``types.Tool(google_search=types.GoogleSearch())``) for
+        authoritative results with automatic citations – no HTML scraping
+        required.  For all other providers (Claude, OpenAI, local models), a
+        DuckDuckGo HTML search is performed first and the results are passed to
+        the AI for synthesis.
+
+        Args:
+            query: Natural-language description of the needed component (e.g.
+                   ``"logic level converter 3.3V to 1.8-5V bidirectional"``).
+            model: Optional model override.
+
+        Returns:
+            Dictionary with ``response`` (AI-synthesized Markdown text),
+            ``search_results`` (web result list), and ``success`` flag.
+        """
+        if not query or not query.strip():
+            return {"success": False, "error": "Query cannot be empty."}
+
+        try:
+            provider = self._get_or_create_provider(model)
+            if not provider:
+                return {
+                    "success": False,
+                    "error": (
+                        "No AI provider configured. "
+                        "Please add an API key or start a local model."
+                    ),
+                }
+
+            from .ai.llm_logger import llm_logger
+            from .ai.base import AIMessage as _AIMessage
+
+            # ------------------------------------------------------------------
+            # Path A: Gemini provider – use native Google Search grounding
+            # ------------------------------------------------------------------
+            try:
+                from .ai.gemini import GeminiProvider
+                is_gemini = isinstance(provider, GeminiProvider)
+            except ImportError:
+                is_gemini = False
+
+            if is_gemini:
+                grounding_prompt = (
+                    "You are a knowledgeable electronics engineer assistant helping "
+                    "with PCB design component selection.\n\n"
+                    f"User request: {query.strip()}\n\n"
+                    "Search the web and recommend 2–4 specific components that best "
+                    "match this request. For each component, provide key specifications, "
+                    "notable features, and trade-offs relevant to PCB design. "
+                    "Format your response in clear Markdown with component names as headings."
+                )
+
+                log_id = llm_logger.start(
+                    provider=self.current_provider_name,
+                    model=model or self.current_model,
+                    messages=[_AIMessage(role="user", content=grounding_prompt)],
+                    is_stream=False,
+                )
+                try:
+                    result = provider.search_grounded_query(grounding_prompt)
+                    response_text = result["response_text"]
+                    search_results = result["search_results"]
+                    llm_logger.finish(log_id, response_text=response_text, usage=result["usage"])
+                except Exception as exc:
+                    llm_logger.finish(log_id, error=str(exc))
+                    raise
+
+                return {
+                    "success": True,
+                    "response": response_text,
+                    "search_results": search_results,
+                    "query": query.strip(),
+                    "grounding": "google",
+                }
+
+            # ------------------------------------------------------------------
+            # Path B: Other providers – DuckDuckGo scrape + AI synthesis
+            # ------------------------------------------------------------------
+            from .web_search import web_search, build_component_search_prompt
+
+            search_query = f"{query.strip()} electronic component specifications"
+            search_results = web_search(search_query)
+            prompt = build_component_search_prompt(query.strip(), search_results)
+
+            log_id = llm_logger.start(
+                provider=self.current_provider_name,
+                model=model or self.current_model,
+                messages=[_AIMessage(role="user", content=prompt)],
+                is_stream=False,
+            )
+            try:
+                ai_response = provider.chat([_AIMessage(role="user", content=prompt)])
+                response_text = ai_response.content
+                llm_logger.finish(log_id, response_text=response_text, usage=ai_response.usage)
+            except Exception as exc:
+                llm_logger.finish(log_id, error=str(exc))
+                raise
+
+            return {
+                "success": True,
+                "response": response_text,
+                "search_results": search_results,
+                "query": query.strip(),
+                "grounding": "duckduckgo",
+            }
+        except Exception as exc:
+            logger.error("web_search_components failed: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
     # Schematic API methods
 
     def inject_schematic_test_note(self, project_path: str) -> Dict[str, Any]:
