@@ -1510,6 +1510,81 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": f"Error synthesizing requirements: {exc}"}
     
+    # ------------------------------------------------------------------
+    # Web component search
+    # ------------------------------------------------------------------
+
+    def web_search_components(
+        self,
+        query: str,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Search the web for electronic components and return AI-synthesized recommendations.
+
+        Performs a DuckDuckGo web search for the given component description,
+        then sends the results to the active AI provider for synthesis into
+        a structured list of component candidates with key specifications.
+
+        Args:
+            query: Natural-language description of the needed component (e.g.
+                   ``"logic level converter 3.3V to 1.8-5V bidirectional"``).
+            model: Optional model override.
+
+        Returns:
+            Dictionary with ``response`` (AI-synthesized Markdown text),
+            ``search_results`` (raw web results list), and ``success`` flag.
+        """
+        if not query or not query.strip():
+            return {"success": False, "error": "Query cannot be empty."}
+
+        try:
+            from .web_search import web_search, build_component_search_prompt
+
+            # Build an electronics-focused search query
+            search_query = f"{query.strip()} electronic component specifications"
+            search_results = web_search(search_query)
+
+            provider = self._get_or_create_provider(model)
+            if not provider:
+                return {
+                    "success": False,
+                    "error": (
+                        "No AI provider configured. "
+                        "Please add an API key or start a local model."
+                    ),
+                }
+
+            prompt = build_component_search_prompt(query.strip(), search_results)
+
+            from .ai.llm_logger import llm_logger
+            from .ai.base import AIMessage as _AIMessage
+
+            log_id = llm_logger.start(
+                provider=self.current_provider_name,
+                model=model or self.current_model,
+                messages=[_AIMessage(role="user", content=prompt)],
+                is_stream=False,
+            )
+            try:
+                ai_response = provider.chat(
+                    [_AIMessage(role="user", content=prompt)]
+                )
+                response_text = ai_response.content
+                llm_logger.finish(log_id, response_text=response_text, usage=ai_response.usage)
+            except Exception as exc:
+                llm_logger.finish(log_id, error=str(exc))
+                raise
+
+            return {
+                "success": True,
+                "response": response_text,
+                "search_results": search_results,
+                "query": query.strip(),
+            }
+        except Exception as exc:
+            logger.error("web_search_components failed: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
     # Schematic API methods
 
     def inject_schematic_test_note(self, project_path: str) -> Dict[str, Any]:

@@ -5,19 +5,50 @@ import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
+import ComponentSearch from './components/ComponentSearch.vue';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
+const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const rightPanelCollapsed = ref(false);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
+const leftPanelTab = ref<'kicad' | 'search'>('kicad');
+
+function handleInsertInChat(text: string) {
+  chatBox.value?.insertText(text);
+}
 </script>
 
 <template>
   <div class="app-container">
     <aside class="left-panel">
-      <KiCadInstanceSelector />
+      <div class="left-panel-tabs">
+        <button
+          :class="['left-tab-btn', { active: leftPanelTab === 'kicad' }]"
+          @click="leftPanelTab = 'kicad'"
+          title="KiCad instances"
+        >
+          <span class="material-icons tab-icon">developer_board</span>
+          KiCad
+        </button>
+        <button
+          :class="['left-tab-btn', { active: leftPanelTab === 'search' }]"
+          @click="leftPanelTab = 'search'"
+          title="Search for components"
+        >
+          <span class="material-icons tab-icon">search</span>
+          Components
+        </button>
+      </div>
+      <div class="left-panel-content">
+        <KiCadInstanceSelector v-show="leftPanelTab === 'kicad'" />
+        <ComponentSearch
+          v-show="leftPanelTab === 'search'"
+          @insert-in-chat="handleInsertInChat"
+        />
+      </div>
     </aside>
     <main class="chat-panel">
-      <ChatBox :activityPanel="activityPanel" />
+      <ChatBox ref="chatBox" :activityPanel="activityPanel" />
     </main>
     <button
       class="panel-toggle-btn"
@@ -138,9 +169,51 @@ body {
   height: 100%;
   background-color: var(--bg-primary);
   border-right: 1px solid var(--border-color);
-  overflow-y: auto;
+  overflow: hidden;
   flex-shrink: 0;
   box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+}
+
+.left-panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.left-tab-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 0.45rem 0.4rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border-bottom: 2px solid transparent;
+}
+
+.left-tab-btn:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.left-tab-btn.active {
+  color: var(--accent-color);
+  border-bottom-color: var(--accent-color);
+  background-color: var(--bg-secondary);
+}
+
+.left-panel-content {
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
 }
 
 .chat-panel {
