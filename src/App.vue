@@ -5,16 +5,39 @@ import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
+import SymbolImporter from './components/SymbolImporter.vue';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const rightPanelCollapsed = ref(false);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
+const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
 </script>
 
 <template>
   <div class="app-container">
     <aside class="left-panel">
-      <KiCadInstanceSelector />
+      <div class="left-panel-tabs">
+        <button
+          :class="['left-tab-btn', { active: leftPanelTab === 'kicad' }]"
+          @click="leftPanelTab = 'kicad'"
+          title="KiCad instance selector"
+        >
+          <span class="material-icons tab-icon">developer_board</span>
+          KiCad
+        </button>
+        <button
+          :class="['left-tab-btn', { active: leftPanelTab === 'importer' }]"
+          @click="leftPanelTab = 'importer'"
+          title="Symbol / Footprint Importer"
+        >
+          <span class="material-icons tab-icon">download</span>
+          Import
+        </button>
+      </div>
+      <div class="left-panel-content">
+        <KiCadInstanceSelector v-show="leftPanelTab === 'kicad'" />
+        <SymbolImporter v-show="leftPanelTab === 'importer'" />
+      </div>
     </aside>
     <main class="chat-panel">
       <ChatBox :activityPanel="activityPanel" />
@@ -138,9 +161,51 @@ body {
   height: 100%;
   background-color: var(--bg-primary);
   border-right: 1px solid var(--border-color);
-  overflow-y: auto;
+  overflow: hidden;
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
   box-shadow: var(--shadow-sm);
+}
+
+.left-panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.left-tab-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 0.45rem 0.3rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border-bottom: 2px solid transparent;
+}
+
+.left-tab-btn:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.left-tab-btn.active {
+  color: var(--accent-color);
+  border-bottom-color: var(--accent-color);
+  background-color: var(--bg-secondary);
+}
+
+.left-panel-content {
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
 }
 
 .chat-panel {

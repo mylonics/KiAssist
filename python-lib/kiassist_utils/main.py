@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -1539,6 +1540,332 @@ class KiAssistAPI:
             True if the schematic API is available, False otherwise.
         """
         return is_schematic_api_available()
+
+    # ------------------------------------------------------------------
+    # Symbol / Footprint Importer
+    # ------------------------------------------------------------------
+
+    def importer_lcsc_available(self) -> Dict[str, Any]:
+        """Return whether the easyeda2kicad package is installed."""
+        from .importer import lcsc_available
+        return {"available": lcsc_available()}
+
+    def importer_get_sym_libraries(self) -> Dict[str, Any]:
+        """List all available symbol library nicknames."""
+        try:
+            from .kicad_parser.library import LibraryDiscovery
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            entries = disc.list_symbol_libraries()
+            libs = [{"nickname": e.nickname, "uri": e.uri} for e in entries]
+            return {"success": True, "libraries": libs}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "libraries": []}
+
+    def importer_get_fp_libraries(self) -> Dict[str, Any]:
+        """List all available footprint library nicknames."""
+        try:
+            from .kicad_parser.library import LibraryDiscovery
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            entries = disc.list_footprint_libraries()
+            libs = [{"nickname": e.nickname, "uri": e.uri} for e in entries]
+            return {"success": True, "libraries": libs}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "libraries": []}
+
+    def importer_import_lcsc(
+        self,
+        lcsc_id: str,
+        target_sym_lib: str = "",
+        target_fp_lib_dir: str = "",
+        models_dir: str = "",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Import a component from LCSC via EasyEDA.
+
+        Args:
+            lcsc_id: LCSC part number (e.g. ``"C14663"``).
+            target_sym_lib: Path to the destination ``.kicad_sym`` file.
+            target_fp_lib_dir: Path to the destination ``.pretty`` directory.
+            models_dir: Directory for 3-D model files.
+            overwrite: Replace existing entries if True.
+
+        Returns:
+            Dict with ``success``, ``component`` summary, ``warnings``, and
+            ``error`` keys.
+        """
+        try:
+            from .importer import import_lcsc, commit_import
+            result = import_lcsc(lcsc_id)
+            if not result.success:
+                return {"success": False, "error": result.error, "warnings": result.warnings}
+
+            if target_sym_lib or target_fp_lib_dir:
+                result = commit_import(
+                    result.component,
+                    target_sym_lib=target_sym_lib or None,
+                    target_fp_lib_dir=target_fp_lib_dir or None,
+                    models_dir=models_dir or None,
+                    overwrite=overwrite,
+                )
+
+            return self._import_result_to_dict(result)
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "warnings": []}
+
+    def importer_import_zip(
+        self,
+        zip_path: str,
+        target_sym_lib: str = "",
+        target_fp_lib_dir: str = "",
+        models_dir: str = "",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Import a component from a SnapEDA / Ultra Librarian ZIP file.
+
+        Args:
+            zip_path: Absolute path to the ``.zip`` file.
+            target_sym_lib: Destination ``.kicad_sym`` file.
+            target_fp_lib_dir: Destination ``.pretty`` directory.
+            models_dir: Directory for 3-D model files.
+            overwrite: Replace existing entries if True.
+
+        Returns:
+            Dict with ``success``, ``component`` summary, ``warnings``, ``error``.
+        """
+        try:
+            from .importer import import_zip, commit_import
+            result = import_zip(zip_path)
+            if not result.success:
+                return {"success": False, "error": result.error, "warnings": result.warnings}
+
+            if target_sym_lib or target_fp_lib_dir:
+                result = commit_import(
+                    result.component,
+                    target_sym_lib=target_sym_lib or None,
+                    target_fp_lib_dir=target_fp_lib_dir or None,
+                    models_dir=models_dir or None,
+                    overwrite=overwrite,
+                )
+
+            return self._import_result_to_dict(result)
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "warnings": []}
+
+    def importer_search_symbols(
+        self,
+        query: str,
+        library_name: str = "",
+    ) -> Dict[str, Any]:
+        """Search existing KiCad symbol libraries.
+
+        Args:
+            query: Case-insensitive substring to match.
+            library_name: Restrict search to this library nickname, or ``""``
+                for all libraries.
+
+        Returns:
+            Dict with ``success`` and ``results`` list.
+        """
+        try:
+            from .importer import search_symbols
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            results = search_symbols(
+                query,
+                library_name=library_name or None,
+                project_dir=project_dir,
+            )
+            return {"success": True, "results": results}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "results": []}
+
+    def importer_search_footprints(
+        self,
+        query: str,
+        library_name: str = "",
+    ) -> Dict[str, Any]:
+        """Search existing KiCad footprint libraries.
+
+        Args:
+            query: Case-insensitive substring.
+            library_name: Library nickname, or ``""`` for all.
+
+        Returns:
+            Dict with ``success`` and ``results`` list.
+        """
+        try:
+            from .importer import search_footprints
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            results = search_footprints(
+                query,
+                library_name=library_name or None,
+                project_dir=project_dir,
+            )
+            return {"success": True, "results": results}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "results": []}
+
+    def importer_import_from_kicad(
+        self,
+        symbol_name: str,
+        library_name: str,
+        target_sym_lib: str = "",
+        target_fp_lib_dir: str = "",
+        models_dir: str = "",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Clone a symbol from an existing KiCad library into a target library.
+
+        Args:
+            symbol_name: KiCad symbol name (e.g. ``"R"``).
+            library_name: Source library nickname.
+            target_sym_lib: Destination ``.kicad_sym`` file.
+            target_fp_lib_dir: Destination ``.pretty`` directory.
+            models_dir: Directory for 3-D models.
+            overwrite: Replace existing entries if True.
+
+        Returns:
+            Dict with ``success``, ``component`` summary, ``warnings``, ``error``.
+        """
+        try:
+            from .importer import import_from_symbol_lib, commit_import
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            result = import_from_symbol_lib(symbol_name, library_name, project_dir=project_dir)
+            if not result.success:
+                return {"success": False, "error": result.error, "warnings": []}
+
+            if target_sym_lib or target_fp_lib_dir:
+                result = commit_import(
+                    result.component,
+                    target_sym_lib=target_sym_lib or None,
+                    target_fp_lib_dir=target_fp_lib_dir or None,
+                    models_dir=models_dir or None,
+                    overwrite=overwrite,
+                )
+
+            return self._import_result_to_dict(result)
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "warnings": []}
+
+    def importer_open_in_kicad(self, footprint_path: str) -> Dict[str, Any]:
+        """Open a footprint file in the KiCad footprint editor.
+
+        Args:
+            footprint_path: Absolute path to the ``.kicad_mod`` file.
+
+        Returns:
+            Dict with ``success`` and ``error``.
+        """
+        import subprocess
+        import platform
+        try:
+            path = Path(footprint_path)
+            if not path.exists():
+                return {"success": False, "error": f"File not found: {footprint_path}"}
+            if path.suffix.lower() != ".kicad_mod":
+                return {"success": False, "error": "Only .kicad_mod files can be opened"}
+
+            system = platform.system()
+            if system == "Windows":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif system == "Darwin":
+                subprocess.Popen(["open", "-a", "KiCad", str(path)])
+            else:
+                # Linux — try pcbnew first, then xdg-open
+                kicad_fp_editor = "pcbnew"
+                if shutil.which(kicad_fp_editor):
+                    subprocess.Popen([kicad_fp_editor, str(path)])
+                else:
+                    subprocess.Popen(["xdg-open", str(path)])
+
+            return {"success": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_browse_zip(self) -> Dict[str, Any]:
+        """Open a file-chooser dialog for ZIP file selection.
+
+        Returns:
+            Dict with ``success`` and ``path`` (empty string if cancelled).
+        """
+        try:
+            import webview
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No webview window available"}
+            result = windows[0].create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("ZIP files (*.zip)", "All files (*.*)"),
+            )
+            if result:
+                return {"success": True, "path": result[0]}
+            return {"success": True, "path": ""}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "path": ""}
+
+    def importer_browse_output_dir(self) -> Dict[str, Any]:
+        """Open a folder-chooser dialog for the output library directory.
+
+        Returns:
+            Dict with ``success`` and ``path``.
+        """
+        try:
+            import webview
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No webview window available"}
+            result = windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+            if result:
+                return {"success": True, "path": result[0]}
+            return {"success": True, "path": ""}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "path": ""}
+
+    @staticmethod
+    def _import_result_to_dict(result) -> Dict[str, Any]:
+        """Serialise an :class:`ImportResult` for JSON transport."""
+        if not result.success:
+            return {"success": False, "error": result.error, "warnings": result.warnings}
+        comp = result.component
+        fields = comp.fields
+        return {
+            "success": True,
+            "warnings": result.warnings,
+            "component": {
+                "name": comp.name,
+                "import_method": comp.import_method.value if comp.import_method else "",
+                "source_info": comp.source_info,
+                "symbol_path": str(comp.symbol_path) if comp.symbol_path else "",
+                "footprint_path": str(comp.footprint_path) if comp.footprint_path else "",
+                "model_paths": [str(p) for p in comp.model_paths],
+                "fields": {
+                    "mpn": fields.mpn,
+                    "manufacturer": fields.manufacturer,
+                    "digikey_pn": fields.digikey_pn,
+                    "mouser_pn": fields.mouser_pn,
+                    "lcsc_pn": fields.lcsc_pn,
+                    "value": fields.value,
+                    "reference": fields.reference,
+                    "footprint": fields.footprint,
+                    "datasheet": fields.datasheet,
+                    "description": fields.description,
+                    "package": fields.package,
+                    "extra": fields.extra,
+                },
+            },
+        }
 
     # ------------------------------------------------------------------
     # Session management
