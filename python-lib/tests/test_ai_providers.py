@@ -358,7 +358,6 @@ class TestGeminiProvider:
 
     def test_search_grounded_query_passes_google_search_tool(self):
         """The google_search tool must be included in the API call config."""
-        from google.genai import types as gtypes
         p = self._make_provider()
 
         mock_resp = MagicMock()

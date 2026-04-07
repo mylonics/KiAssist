@@ -18,9 +18,57 @@ const lastQuery = ref('');
 const showSources = ref(false);
 const groundingBackend = ref<'google' | 'duckduckgo' | null>(null);
 
+/**
+ * Sanitize HTML produced by marked to prevent XSS.
+ * Uses the browser's DOMParser to strip dangerous elements and event attributes.
+ * Legitimate markdown output (headings, paragraphs, lists, code blocks) is preserved.
+ */
+function sanitizeHtml(html: string): string {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  // Remove elements that can execute scripts or load external resources
+  doc.querySelectorAll('script, iframe, object, embed, form, base').forEach(el => el.remove());
+  // Remove event-handler attributes (on*) and dangerous attribute values from all elements
+  doc.querySelectorAll('*').forEach(el => {
+    Array.from(el.attributes).forEach(attr => {
+      if (attr.name.startsWith('on')) {
+        el.removeAttribute(attr.name);
+      } else if (attr.name === 'href' || attr.name === 'src' || attr.name === 'action') {
+        const val = attr.value.trim().toLowerCase();
+        if (
+          !val.startsWith('http:') &&
+          !val.startsWith('https:') &&
+          !val.startsWith('//') &&   // protocol-relative (inherits https: in context)
+          !val.startsWith('#')
+        ) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    });
+  });
+  return doc.body.innerHTML;
+}
+
 function renderMarkdown(text: string): string {
   if (!text) return '';
-  return marked.parse(text) as string;
+  const raw = marked.parse(text) as string;
+  return sanitizeHtml(raw);
+}
+
+/**
+ * Validate that a URL from an external search result uses a safe scheme.
+ * Returns '#' for any non-http(s) URL to prevent javascript: and data: injections.
+ */
+function safeUrl(url: string | undefined): string {
+  if (!url) return '#';
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return url;
+    }
+  } catch {
+    // Malformed URL
+  }
+  return '#';
 }
 
 async function search() {
@@ -140,7 +188,7 @@ function handleKeydown(event: KeyboardEvent) {
         </button>
         <ul v-if="showSources" class="sources-list">
           <li v-for="(r, idx) in searchResults" :key="idx" class="source-item">
-            <a :href="r.url" target="_blank" rel="noopener noreferrer" class="source-title">
+            <a :href="safeUrl(r.url)" target="_blank" rel="noopener noreferrer" class="source-title">
               {{ r.title }}
             </a>
             <span v-if="r.snippet" class="source-snippet">{{ r.snippet }}</span>

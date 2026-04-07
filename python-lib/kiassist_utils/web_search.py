@@ -9,12 +9,11 @@ fallback is attempted when the main endpoint fails or returns no results.
 
 from __future__ import annotations
 
-import json
 import logging
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 

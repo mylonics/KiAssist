@@ -2,15 +2,7 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch
-
-import pytest
-
-# Ensure the package is importable from within the python-lib directory
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from unittest.mock import patch
 
 from kiassist_utils.web_search import (
     _DDGResultParser,
@@ -87,8 +79,8 @@ class TestDDGResultParser:
         """
         parser = _DDGResultParser()
         parser.feed(html)
-        if parser.results:
-            assert parser.results[0]["url"].startswith("https://")
+        assert len(parser.results) >= 1
+        assert parser.results[0]["url"].startswith("https://")
 
     def test_snippet_captured(self):
         """Snippet text from result__snippet anchor is stored."""
@@ -100,9 +92,10 @@ class TestDDGResultParser:
         """
         parser = _DDGResultParser()
         parser.feed(html)
-        if parser.results:
-            assert "snippet" in parser.results[0]
-            assert "3.3V" in parser.results[0]["snippet"]
+        assert len(parser.results) >= 1
+        result = parser.results[0]
+        assert "snippet" in result
+        assert "3.3V" in result["snippet"]
 
 
 # ---------------------------------------------------------------------------
@@ -195,10 +188,10 @@ class TestWebSearch:
             return_value=_FakeResponse(SAMPLE_DDG_HTML),
         ):
             results = web_search("logic level converter")
-        if results:
-            for r in results:
-                assert "title" in r
-                assert "url" in r
+        assert results, "Expected mocked HTML response to produce at least one search result"
+        for r in results:
+            assert "title" in r
+            assert "url" in r
 
     def test_max_results_respected(self):
         with patch(

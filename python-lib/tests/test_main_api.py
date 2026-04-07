@@ -25,7 +25,10 @@ from kiassist_utils.context.history import ConversationStore
 # shadowing issue where `kiassist_utils.main` resolves to the main()
 # function rather than the module object).
 # ---------------------------------------------------------------------------
-import kiassist_utils  # noqa: F401 — ensure package is loaded
+import kiassist_utils
+# Accessing KiAssistAPI via the package triggers the lazy-load of
+# kiassist_utils.main, ensuring it is present in sys.modules below.
+kiassist_utils.KiAssistAPI  # noqa: B018
 _main_mod = sys.modules["kiassist_utils.main"]
 KiAssistAPI = _main_mod.KiAssistAPI
 
@@ -615,3 +618,84 @@ class TestOllamaProvider:
         result = p.chat([AIMessage(role="user", content="hi")])
         assert result.content == "Hello from Ollama"
         p._delegate.chat.assert_called_once()
+
+
+# ===========================================================================
+# Tests: web_search_components
+# ===========================================================================
+
+
+class TestWebSearchComponents:
+    """Unit tests for KiAssistAPI.web_search_components()."""
+
+    def _make_gemini_provider(self, grounding_text: str = "TXB0104 is ideal."):
+        """Return a real GeminiProvider instance with search_grounded_query mocked."""
+        from kiassist_utils.ai.gemini import GeminiProvider
+        with patch("kiassist_utils.ai.gemini.genai.Client"):
+            provider = GeminiProvider(api_key="fake", model="3-flash")
+        provider.search_grounded_query = MagicMock(return_value={
+            "response_text": grounding_text,
+            "search_results": [{"title": "TXB0104", "url": "https://example.com"}],
+            "usage": {"input_tokens": 50, "output_tokens": 100},
+        })
+        return provider
+
+    def test_empty_query_returns_error(self, api):
+        result = api.web_search_components("")
+        assert result["success"] is False
+        assert "empty" in result["error"].lower()
+
+    def test_whitespace_only_query_returns_error(self, api):
+        result = api.web_search_components("   ")
+        assert result["success"] is False
+
+    def test_no_provider_returns_error(self, api):
+        """No provider configured → success: False with a helpful message."""
+        result = api.web_search_components("logic level converter")
+        assert result["success"] is False
+        assert "error" in result
+
+    def test_gemini_path_uses_grounding(self, api, monkeypatch):
+        """When Gemini is active, search_grounded_query() is called."""
+        provider = self._make_gemini_provider("TXB0104 is ideal.")
+        monkeypatch.setattr(api, "_get_or_create_provider", lambda m=None: provider)
+
+        result = api.web_search_components("logic level converter 3.3V")
+        assert result["success"] is True
+        assert result["grounding"] == "google"
+        assert "TXB0104" in result["response"]
+        assert len(result["search_results"]) >= 1
+        provider.search_grounded_query.assert_called_once()
+
+    def test_duckduckgo_path_for_non_gemini(self, api, monkeypatch):
+        """Non-Gemini provider falls back to DuckDuckGo scraping."""
+        fake_ddg_results = [
+            {"title": "BSS138", "url": "https://example.com/bss138", "snippet": "Level shifter"},
+        ]
+        monkeypatch.setattr(api, "_get_or_create_provider", lambda m=None: _FakeProvider("BSS138 works well."))
+        # web_search is imported locally inside web_search_components; patch at source module
+        with patch("kiassist_utils.web_search.web_search", return_value=fake_ddg_results):
+            result = api.web_search_components("logic level converter")
+        assert result["success"] is True
+        assert result["grounding"] == "duckduckgo"
+        assert result["search_results"] == fake_ddg_results
+        assert "BSS138 works well." in result["response"]
+
+    def test_query_is_stripped(self, api, monkeypatch):
+        """Leading/trailing whitespace is stripped from the query in the result."""
+        monkeypatch.setattr(api, "_get_or_create_provider", lambda m=None: _FakeProvider())
+        with patch("kiassist_utils.web_search.web_search", return_value=[]):
+            result = api.web_search_components("  level shifter  ")
+        assert result["success"] is True
+        assert result["query"] == "level shifter"
+
+    def test_provider_exception_returns_error(self, api, monkeypatch):
+        """If the provider raises an exception the method returns success:False."""
+        bad_provider = _FakeProvider()
+        bad_provider.chat = MagicMock(side_effect=RuntimeError("API timeout"))
+        monkeypatch.setattr(api, "_get_or_create_provider", lambda m=None: bad_provider)
+        with patch("kiassist_utils.web_search.web_search", return_value=[]):
+            result = api.web_search_components("resistor")
+        assert result["success"] is False
+        assert "API timeout" in result["error"]
+
