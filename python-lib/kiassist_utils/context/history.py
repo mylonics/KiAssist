@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -264,10 +265,22 @@ class ConversationStore:
                     continue  # skip corrupted lines
 
     def _rewrite(self, entries: List[Dict[str, Any]]) -> None:
-        """Overwrite the history file with *entries*."""
+        """Overwrite the history file with *entries*.
+
+        Uses a unique temporary file in the same directory for an atomic
+        replace.  This avoids a fixed ``.jsonl.tmp`` path that two concurrent
+        processes could collide on.
+        """
         self._ensure_store_dir()
-        tmp_path = self._history_path.with_suffix(".jsonl.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            for entry in entries:
-                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        os.replace(tmp_path, self._history_path)
+        tmp_fd, tmp_path_str = tempfile.mkstemp(
+            dir=self._history_path.parent, suffix=".tmp"
+        )
+        tmp_path = Path(tmp_path_str)
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+                for entry in entries:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, self._history_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise

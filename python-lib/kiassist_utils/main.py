@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import webview
@@ -751,22 +752,34 @@ class KiAssistAPI:
     # API key management
     # ------------------------------------------------------------------
 
+    # Providers that run fully locally and never require an API key.
+    _LOCAL_PROVIDERS = frozenset({"local", "gemma4"})
+
     def check_api_key(self, provider: Optional[str] = None) -> bool:
         """Check if an API key is stored for *provider* (default: current provider).
+
+        Local providers (``"local"``, ``"gemma4"``) are always considered
+        configured because they do not require an API key.
 
         Args:
             provider: Provider ID to check, or ``None`` to use the active provider.
 
         Returns:
-            ``True`` if an API key exists, ``False`` otherwise.
+            ``True`` if an API key exists (or the provider needs no key).
         """
         target = provider or self.current_provider_name
+        if target in self._LOCAL_PROVIDERS:
+            logger.debug("check_api_key(%r) -> True (no key needed)", target)
+            return True
         has_key = self.api_key_store.has_api_key(target)
         logger.debug("check_api_key(%r) -> %s", target, has_key)
         return has_key
 
     def get_api_key(self, provider: Optional[str] = None) -> Optional[str]:
         """Get the stored API key for *provider* (default: current provider).
+
+        Local providers (``"local"``, ``"gemma4"``) do not use API keys; this
+        returns ``None`` for them without consulting the key store.
 
         Args:
             provider: Provider ID, or ``None`` to use the active provider.
@@ -775,6 +788,8 @@ class KiAssistAPI:
             The API key or ``None``.
         """
         target = provider or self.current_provider_name
+        if target in self._LOCAL_PROVIDERS:
+            return None
         return self.api_key_store.get_api_key(target)
 
     def set_api_key(self, api_key: str, provider: Optional[str] = None) -> dict:
@@ -1099,7 +1114,6 @@ class KiAssistAPI:
                 with self._stream_lock:
                     if self._stream_done:
                         break
-                import time
                 time.sleep(step)
                 waited += step
 
@@ -1602,20 +1616,21 @@ class KiAssistAPI:
         """
         try:
             from .importer import import_lcsc, commit_import
-            result = import_lcsc(lcsc_id)
-            if not result.success:
-                return {"success": False, "error": result.error, "warnings": result.warnings}
+            with tempfile.TemporaryDirectory(prefix="kiassist_lcsc_") as tmp_dir:
+                result = import_lcsc(lcsc_id, output_dir=tmp_dir)
+                if not result.success:
+                    return {"success": False, "error": result.error, "warnings": result.warnings}
 
-            if target_sym_lib or target_fp_lib_dir:
-                result = commit_import(
-                    result.component,
-                    target_sym_lib=target_sym_lib or None,
-                    target_fp_lib_dir=target_fp_lib_dir or None,
-                    models_dir=models_dir or None,
-                    overwrite=overwrite,
-                )
+                if target_sym_lib or target_fp_lib_dir:
+                    result = commit_import(
+                        result.component,
+                        target_sym_lib=target_sym_lib or None,
+                        target_fp_lib_dir=target_fp_lib_dir or None,
+                        models_dir=models_dir or None,
+                        overwrite=overwrite,
+                    )
 
-            return self._import_result_to_dict(result)
+                return self._import_result_to_dict(result)
         except Exception as exc:
             return {"success": False, "error": str(exc), "warnings": []}
 
@@ -2275,6 +2290,19 @@ class KiAssistAPI:
             return {"success": True, "content": "\n".join(lines)}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    def shutdown(self) -> None:
+        """Stop the background asyncio event loop and join the thread.
+
+        Call this when the :class:`KiAssistAPI` instance is no longer needed
+        (e.g. in tests or when creating multiple instances) to release the
+        background thread.  The method is idempotent: calling it more than once
+        is safe.
+        """
+        if self._async_loop.is_running():
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+        if self._async_thread.is_alive():
+            self._async_thread.join(timeout=5)
 
 
 def get_frontend_path() -> Path:

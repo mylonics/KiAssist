@@ -225,12 +225,13 @@ class LocalModelManager:
         known_filenames = {v["filename"] for v in _KNOWN_MODEL_VARIANTS}
         for gguf_file in sorted(self._models_dir.glob("*.gguf")):
             if gguf_file.name not in known_filenames:
+                st = gguf_file.stat()
                 models.append({
                     "id": gguf_file.stem,
                     "name": gguf_file.stem,
                     "filename": gguf_file.name,
-                    "size_label": _human_readable_size(gguf_file.stat().st_size),
-                    "size_bytes": gguf_file.stat().st_size,
+                    "size_label": _human_readable_size(st.st_size),
+                    "size_bytes": st.st_size,
                     "description": "Manually added model.",
                     "context_window": 32_768,
                     "hf_repo": "",
@@ -763,9 +764,12 @@ class LocalModelManager:
                         subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
                     )
 
-                self._server_process = subprocess.Popen(cmd, **kwargs)
-                # Close our copy of the file handle; the child owns it now.
-                log_fh.close()
+                try:
+                    self._server_process = subprocess.Popen(cmd, **kwargs)
+                finally:
+                    # Close our copy of the file handle regardless of whether
+                    # Popen succeeded; the child process owns the fd now.
+                    log_fh.close()
                 self._server_model_id = model_id
                 self._server_ready.clear()
 

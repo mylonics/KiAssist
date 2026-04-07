@@ -98,7 +98,10 @@ def _safe_save(obj: Any, path: str | os.PathLike) -> None:
         shutil.copy2(dest, str(dest) + ".bak")
     tmp_fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
     try:
-        os.close(tmp_fd)
+        try:
+            os.close(tmp_fd)
+        except OSError:
+            pass  # fd already closed or invalid; proceed — file still exists
         obj.save(tmp_path)
         os.replace(tmp_path, str(dest))
     except Exception:
@@ -544,9 +547,8 @@ def schematic_find_pins(
         if reference is not None and reference.lower() not in ref.lower():
             continue
         for lib_sym in sch.lib_symbols:
-            if lib_sym.name != sym.lib_id and not lib_sym.name.endswith(
-                ":" + sym.lib_id.split(":")[-1]
-            ):
+            bare = sym.lib_id.split(":")[-1]
+            if lib_sym.name != sym.lib_id and lib_sym.name != bare:
                 continue
             if lib_sym.raw_tree:
                 for unit in _find_all(lib_sym.raw_tree, "symbol"):
@@ -601,9 +603,8 @@ def schematic_get_power_pins(path: str, reference: str) -> Dict[str, Any]:
     sym = syms[0]
     results = []
     for lib_sym in sch.lib_symbols:
-        if lib_sym.name != sym.lib_id and not lib_sym.name.endswith(
-            ":" + sym.lib_id.split(":")[-1]
-        ):
+        bare = sym.lib_id.split(":")[-1]
+        if lib_sym.name != sym.lib_id and lib_sym.name != bare:
             continue
         if lib_sym.raw_tree:
             for unit in _find_all(lib_sym.raw_tree, "symbol"):

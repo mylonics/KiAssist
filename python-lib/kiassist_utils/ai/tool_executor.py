@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from .base import (
@@ -64,6 +65,7 @@ DEFAULT_MAX_ITERATIONS = 20
 # Exposed at module level so tests can monkeypatch it:
 #   patch("kiassist_utils.ai.tool_executor.in_process_call", ...)
 in_process_call: Optional[Any] = None
+_in_process_call_lock = threading.Lock()
 
 
 def _get_in_process_call() -> Any:
@@ -72,11 +74,15 @@ def _get_in_process_call() -> Any:
     Using a resolver function keeps the import lazy (avoids circular-import
     issues at module load time) while still exposing the name at module level
     so test code can monkeypatch ``kiassist_utils.ai.tool_executor.in_process_call``.
+
+    The double-checked locking pattern makes this safe under multi-threaded use.
     """
     global in_process_call
     if in_process_call is None:
-        from ..mcp_server import in_process_call as _ipc  # noqa: PLC0415
-        in_process_call = _ipc
+        with _in_process_call_lock:
+            if in_process_call is None:
+                from ..mcp_server import in_process_call as _ipc  # noqa: PLC0415
+                in_process_call = _ipc
     return in_process_call
 
 

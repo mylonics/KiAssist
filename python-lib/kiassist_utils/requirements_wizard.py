@@ -245,10 +245,12 @@ def build_refine_prompt(answers: Dict[str, str]) -> str:
     """
     agent_prompt = get_agent_prompt()
     
-    # Build a lookup for initial questions by ID
+    # Build a lookup for initial questions by ID using the authoritative
+    # INITIAL_QUESTION_IDS set so the result is independent of list order.
     initial_questions_lookup = {
-        q['id']: q['question'] 
-        for q in DEFAULT_QUESTIONS[:INITIAL_QUESTIONS_COUNT]
+        q['id']: q['question']
+        for q in DEFAULT_QUESTIONS
+        if q['id'] in INITIAL_QUESTION_IDS
     }
     
     # Format the initial answers

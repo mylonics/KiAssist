@@ -80,7 +80,14 @@ def import_lcsc(
     if not lcsc_id.startswith("C"):
         lcsc_id = "C" + lcsc_id
 
-    tmp_dir = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="kiassist_lcsc_"))
+    if output_dir is None:
+        raise ValueError(
+            "import_lcsc requires an explicit output_dir. "
+            "Use tempfile.TemporaryDirectory() in the caller to manage the "
+            "temp directory lifetime so it is cleaned up properly."
+        )
+
+    tmp_dir = Path(output_dir)
     warnings: list[str] = []
 
     try:

@@ -27,6 +27,7 @@ import os
 import platform
 import shutil
 import sys
+import threading
 import time
 
 if sys.platform != "win32":
@@ -57,14 +58,20 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 in_process_call: Optional[Any] = None
+_in_process_call_lock = threading.Lock()
 
 
 def _get_in_process_call() -> Any:
-    """Return the MCP in_process_call coroutine, importing it on first use."""
+    """Return the MCP in_process_call coroutine, importing it on first use.
+
+    The double-checked locking pattern makes this safe under multi-threaded use.
+    """
     global in_process_call
     if in_process_call is None:
-        from .mcp_server import in_process_call as _ipc  # noqa: PLC0415
-        in_process_call = _ipc
+        with _in_process_call_lock:
+            if in_process_call is None:
+                from .mcp_server import in_process_call as _ipc  # noqa: PLC0415
+                in_process_call = _ipc
     return in_process_call
 
 

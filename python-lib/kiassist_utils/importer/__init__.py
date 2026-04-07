@@ -9,15 +9,17 @@ Supports three import sources:
 
 Typical usage::
 
+    import tempfile
     from kiassist_utils.importer import import_lcsc, import_zip, commit_import
 
-    result = import_lcsc("C14663")
-    if result.success:
-        final = commit_import(
-            result.component,
-            target_sym_lib="MyProject.kicad_sym",
-            target_fp_lib_dir="MyProject.pretty",
-        )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        result = import_lcsc("C14663", output_dir=tmp_dir)
+        if result.success:
+            final = commit_import(
+                result.component,
+                target_sym_lib="MyProject.kicad_sym",
+                target_fp_lib_dir="MyProject.pretty",
+            )
 """
 
 from .models import FieldSet, ImportedComponent, ImportMethod, ImportResult
