@@ -166,13 +166,30 @@ def import_zip(
     if not zipfile.is_zipfile(zip_path):
         return ImportResult(success=False, error=f"Not a valid ZIP file: {zip_path}")
 
-    tmp_dir = Path(output_dir) if output_dir else Path(
-        tempfile.mkdtemp(prefix="kiassist_zip_")
-    )
+    if output_dir is None:
+        raise ValueError(
+            "import_zip requires an explicit output_dir; callers should manage "
+            "the temp directory lifetime (e.g. via tempfile.TemporaryDirectory)."
+        )
+
+    tmp_dir = Path(output_dir)
     warnings: list[str] = []
 
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
+            # --- Zip Slip protection: reject entries that escape tmp_dir ---
+            resolved_base = tmp_dir.resolve()
+            for member in zf.infolist():
+                member_path = (resolved_base / member.filename).resolve()
+                if not (
+                    str(member_path).startswith(str(resolved_base) + os.sep)
+                    or member_path == resolved_base
+                ):
+                    return ImportResult(
+                        success=False,
+                        error=f"Unsafe ZIP entry rejected (path traversal): {member.filename}",
+                        warnings=warnings,
+                    )
             zf.extractall(tmp_dir)
 
         # Discover files
@@ -258,14 +275,22 @@ def import_zip_bytes(
     """Import from raw ZIP bytes (e.g. uploaded via the UI).
 
     Writes the bytes to a temporary file then delegates to :func:`import_zip`.
+    The caller must supply *output_dir* (or accept that model file paths in the
+    returned component will only be valid until this function returns and the
+    temporary directory is removed).
     """
-    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp_zip = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
     try:
-        tmp.write(zip_bytes)
-        tmp.close()
-        return import_zip(tmp.name, output_dir=output_dir)
+        tmp_zip.write(zip_bytes)
+        tmp_zip.close()
+        if output_dir is not None:
+            return import_zip(tmp_zip.name, output_dir=output_dir)
+        # No output_dir: create a temporary extract dir that persists until
+        # the caller is done (caller is responsible for cleanup).
+        tmp_extract_dir = tempfile.mkdtemp(prefix="kiassist_zip_")
+        return import_zip(tmp_zip.name, output_dir=tmp_extract_dir)
     finally:
         try:
-            os.unlink(tmp.name)
+            os.unlink(tmp_zip.name)
         except OSError:
             pass

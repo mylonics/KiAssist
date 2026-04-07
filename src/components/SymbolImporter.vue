@@ -29,6 +29,8 @@ interface ImportedComponent {
   symbol_path: string;
   footprint_path: string;
   model_paths: string[];
+  symbol_sexpr: string;
+  footprint_sexpr: string;
   fields: ImportedFields;
 }
 
@@ -337,7 +339,7 @@ async function aiSuggestSymbol() {
       c.fields.manufacturer,
       c.fields.description,
       c.fields.package,
-      '', // symbol_sexpr not stored in component state; backend uses metadata only
+      c.symbol_sexpr || '',
     );
     if (r?.success) {
       aiSuggestions.value = r.suggestions ?? [];
@@ -369,7 +371,7 @@ async function aiMapPins(suggestion: AiSuggestion) {
   try {
     const r = await api.importer_ai_map_pins(
       resultComponent.value.fields.mpn,
-      '', // imported_symbol_sexpr not available in frontend state; backend re-extracts pins from the base symbol
+      resultComponent.value.symbol_sexpr || '',
       suggestion.library,
       suggestion.name,
     );
@@ -389,20 +391,18 @@ async function applyPinMapping() {
   if (!pinMappingResult.value?.merged_symbol_sexpr || !resultComponent.value) return;
   const api = getApi();
   if (!api) return;
-  // Commit the merged symbol back into the target library
   try {
-    const r = await api.importer_import_from_kicad(
-      selectedBaseSuggestion.value!.name,
-      selectedBaseSuggestion.value!.library,
+    const r = await api.importer_write_symbol_sexpr(
+      pinMappingResult.value.merged_symbol_sexpr,
+      resultComponent.value.name,
       targetSymLib.value.trim(),
-      targetFpLibDir.value.trim(),
-      '',
       overwrite.value,
     );
     if (r?.success) {
-      resultComponent.value = r.component ?? resultComponent.value;
+      // The merged symbol is written to targetSymLib; the component state
+      // (resultComponent) retains the original import metadata — the user
+      // can review the new symbol in KiCad via "Open Footprint in KiCad".
       pinMapApplied.value = true;
-      warnings.value = [...(warnings.value ?? []), ...(r.warnings ?? [])];
     } else {
       pinMapError.value = r?.error || 'Failed to apply mapping';
     }
@@ -448,17 +448,15 @@ async function saveGeneratedSymbol() {
   const api = getApi();
   if (!api || !aiGeneratedSexpr.value || !resultComponent.value) return;
   try {
-    const r = await api.importer_import_zip(
-      '',   // no zip path — we pass symbol_sexpr directly via the generic import path
+    const r = await api.importer_save_generated_symbol(
+      aiGeneratedSexpr.value,
+      resultComponent.value.name,
       targetSymLib.value.trim(),
-      targetFpLibDir.value.trim(),
-      '',
       overwrite.value,
     );
     if (r?.success) {
-      resultComponent.value = r.component ?? resultComponent.value;
+      // Generated symbol saved; clear the preview
       aiGeneratedSexpr.value = '';
-      warnings.value = [...(warnings.value ?? []), ...(r.warnings ?? [])];
     } else {
       aiGenerateError.value = r?.error || 'Save failed';
     }

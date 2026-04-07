@@ -260,7 +260,7 @@ def write_footprint_to_library(
     if fp_text:
         # Patch 3-D model references into the footprint text if we copied models
         if copied_models:
-            fp_text = _inject_3d_models(fp_text, copied_models)
+            fp_text = _inject_3d_models(fp_text, copied_models, fp_lib_dir=lib_dir)
     else:
         # Create a minimal empty footprint
         fp_text = (
@@ -283,8 +283,13 @@ def _safe_fp_name(raw: str) -> str:
     return name or "Footprint"
 
 
-def _inject_3d_models(fp_text: str, model_paths: List[Path]) -> str:
-    """Append / replace ``(model …)`` nodes in *fp_text* for the given paths."""
+def _inject_3d_models(fp_text: str, model_paths: List[Path], fp_lib_dir: Optional[Path] = None) -> str:
+    """Append / replace ``(model …)`` nodes in *fp_text* for the given paths.
+
+    Paths are stored using the ``${FOOTPRINTLIB_DIR}`` KiCad variable when the
+    model is inside *fp_lib_dir*, making the library portable.  Absolute paths
+    (normalised to forward slashes) are used as a fallback.
+    """
     # Remove any existing model nodes for cleanliness
     cleaned = re.sub(
         r"\(model\s+[^\)]*(?:\([^\)]*\)\s*)*\)",
@@ -299,8 +304,19 @@ def _inject_3d_models(fp_text: str, model_paths: List[Path]) -> str:
 
     model_blocks = []
     for mp in model_paths:
+        # Prefer a ${FOOTPRINTLIB_DIR}-relative path for portability
+        if fp_lib_dir is not None:
+            try:
+                rel = mp.resolve().relative_to(fp_lib_dir.resolve())
+                model_ref = "${FOOTPRINTLIB_DIR}/" + rel.as_posix()
+            except ValueError:
+                # model is outside the library dir — use normalised absolute path
+                model_ref = mp.as_posix()
+        else:
+            model_ref = mp.as_posix()
+
         model_blocks.append(
-            f'  (model "{mp}"\n'
+            f'  (model "{model_ref}"\n'
             f"    (offset (xyz 0 0 0))\n"
             f"    (scale (xyz 1 1 1))\n"
             f"    (rotate (xyz 0 0 0))\n"
@@ -348,10 +364,6 @@ def commit_import(
             ok, sym_name = write_symbol_to_library(component, target_sym_lib, overwrite=overwrite)
             if ok:
                 component.symbol_path = Path(target_sym_lib)
-                # Update footprint reference in the field set
-                if target_fp_lib_dir:
-                    lib_name = Path(target_fp_lib_dir).stem
-                    component.fields.footprint = f"{lib_name}:{sym_name}"
             else:
                 warnings.append(f"Symbol write failed: {sym_name}")
         except Exception as exc:
@@ -365,6 +377,10 @@ def commit_import(
             if ok:
                 component.footprint_path = Path(fp_path)
                 component.model_paths = copied
+                # Update the Footprint field to the canonical library:name reference
+                fp_stem = Path(fp_path).stem
+                lib_name = Path(target_fp_lib_dir).stem
+                component.fields.footprint = f"{lib_name}:{fp_stem}"
             else:
                 warnings.append(f"Footprint write failed: {fp_path}")
         except Exception as exc:

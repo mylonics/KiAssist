@@ -60,7 +60,7 @@ def search_symbols(
     results: List[Dict[str, str]] = []
 
     lib_names = [library_name] if library_name else [
-        e["nickname"] for e in disc.list_symbol_libraries()
+        e.nickname for e in disc.list_symbol_libraries()
     ]
 
     for lib in lib_names:
@@ -103,7 +103,7 @@ def search_footprints(
     results: List[Dict[str, str]] = []
 
     lib_names = [library_name] if library_name else [
-        e["nickname"] for e in disc.list_footprint_libraries()
+        e.nickname for e in disc.list_footprint_libraries()
     ]
 
     for lib in lib_names:

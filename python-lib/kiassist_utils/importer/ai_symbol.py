@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -44,14 +44,10 @@ class SymbolSuggestion:
 class PinMapping:
     """Result of AI pin-mapping."""
 
-    # Map of base-symbol pin-number → imported pin-number
-    mapping: Dict[str, str]
+    # Map of base-symbol pin-number → imported pin-number (None = unmapped)
+    mapping: Dict[str, Optional[str]] = field(default_factory=dict)
     notes: str = ""
-    warnings: List[str] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.warnings is None:
-            self.warnings = []
+    warnings: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

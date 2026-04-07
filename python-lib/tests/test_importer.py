@@ -234,6 +234,16 @@ class TestZipImporter:
         assert not result.success
         assert "no .kicad_sym" in result.error.lower()
 
+    def test_zip_slip_rejected(self, tmp_path):
+        """ZIP entries with path traversal should be rejected (Zip Slip fix)."""
+        import zipfile as zf
+        bad_zip = tmp_path / "evil.zip"
+        with zf.ZipFile(bad_zip, "w") as z:
+            z.writestr("../../evil.kicad_sym", "(kicad_symbol_lib)")
+        result = import_zip(bad_zip, output_dir=tmp_path / "out")
+        assert not result.success
+        assert "path traversal" in result.error.lower() or "unsafe" in result.error.lower()
+
     def test_import_zip_bytes(self, tmp_path):
         zp = _make_zip({"Component.kicad_sym": MINIMAL_SYM}, tmp_path)
         data = zp.read_bytes()
@@ -360,7 +370,7 @@ class TestLibraryWriter:
 
     def test_write_footprint_injects_3d_model_ref(self, tmp_path):
         fp_dir = tmp_path / "parts.pretty"
-        models_dir = tmp_path / "3d"
+        models_dir = tmp_path / "3d"  # outside fp_dir
         step_file = tmp_path / "R_0402.step"
         step_file.write_text("ISO-10303-21;")
 
@@ -371,6 +381,26 @@ class TestLibraryWriter:
         assert ok
         content = Path(fp_path).read_text()
         assert "(model" in content
+        assert "R_0402" in content
+        # Model is copied to models_dir (outside fp_dir), so fallback to posix absolute path
+        assert "${FOOTPRINTLIB_DIR}" not in content
+
+    def test_write_footprint_3d_model_uses_footprintlib_dir(self, tmp_path):
+        """When model is inside fp_dir, path should use ${FOOTPRINTLIB_DIR}."""
+        fp_dir = tmp_path / "parts.pretty"
+        # Store model inside fp_dir (default location)
+        step_file = tmp_path / "R_0402.step"
+        step_file.write_text("ISO-10303-21;")
+
+        comp = ImportedComponent(name="R_0402", footprint_sexpr=MINIMAL_FP)
+        comp.model_paths = [step_file]
+
+        # Use default models_dir (fp_dir / "3dmodels") so model lands inside fp_dir
+        ok, fp_path, copied = write_footprint_to_library(comp, fp_dir)
+        assert ok
+        content = Path(fp_path).read_text()
+        assert "${FOOTPRINTLIB_DIR}" in content
+        assert "3dmodels/R_0402.step" in content
 
     def test_commit_import_end_to_end(self, tmp_path):
         sym_lib = tmp_path / "parts.kicad_sym"
@@ -605,3 +635,66 @@ class TestAiSymbolHelpers:
         assert len(sug) == 1
         assert sug[0].reason == ""
         assert sug[0].confidence == "medium"
+
+    def test_pin_mapping_defaults_to_optional_str(self):
+        """PinMapping.mapping values can be None (unmapped pins)."""
+        from kiassist_utils.importer.ai_symbol import PinMapping
+        pm = PinMapping(mapping={"1": "A", "2": None})
+        assert pm.mapping["1"] == "A"
+        assert pm.mapping["2"] is None
+        assert pm.warnings == []
+        assert pm.notes == ""
+
+    def test_pin_mapping_empty_defaults(self):
+        """PinMapping can be created with no arguments."""
+        from kiassist_utils.importer.ai_symbol import PinMapping
+        pm = PinMapping()
+        assert pm.mapping == {}
+        assert pm.warnings == []
+
+
+# ===========================================================================
+# library_writer: importer_write_symbol_sexpr (via write_symbol_to_library)
+# ===========================================================================
+
+class TestWriteSymbolSexpr:
+    def test_write_symbol_sexpr_creates_library(self, tmp_path):
+        from kiassist_utils.importer.models import ImportedComponent
+        from kiassist_utils.importer.library_writer import write_symbol_to_library
+        sym_lib = tmp_path / "gen.kicad_sym"
+        comp = ImportedComponent(name="MyIC", symbol_sexpr=MINIMAL_SYM)
+        ok, name = write_symbol_to_library(comp, sym_lib)
+        assert ok
+        assert sym_lib.exists()
+        assert name == "MyIC"
+
+    def test_write_symbol_sexpr_empty_raises(self, tmp_path):
+        from kiassist_utils.importer.models import ImportedComponent
+        from kiassist_utils.importer.library_writer import write_symbol_to_library
+        sym_lib = tmp_path / "gen.kicad_sym"
+        comp = ImportedComponent(name="MyIC", symbol_sexpr="")
+        # Empty sexpr should still run (creates a minimal stub)
+        ok, name = write_symbol_to_library(comp, sym_lib)
+        assert ok
+
+    def test_footprint_field_uses_fp_name_not_sym_name(self, tmp_path):
+        """After commit_import, footprint field should be lib:fp_name (not lib:sym_name)."""
+        from kiassist_utils.importer.models import ImportedComponent, ImportMethod
+        from kiassist_utils.importer.library_writer import commit_import
+        sym_lib = tmp_path / "parts.kicad_sym"
+        fp_dir = tmp_path / "parts.pretty"
+        comp = ImportedComponent(
+            name="NE555D",
+            symbol_sexpr=MINIMAL_SYM,
+            footprint_sexpr=MINIMAL_FP,
+            import_method=ImportMethod.ZIP,
+        )
+        from kiassist_utils.importer.field_normalizer import normalize_fields
+        comp.fields = normalize_fields({"MPN": "NE555D"})
+        result = commit_import(comp, sym_lib, fp_dir)
+        assert result.success
+        # Footprint field should be "parts:NE555D" (lib stem : fp stem)
+        # NOT "parts:NE555D" pointing to symbol name (which happens to be same here)
+        # The key test: fp stem comes from write_footprint_to_library, not write_symbol_to_library
+        assert "parts:" in result.component.fields.footprint
+

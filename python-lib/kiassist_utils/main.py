@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -1640,18 +1641,19 @@ class KiAssistAPI:
         """
         try:
             from .importer import import_zip, commit_import
-            result = import_zip(zip_path)
-            if not result.success:
-                return {"success": False, "error": result.error, "warnings": result.warnings}
+            with tempfile.TemporaryDirectory(prefix="kiassist_zip_") as tmp_dir:
+                result = import_zip(zip_path, output_dir=tmp_dir)
+                if not result.success:
+                    return {"success": False, "error": result.error, "warnings": result.warnings}
 
-            if target_sym_lib or target_fp_lib_dir:
-                result = commit_import(
-                    result.component,
-                    target_sym_lib=target_sym_lib or None,
-                    target_fp_lib_dir=target_fp_lib_dir or None,
-                    models_dir=models_dir or None,
-                    overwrite=overwrite,
-                )
+                if target_sym_lib or target_fp_lib_dir:
+                    result = commit_import(
+                        result.component,
+                        target_sym_lib=target_sym_lib or None,
+                        target_fp_lib_dir=target_fp_lib_dir or None,
+                        models_dir=models_dir or None,
+                        overwrite=overwrite,
+                    )
 
             return self._import_result_to_dict(result)
         except Exception as exc:
@@ -1976,7 +1978,20 @@ class KiAssistAPI:
             base_sym_sexpr = serialize(base_sym.to_tree())
 
             # Extract pins
-            imported_pins = extract_pins_from_symbol(imported_symbol_sexpr) if imported_symbol_sexpr else []
+            if not imported_symbol_sexpr:
+                return {
+                    "success": False,
+                    "error": (
+                        "No imported symbol S-expression provided. "
+                        "Pass the symbol_sexpr returned by the import call."
+                    ),
+                }
+            imported_pins = extract_pins_from_symbol(imported_symbol_sexpr)
+            if not imported_pins:
+                return {
+                    "success": False,
+                    "error": "No pins found in imported symbol S-expression.",
+                }
             base_pins = extract_pins_from_symbol(base_sym_sexpr)
 
             if not base_pins:
@@ -2078,6 +2093,72 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc), "symbol_sexpr": ""}
 
+    def importer_write_symbol_sexpr(
+        self,
+        symbol_sexpr: str,
+        component_name: str,
+        target_sym_lib: str = "",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Write an arbitrary symbol S-expression (e.g. AI-merged result) to a library.
+
+        Used by the frontend after the AI produces a merged or generated symbol
+        so the user can commit it without re-running the full import pipeline.
+
+        Args:
+            symbol_sexpr: Raw KiCad 6 symbol S-expression.
+            component_name: Desired symbol name in the target library.
+            target_sym_lib: Destination ``.kicad_sym`` file path.
+            overwrite: Replace an existing entry with the same name if True.
+
+        Returns:
+            Dict with ``success``, ``name`` (final symbol name in library).
+        """
+        if not symbol_sexpr.strip():
+            return {"success": False, "error": "Empty symbol S-expression"}
+        if not target_sym_lib.strip():
+            return {"success": False, "error": "No target symbol library specified"}
+        try:
+            from .importer.models import ImportedComponent
+            from .importer.library_writer import write_symbol_to_library
+
+            comp = ImportedComponent(name=component_name, symbol_sexpr=symbol_sexpr)
+            ok, final_name = write_symbol_to_library(comp, target_sym_lib, overwrite=overwrite)
+            if ok:
+                return {"success": True, "name": final_name, "path": target_sym_lib}
+            return {"success": False, "error": f"Symbol write failed: {final_name}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_save_generated_symbol(
+        self,
+        symbol_sexpr: str,
+        component_name: str,
+        target_sym_lib: str = "",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Save an AI-generated symbol S-expression to the target library.
+
+        Delegates to :meth:`importer_write_symbol_sexpr`.  AI-generated symbols
+        contain only schematic graphics; a separate footprint write is not
+        performed here (the user can assign a footprint in KiCad after import).
+
+        Args:
+            symbol_sexpr: Raw KiCad 6 symbol S-expression produced by the AI.
+            component_name: Desired symbol name.
+            target_sym_lib: Destination ``.kicad_sym`` file path.
+            overwrite: Replace existing entry if True.
+
+        Returns:
+            Dict with ``success``, ``name``, ``symbol_path``.
+        """
+        return self.importer_write_symbol_sexpr(
+            symbol_sexpr=symbol_sexpr,
+            component_name=component_name,
+            target_sym_lib=target_sym_lib,
+            overwrite=overwrite,
+        )
+
     @staticmethod
     def _import_result_to_dict(result) -> Dict[str, Any]:
         """Serialise an :class:`ImportResult` for JSON transport."""
@@ -2095,6 +2176,9 @@ class KiAssistAPI:
                 "symbol_path": str(comp.symbol_path) if comp.symbol_path else "",
                 "footprint_path": str(comp.footprint_path) if comp.footprint_path else "",
                 "model_paths": [str(p) for p in comp.model_paths],
+                # Include S-expressions so the frontend can pass them to AI tools
+                "symbol_sexpr": comp.symbol_sexpr,
+                "footprint_sexpr": comp.footprint_sexpr,
                 "fields": {
                     "mpn": fields.mpn,
                     "manufacturer": fields.manufacturer,
