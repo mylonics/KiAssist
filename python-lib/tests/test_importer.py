@@ -454,7 +454,8 @@ class TestLcscImporter:
         from kiassist_utils.importer.lcsc_importer import is_available, import_lcsc
         if is_available():
             pytest.skip("easyeda2kicad is installed; skipping unavailability test")
-        result = import_lcsc("C14663")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            result = import_lcsc("C14663", output_dir=tmp_dir)
         assert not result.success
         assert "easyeda2kicad" in result.error
 

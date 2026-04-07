@@ -108,29 +108,33 @@ def discover_socket_files() -> List[Path]:
             # Normalize socket_dir for case-insensitive comparison with forward slashes
             # (NNG on Windows uses forward slashes in pipe names)
             temp_dir_normalized = str(socket_dir).replace('\\', '/').lower().rstrip('/')
-            
+
             for pipe_name in os.listdir(r'\\.\pipe'):
                 pipe_lower = pipe_name.replace('\\', '/').lower()
-                
+
                 # Check if this pipe belongs to our kicad socket dir
                 prefix = temp_dir_normalized + '/'
                 if not pipe_lower.startswith(prefix):
                     continue
-                
-                # Extract the filename part after the directory prefix
-                filename = pipe_lower[len(prefix):]
-                
+
+                # Extract the filename part after the directory prefix using
+                # the original-case pipe name so the path matches what NNG
+                # registered (named pipe matching is case-insensitive on
+                # Windows but using original case avoids any edge cases).
+                filename = pipe_name.replace('\\', '/')[len(prefix):]
+                filename_lower = pipe_lower[len(prefix):]
+
                 # Validate the pattern: api.sock or api-<PID>.sock
-                if filename == "api.sock" or (
-                    filename.startswith("api-") and 
-                    filename.endswith(".sock") and
-                    filename[4:-5].isdigit()
+                if filename_lower == "api.sock" or (
+                    filename_lower.startswith("api-") and
+                    filename_lower.endswith(".sock") and
+                    filename_lower[4:-5].isdigit()
                 ):
                     # Reconstruct the path using socket_dir for consistent format
                     sockets.append(socket_dir / filename)
         except Exception as e:
             logger.warning("Could not enumerate Windows named pipes: %s", e)
-        
+
         return sockets
     
     # On Linux/macOS, scan the directory for actual socket files

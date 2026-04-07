@@ -1,10 +1,13 @@
 """Recent projects management module."""
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 def get_config_dir() -> Path:
@@ -43,7 +46,7 @@ class RecentProjectsStore:
                     data = json.load(f)
                     self._recent_projects = data.get('recent_projects', [])
         except (json.JSONDecodeError, OSError) as e:
-            print(f"Warning: Could not load recent projects: {e}")
+            logger.warning("Could not load recent projects: %s", e)
             self._recent_projects = []
     
     def _save(self) -> None:
@@ -52,7 +55,7 @@ class RecentProjectsStore:
             with open(self._config_file, 'w', encoding='utf-8') as f:
                 json.dump({'recent_projects': self._recent_projects}, f, indent=2)
         except OSError as e:
-            print(f"Warning: Could not save recent projects: {e}")
+            logger.warning("Could not save recent projects: %s", e)
     
     def add_project(self, project_path: str) -> None:
         """Add or update a project in the recent list.

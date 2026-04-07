@@ -21,6 +21,7 @@ Shortcut       Actual model ID
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -292,7 +293,6 @@ class GeminiProvider(AIProvider):
 
         config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
-        import time
         max_retries = 3
         retry_delay = 2.0
 

@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional
 INITIAL_QUESTIONS_COUNT = 2
 
 # IDs of the initial questions used for refinement
-INITIAL_QUESTION_IDS = ('objectives', 'known_parts')
+INITIAL_QUESTION_IDS = frozenset(('objectives', 'known_parts'))
 
 # Default wizard questions organized by category
 DEFAULT_QUESTIONS = [
@@ -245,10 +245,12 @@ def build_refine_prompt(answers: Dict[str, str]) -> str:
     """
     agent_prompt = get_agent_prompt()
     
-    # Build a lookup for initial questions by ID
+    # Build a lookup for initial questions by ID using the authoritative
+    # INITIAL_QUESTION_IDS frozenset so the result is independent of list order.
     initial_questions_lookup = {
-        q['id']: q['question'] 
-        for q in DEFAULT_QUESTIONS[:INITIAL_QUESTIONS_COUNT]
+        q['id']: q['question']
+        for q in DEFAULT_QUESTIONS
+        if q['id'] in INITIAL_QUESTION_IDS
     }
     
     # Format the initial answers

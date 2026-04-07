@@ -32,10 +32,6 @@ logger = logging.getLogger(__name__)
 # KiCad 5 legacy symbol-lib → KiCad 6 kicad_sym conversion (minimal)
 # ---------------------------------------------------------------------------
 
-_LEGACY_COMPONENT_RE = re.compile(
-    r"DEF\s+(\S+)\s+(\S+).*?(?=\nDEF|\nENDLIB)", re.DOTALL
-)
-
 
 def _convert_legacy_sym(lib_text: str) -> str:  # noqa: C901
     """Very lightweight KiCad-5 ``.lib`` → ``.kicad_sym`` converter.
