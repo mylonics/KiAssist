@@ -231,6 +231,28 @@ export interface ExportSessionResult extends ApiResult {
   content?: string;
 }
 
+// Component search types
+export interface ComponentCandidate {
+  library_name: string;
+  symbol_name: string;
+  lib_id: string;
+  description: string;
+  keywords: string[];
+  properties: Record<string, string>;
+  pin_count: number;
+}
+
+export interface ComponentSearchResult extends ApiResult {
+  candidates?: ComponentCandidate[];
+  library_names?: string[];
+  total_searched?: number;
+  query?: string;
+}
+
+export interface LibraryListResult extends ApiResult {
+  libraries?: string[];
+}
+
 export interface PyWebViewAPI {
   echo_message: (message: string) => Promise<string>;
   detect_kicad_instances: () => Promise<KiCadInstance[]>;
@@ -290,6 +312,9 @@ export interface PyWebViewAPI {
   // Schematic API
   inject_schematic_test_note: (projectPath: string) => Promise<InjectTestNoteResult>;
   is_schematic_api_available: () => Promise<boolean>;
+  // Component search API
+  get_component_libraries: () => Promise<LibraryListResult>;
+  search_components: (query: string, libraryFilter?: string | null, maxResults?: number) => Promise<ComponentSearchResult>;
 }
 
 declare global {
