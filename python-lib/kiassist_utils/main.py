@@ -1620,6 +1620,67 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    # ------------------------------------------------------------------
+    # Component search
+    # ------------------------------------------------------------------
+
+    def get_component_libraries(self) -> Dict[str, Any]:
+        """Return the names of all available KiCad symbol libraries.
+
+        Uses the current project directory (if set) so that project-local
+        library tables are included.
+
+        Returns:
+            Dictionary with ``libraries`` list of nickname strings.
+        """
+        try:
+            from .component_selection import ComponentSelector
+            selector = ComponentSelector(project_dir=self._current_project_path)
+            libraries = selector.list_libraries()
+            return {"success": True, "libraries": libraries}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "libraries": []}
+
+    def search_components(
+        self,
+        query: str,
+        library_filter: Optional[str] = None,
+        max_results: int = 50,
+    ) -> Dict[str, Any]:
+        """Search KiCad symbol libraries for components matching *query*.
+
+        Performs a case-insensitive substring search across symbol names,
+        descriptions, keywords, and property values.
+
+        Args:
+            query:          Free-text search string.
+            library_filter: Restrict the search to this library nickname.
+            max_results:    Maximum number of results (default 50).
+
+        Returns:
+            Dictionary with ``candidates`` list, ``library_names``,
+            ``total_searched``, and ``query``.
+        """
+        try:
+            from .component_selection import ComponentSelector, ComponentSpec
+            spec = ComponentSpec(
+                query=query,
+                library_filter=library_filter or None,
+                max_results=max_results,
+            )
+            selector = ComponentSelector(project_dir=self._current_project_path)
+            result = selector.search(spec)
+            return {"success": True, **result.to_dict()}
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "candidates": [],
+                "library_names": [],
+                "total_searched": 0,
+                "query": query,
+            }
+
 
 def get_frontend_path() -> Path:
     """Get the path to the frontend dist directory.

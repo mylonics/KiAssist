@@ -1093,6 +1093,12 @@ onMounted(() => {
   waitForPywebviewAndCheckApiKey();
   scrollToBottom();
 });
+
+defineExpose({
+  insertText(text: string) {
+    inputMessage.value = text;
+  },
+});
 </script>
 
 <template>

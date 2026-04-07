@@ -5,19 +5,50 @@ import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
+import ComponentSearch from './components/ComponentSearch.vue';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
+const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const rightPanelCollapsed = ref(false);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
+const leftPanelTab = ref<'project' | 'components'>('project');
+
+function onInsertInChat(text: string) {
+  chatBox.value?.insertText(text);
+}
 </script>
 
 <template>
   <div class="app-container">
     <aside class="left-panel">
-      <KiCadInstanceSelector />
+      <div class="left-panel-tabs">
+        <button
+          :class="['tab-btn', { active: leftPanelTab === 'project' }]"
+          @click="leftPanelTab = 'project'"
+          title="KiCad project selector"
+        >
+          <span class="material-icons tab-icon">folder_open</span>
+          Project
+        </button>
+        <button
+          :class="['tab-btn', { active: leftPanelTab === 'components' }]"
+          @click="leftPanelTab = 'components'"
+          title="Search KiCad symbol libraries"
+        >
+          <span class="material-icons tab-icon">electrical_services</span>
+          Components
+        </button>
+      </div>
+      <div class="left-panel-content">
+        <KiCadInstanceSelector v-show="leftPanelTab === 'project'" />
+        <ComponentSearch
+          v-show="leftPanelTab === 'components'"
+          @insert-in-chat="onInsertInChat"
+        />
+      </div>
     </aside>
     <main class="chat-panel">
-      <ChatBox :activityPanel="activityPanel" />
+      <ChatBox ref="chatBox" :activityPanel="activityPanel" />
     </main>
     <button
       class="panel-toggle-btn"
@@ -138,9 +169,23 @@ body {
   height: 100%;
   background-color: var(--bg-primary);
   border-right: 1px solid var(--border-color);
-  overflow-y: auto;
+  overflow: hidden;
   flex-shrink: 0;
   box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+}
+
+.left-panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.left-panel-content {
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
 }
 
 .chat-panel {

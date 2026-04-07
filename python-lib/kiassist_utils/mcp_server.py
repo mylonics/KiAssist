@@ -729,7 +729,91 @@ def schematic_search(
 
 
 # ===========================================================================
-# 2.3  Symbol Library Tools
+# 2.3  Component Library Search Tools
+# ===========================================================================
+
+
+@mcp.tool()
+def component_search(
+    query: str,
+    project_dir: Optional[str] = None,
+    library_filter: Optional[str] = None,
+    max_results: int = 50,
+) -> Dict[str, Any]:
+    """Search for components across KiCad symbol libraries.
+
+    Performs a case-insensitive substring search across all resolved symbol
+    libraries (or a single library when *library_filter* is given).  Each
+    matching symbol contributes a summary entry; use
+    :func:`component_get_candidates` to obtain full details from a specific
+    library.
+
+    Args:
+        query:          Free-text search string.
+        project_dir:    Optional KiCad project directory.  When provided,
+                        project-local library tables are included.
+        library_filter: Restrict search to this library nickname (optional).
+        max_results:    Maximum number of results to return (default 50).
+
+    Returns:
+        ``{"candidates": [...], "library_names": [...], "total_searched": N,
+        "query": "..."}``
+    """
+    from .component_selection import ComponentSelector, ComponentSpec
+
+    spec = ComponentSpec(
+        query=query,
+        library_filter=library_filter or None,
+        max_results=max_results,
+    )
+    try:
+        selector = ComponentSelector(project_dir=project_dir)
+        result = selector.search(spec)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    return _ok(result.to_dict())
+
+
+@mcp.tool()
+def component_get_candidates(
+    library_name: str,
+    query: str,
+    project_dir: Optional[str] = None,
+    max_results: int = 20,
+) -> Dict[str, Any]:
+    """Get detailed component candidates from a single symbol library.
+
+    Searches the named library only and returns full candidate details
+    including all properties, pin count, description, and keywords.
+
+    Args:
+        library_name: Nickname of the library to search (e.g. ``"Device"``).
+        query:        Free-text search string.
+        project_dir:  Optional KiCad project directory for resolving library
+                      paths.
+        max_results:  Maximum number of results to return (default 20).
+
+    Returns:
+        ``{"candidates": [...], "library_name": "..."}``
+    """
+    from .component_selection import ComponentSelector, ComponentSpec
+
+    spec = ComponentSpec(query=query, max_results=max_results)
+    try:
+        selector = ComponentSelector(project_dir=project_dir)
+        candidates = selector.get_candidates(library_name, spec)
+    except Exception as exc:  # noqa: BLE001
+        return _err(str(exc))
+
+    return _ok({
+        "candidates": [c.to_dict() for c in candidates],
+        "library_name": library_name,
+    })
+
+
+# ===========================================================================
+# 2.4  Symbol Library Tools
 # ===========================================================================
 
 
