@@ -918,6 +918,120 @@ class TestSystemPromptBuilder:
         prompt = builder.build(project_path=tmp_path)
         assert "already in context" not in prompt
 
+    # ------------------------------------------------------------------
+    # Focused agent layer
+    # ------------------------------------------------------------------
+
+    def test_focused_agent_from_path(self, tmp_path: Path):
+        """An explicit Path to a focused-agent file is injected as Layer 2."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Base layer.")
+        agent_file = tmp_path / "my-agent.md"
+        agent_file.write_text("# Focused Agent\n\nSchematic only.")
+        builder = SystemPromptBuilder(base_prompt_path=bp, focused_agent=agent_file)
+        prompt = builder.build()
+        assert "Base layer." in prompt
+        assert "Schematic only." in prompt
+
+    def test_focused_agent_from_name(self, tmp_path: Path):
+        """Bare agent name is resolved from the real public/agents/ directory."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        builder = SystemPromptBuilder(base_prompt_path=bp, focused_agent="schematic-agent")
+        prompt = builder.build()
+        assert "Base." in prompt
+        # The bundled schematic-agent.md exists in this repo; its content must appear.
+        assert "Schematic" in prompt
+
+    def test_focused_agent_name_resolves_bundled_schematic_agent(self):
+        """The bundled schematic-agent.md should be discoverable by bare name."""
+        builder = SystemPromptBuilder(focused_agent="schematic-agent")
+        assert builder._base_prompt_path is not None, (
+            "Base prompt not found — public/agents/kicad-assistant.md must be present"
+        )
+        prompt = builder.build()
+        assert "Schematic" in prompt
+
+    def test_focused_agent_per_call_override(self, tmp_path: Path):
+        """focused_agent passed to build() overrides the instance-level setting."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        agent1 = tmp_path / "agent1.md"
+        agent1.write_text("Agent one content.")
+        agent2 = tmp_path / "agent2.md"
+        agent2.write_text("Agent two content.")
+
+        builder = SystemPromptBuilder(base_prompt_path=bp, focused_agent=agent1)
+        # Override at call time with agent2.
+        prompt = builder.build(focused_agent=agent2)
+        assert "Agent two content." in prompt
+        assert "Agent one content." not in prompt
+
+    def test_focused_agent_none_skips_layer(self, tmp_path: Path):
+        """When focused_agent is None, no extra layer is added."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Base only.")
+        builder = SystemPromptBuilder(base_prompt_path=bp)
+        prompt = builder.build()
+        assert "Base only." in prompt
+        # No separator when there is only one section.
+        assert "---" not in prompt
+
+    def test_focused_agent_missing_file_graceful(self, tmp_path: Path):
+        """A missing focused-agent file should not raise; prompt still builds."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        builder = SystemPromptBuilder(
+            base_prompt_path=bp, focused_agent=tmp_path / "nonexistent-agent.md"
+        )
+        prompt = builder.build()
+        assert "Base." in prompt
+
+    def test_focused_agent_path_without_md_extension_reads_directly(self, tmp_path: Path):
+        """A Path object without .md suffix must be read as-is, not name-resolved."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Base.")
+        # Create a file with no extension.
+        agent_file = tmp_path / "my-agent"
+        agent_file.write_text("No-extension agent content.")
+        builder = SystemPromptBuilder(base_prompt_path=bp, focused_agent=agent_file)
+        prompt = builder.build()
+        assert "No-extension agent content." in prompt
+
+    def test_list_focused_agents_returns_names(self):
+        """list_focused_agents() should return the bundled agent names."""
+        names = SystemPromptBuilder.list_focused_agents()
+        # The bundled agents may or may not be discoverable in this test env,
+        # but the method must not raise and must return a list of strings.
+        assert isinstance(names, list)
+        assert all(isinstance(n, str) for n in names)
+
+    def test_list_focused_agents_includes_all_bundled(self):
+        """All four bundled focused agents should be listed if discoverable."""
+        names = SystemPromptBuilder.list_focused_agents()
+        assert names, "Expected bundled focused agents to be discoverable"
+        assert "schematic-agent" in names
+        assert "pcb-agent" in names
+        assert "symbol-library-agent" in names
+        assert "footprint-agent" in names
+
+    def test_focused_agent_appears_between_base_and_project(self, tmp_path: Path):
+        """Focused agent layer must appear after the base and before project context."""
+        bp = tmp_path / "base.md"
+        bp.write_text("Layer 1 base.")
+        agent_file = tmp_path / "focused.md"
+        agent_file.write_text("Layer 2 focused.")
+        builder = SystemPromptBuilder(
+            base_prompt_path=bp,
+            focused_agent=agent_file,
+            cache_project_context=False,
+        )
+        prompt = builder.build(project_path=tmp_path)
+        base_pos = prompt.index("Layer 1 base.")
+        focused_pos = prompt.index("Layer 2 focused.")
+        ctx_pos = prompt.index("Project Context")
+        assert base_pos < focused_pos < ctx_pos
+
 
 # ===========================================================================
 # Package-level imports
