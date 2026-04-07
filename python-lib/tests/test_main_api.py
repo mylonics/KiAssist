@@ -103,9 +103,9 @@ class TestGetProviders:
         assert "openai" in ids
         assert "local" in ids
 
-    def test_default_provider_is_gemini(self, api):
+    def test_default_provider_is_gemma4(self, api):
         result = api.get_providers()
-        assert result["current_provider"] == "gemini"
+        assert result["current_provider"] == "gemma4"
 
     def test_each_provider_has_models(self, api):
         result = api.get_providers()
@@ -116,11 +116,11 @@ class TestGetProviders:
                 assert "name" in m
 
     def test_has_key_reflects_store(self, api):
-        # No cloud keys configured yet; local provider always has has_key=True
+        # No cloud keys configured yet; local providers always have has_key=True
         result = api.get_providers()
         for p in result["providers"]:
-            if p["id"] == "local":
-                assert p["has_key"] is True  # local needs no cloud key
+            if p["id"] in ("local", "gemma4"):
+                assert p["has_key"] is True  # local providers need no cloud key
             else:
                 assert p["has_key"] is False
 
@@ -154,7 +154,7 @@ class TestSetProvider:
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFakeKey" if (p or "gemini") == "gemini" else None
 
         fake_provider = _FakeProvider()
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda api_key, model: fake_provider)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda api_key, model: fake_provider)
 
         result = api.set_provider("gemini", "3-flash")
         assert result["success"] is True
@@ -172,13 +172,17 @@ class TestSetProvider:
 
 class TestApiKeyManagement:
     def test_check_api_key_no_key(self, api):
-        assert api.check_api_key() is False
+        # Default provider is gemma4 (local), which always reports True
+        assert api.check_api_key() is True
+        # Cloud providers with no key should report False
         assert api.check_api_key("gemini") is False
         assert api.check_api_key("claude") is False
 
     def test_set_api_key_default_provider(self, api, monkeypatch):
+        # Switch to gemini first since default is now gemma4 (local)
+        api.current_provider_name = "gemini"
         fake_provider = _FakeProvider()
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake_provider)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake_provider)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake" if (p or "gemini") == "gemini" else None
 
         result = api.set_api_key("AIzaFakeKey")
@@ -192,9 +196,11 @@ class TestApiKeyManagement:
         api.api_key_store.set_api_key.assert_called_once_with("sk-ant-fakekey", "claude")
 
     def test_get_api_key_uses_current_provider(self, api):
+        # Default provider is gemma4 (local), which always returns None
+        assert api.get_api_key() is None
+        # Explicitly requesting a cloud provider key should work
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaTest" if (p or "gemini") == "gemini" else None
-        key = api.get_api_key()
-        assert key == "AIzaTest"
+        assert api.get_api_key("gemini") == "AIzaTest"
 
     def test_get_api_key_explicit_provider(self, api):
         api.api_key_store.get_api_key.side_effect = lambda p=None: {
@@ -233,8 +239,9 @@ class TestApiKeyManagement:
 
 class TestSendMessage:
     def test_send_message_returns_response(self, api, monkeypatch):
+        api.current_provider_name = "gemini"
         fake = _FakeProvider("Hello, PCB designer!")
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
 
         result = api.send_message("What is a PCB?")
@@ -242,18 +249,20 @@ class TestSendMessage:
         assert result["response"] == "Hello, PCB designer!"
 
     def test_send_message_no_key_returns_error(self, api):
-        # No key configured
+        # Switch to a cloud provider with no key configured
+        api.current_provider_name = "gemini"
         result = api.send_message("Hello")
         assert result["success"] is False
         assert "error" in result
 
     def test_send_message_provider_error_returns_error(self, api, monkeypatch):
+        api.current_provider_name = "gemini"
         def _bad_chat(*a, **kw):
             raise RuntimeError("API timeout")
 
         fake = _FakeProvider()
         fake.chat = _bad_chat
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
 
         result = api.send_message("Hello")
@@ -262,8 +271,9 @@ class TestSendMessage:
 
     def test_send_message_persists_to_session(self, api, tmp_path, monkeypatch):
         """Messages should be appended to ConversationStore on success."""
+        api.current_provider_name = "gemini"
         fake = _FakeProvider("AI response text")
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
         api._current_project_path = str(tmp_path)
 
@@ -280,8 +290,9 @@ class TestSendMessage:
 
     def test_send_message_reuses_existing_session(self, api, tmp_path, monkeypatch):
         """Subsequent calls should append to the same session."""
+        api.current_provider_name = "gemini"
         fake = _FakeProvider("reply")
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
         api._current_project_path = str(tmp_path)
 
@@ -302,8 +313,9 @@ class TestSendMessage:
 
 class TestStreaming:
     def test_stream_lifecycle(self, api, monkeypatch):
+        api.current_provider_name = "gemini"
         fake = _FakeProvider("word1 word2 word3")
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
 
         start_result = api.start_stream_message("Hello")
@@ -322,14 +334,17 @@ class TestStreaming:
         assert "word1" in poll["text"]
 
     def test_stream_no_key_returns_error(self, api):
+        # Switch to a cloud provider with no key
+        api.current_provider_name = "gemini"
         result = api.start_stream_message("Hello")
         assert result["success"] is False
         assert "error" in result
 
     def test_stream_persists_user_message_immediately(self, api, tmp_path, monkeypatch):
         """User message is persisted before streaming starts."""
+        api.current_provider_name = "gemini"
         fake = _FakeProvider("streamed response")
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
         api._current_project_path = str(tmp_path)
 
@@ -343,8 +358,9 @@ class TestStreaming:
 
     def test_stream_persists_assistant_response_when_done(self, api, tmp_path, monkeypatch):
         """Assistant response is persisted after streaming completes."""
+        api.current_provider_name = "gemini"
         fake = _FakeProvider("final answer here")
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake)
         api.api_key_store.get_api_key.side_effect = lambda p=None: "AIzaFake"
         api._current_project_path = str(tmp_path)
 
@@ -497,7 +513,7 @@ class TestLocalProvider:
         )
 
         fake_ollama = _FakeProvider("local AI response")
-        with patch.object(_main_mod, "OllamaProvider", autospec=True) as mock_ollama_cls:
+        with patch("kiassist_utils.ai.ollama.OllamaProvider", autospec=True) as mock_ollama_cls:
             mock_ollama_cls.return_value = fake_ollama
             result = api.set_provider("local", "llama3.2")
 
@@ -561,7 +577,7 @@ class TestDualModelSupport:
             "AIzaFakeKey" if (p or "gemini") == "gemini" else None
         )
         fake_provider = _FakeProvider()
-        monkeypatch.setattr(_main_mod, "GeminiProvider", lambda k, m: fake_provider)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", lambda k, m: fake_provider)
 
         result = api.set_secondary_model("gemini", "3.1-flash-lite")
         assert result["success"] is True
@@ -582,7 +598,7 @@ class TestDualModelSupport:
             call_count[0] += 1
             return fake1 if call_count[0] == 1 else fake2
 
-        monkeypatch.setattr(_main_mod, "GeminiProvider", _make_gemini)
+        monkeypatch.setattr("kiassist_utils.ai.gemini.GeminiProvider", _make_gemini)
         api.set_provider("gemini", "3.1-pro")
         api.set_secondary_model("gemini", "3.1-flash-lite")
 
