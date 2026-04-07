@@ -1630,16 +1630,16 @@ class KiAssistAPI:
                         overwrite=overwrite,
                     )
                     return self._import_result_to_dict(result)
-
-                # Preview-only: the temp dir will be deleted when the context
-                # manager exits, so path fields would become stale.  Clear them
-                # and return only the S-expression data and field metadata.
-                result_dict = self._import_result_to_dict(result)
-                if result_dict.get("success") and "component" in result_dict:
-                    result_dict["component"]["symbol_path"] = ""
-                    result_dict["component"]["footprint_path"] = ""
-                    result_dict["component"]["model_paths"] = []
-                return result_dict
+                else:
+                    # Preview-only: the temp dir will be deleted when the context
+                    # manager exits, so path fields would become stale.  Clear them
+                    # and return only the S-expression data and field metadata.
+                    result_dict = self._import_result_to_dict(result)
+                    if result_dict.get("success") and "component" in result_dict:
+                        result_dict["component"]["symbol_path"] = ""
+                        result_dict["component"]["footprint_path"] = ""
+                        result_dict["component"]["model_paths"] = []
+                    return result_dict
         except Exception as exc:
             return {"success": False, "error": str(exc), "warnings": []}
 

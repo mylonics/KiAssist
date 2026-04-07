@@ -35,5 +35,5 @@ if "webview" not in sys.modules:
 # Force-import kiassist_utils.main so that sys.modules["kiassist_utils.main"]
 # is populated before test_main_api.py is collected (it accesses the module
 # via sys.modules at collection time).
-import kiassist_utils  # noqa: E402 — must come after stub setup
+import kiassist_utils  # noqa: E402 -- must come after stub setup
 _ = kiassist_utils.KiAssistAPI  # trigger lazy load
