@@ -12,12 +12,11 @@ const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const rightPanelCollapsed = ref(false);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
-const leftPanelTab = ref<'kicad' | 'search'>('kicad');
+const leftPanelTab = ref<'kicad' | 'search' | 'importer'>('kicad');
 
 function handleInsertInChat(text: string) {
   chatBox.value?.insertText(text);
 }
-const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
 </script>
 
 <template>
@@ -39,6 +38,8 @@ const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
         >
           <span class="material-icons tab-icon">search</span>
           Components
+        </button>
+        <button
           :class="['left-tab-btn', { active: leftPanelTab === 'importer' }]"
           @click="leftPanelTab = 'importer'"
           title="Symbol / Footprint Importer"
@@ -183,48 +184,6 @@ body {
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-sm);
-  display: flex;
-  flex-direction: column;
-}
-
-.left-panel-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--border-color);
-  flex-shrink: 0;
-}
-
-.left-tab-btn {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  padding: 0.45rem 0.4rem;
-  border: none;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 0.72rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  border-bottom: 2px solid transparent;
-}
-
-.left-tab-btn:hover {
-  background-color: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
-.left-tab-btn.active {
-  color: var(--accent-color);
-  border-bottom-color: var(--accent-color);
-  background-color: var(--bg-secondary);
-}
-
-.left-panel-content {
-  flex: 1;
-  overflow-y: auto;
-  min-height: 0;
 }
 
 .left-panel-tabs {
