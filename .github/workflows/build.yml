@@ -59,6 +59,11 @@ jobs:
         cd python-lib
         pip install -e ".[dev]"
 
+    - name: Run Python tests
+      run: |
+        cd python-lib
+        python -m pytest tests/ -v
+
     - name: Build distributable with PyInstaller
       run: |
         pyinstaller kiassist.spec --clean
