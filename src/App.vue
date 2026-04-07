@@ -212,7 +212,7 @@ body {
 
 .left-panel-content {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
   min-height: 0;
 }
 

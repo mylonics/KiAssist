@@ -99,7 +99,7 @@ function handleKeydown(event: KeyboardEvent) {
     <!-- Loading state -->
     <div v-if="isLoading" class="search-loading">
       <span class="material-icons spin">sync</span>
-      <span>Searching and analysing…</span>
+      <span>Searching and analyzing…</span>
     </div>
 
     <!-- Error state -->
