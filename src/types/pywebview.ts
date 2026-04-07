@@ -242,6 +242,8 @@ export interface ComponentSearchResult extends ApiResult {
   response?: string;
   search_results?: WebSearchResult[];
   query?: string;
+  /** Which search backend was used: 'google' (Gemini grounding) or 'duckduckgo' */
+  grounding?: 'google' | 'duckduckgo';
 }
 
 export interface PyWebViewAPI {

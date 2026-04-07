@@ -425,6 +425,104 @@ class GeminiProvider(AIProvider):
         )
 
     # ------------------------------------------------------------------
+    # Google Search grounding
+    # ------------------------------------------------------------------
+
+    def search_grounded_query(
+        self,
+        query: str,
+        system_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Send *query* to Gemini with native Google Search grounding enabled.
+
+        This uses ``types.Tool(google_search=types.GoogleSearch())`` to let
+        Gemini automatically search Google and ground its response in live web
+        results.  No external HTTP requests are made by this library – the
+        search is handled natively by the Gemini API.
+
+        Args:
+            query:         The question or request to answer with web context.
+            system_prompt: Optional system instruction override.
+
+        Returns:
+            Dictionary with:
+            * ``response_text`` – The AI-synthesized answer.
+            * ``search_results`` – List of ``{title, url}`` dicts extracted
+              from ``groundingMetadata.groundingChunks``.
+            * ``usage`` – Token usage dict.
+
+        Raises:
+            Exception: On Gemini API errors.
+        """
+        import time
+
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        config_kwargs: Dict[str, Any] = {"tools": [grounding_tool]}
+        if system_prompt:
+            config_kwargs["system_instruction"] = system_prompt
+        config = types.GenerateContentConfig(**config_kwargs)
+
+        max_retries = 3
+        retry_delay = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                response = self._client.models.generate_content(
+                    model=self._model_name,
+                    contents=query,
+                    config=config,
+                )
+                break
+            except errors.APIError as exc:
+                status = getattr(exc, "code", None) or getattr(exc, "status", None)
+                retryable = (
+                    status in (429, 503)
+                    or "503" in str(exc)
+                    or "429" in str(exc)
+                    or "UNAVAILABLE" in str(exc)
+                )
+                if retryable and attempt < max_retries - 1:
+                    time.sleep(retry_delay * (2 ** attempt))
+                    continue
+                raise Exception(f"Gemini API error: {exc}") from exc
+
+        try:
+            response_text = response.text or ""
+        except (ValueError, AttributeError):
+            response_text = ""
+
+        # Extract grounding sources from groundingMetadata
+        search_results: List[Dict[str, str]] = []
+        try:
+            metadata = response.candidates[0].grounding_metadata
+            if metadata and hasattr(metadata, "grounding_chunks"):
+                for chunk in metadata.grounding_chunks:
+                    if hasattr(chunk, "web") and chunk.web:
+                        entry: Dict[str, str] = {}
+                        if getattr(chunk.web, "title", None):
+                            entry["title"] = chunk.web.title
+                        if getattr(chunk.web, "uri", None):
+                            entry["url"] = chunk.web.uri
+                        if entry.get("title") or entry.get("url"):
+                            search_results.append(entry)
+        except (AttributeError, IndexError, TypeError):
+            pass
+
+        usage: Dict[str, int] = {}
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            meta = response.usage_metadata
+            usage = {
+                "input_tokens": getattr(meta, "prompt_token_count", 0) or 0,
+                "output_tokens": getattr(meta, "candidates_token_count", 0) or 0,
+            }
+
+        return {
+            "response_text": response_text,
+            "search_results": search_results,
+            "usage": usage,
+        }
+
+    # ------------------------------------------------------------------
     # Legacy compatibility helpers (used by existing main.py code)
     # ------------------------------------------------------------------
 

@@ -16,6 +16,7 @@ const aiResponse = ref('');
 const searchResults = ref<WebSearchResult[]>([]);
 const lastQuery = ref('');
 const showSources = ref(false);
+const groundingBackend = ref<'google' | 'duckduckgo' | null>(null);
 
 function renderMarkdown(text: string): string {
   if (!text) return '';
@@ -32,6 +33,7 @@ async function search() {
   searchResults.value = [];
   lastQuery.value = q;
   showSources.value = false;
+  groundingBackend.value = null;
 
   try {
     const api = window.pywebview?.api;
@@ -45,6 +47,7 @@ async function search() {
     if (result.success) {
       aiResponse.value = result.response ?? '';
       searchResults.value = result.search_results ?? [];
+      groundingBackend.value = result.grounding ?? null;
     } else {
       errorMessage.value = result.error ?? 'Component search failed.';
     }
@@ -112,6 +115,14 @@ function handleKeydown(event: KeyboardEvent) {
     <div v-else-if="aiResponse" class="search-results">
       <div class="results-toolbar">
         <span class="results-label">Results for: <em>{{ lastQuery }}</em></span>
+        <span v-if="groundingBackend === 'google'" class="grounding-badge google" title="Results grounded with Google Search via Gemini API">
+          <span class="material-icons badge-icon">public</span>
+          Google Search
+        </span>
+        <span v-else-if="groundingBackend === 'duckduckgo'" class="grounding-badge ddg" title="Results from DuckDuckGo web search">
+          <span class="material-icons badge-icon">search</span>
+          DuckDuckGo
+        </span>
         <button class="chat-btn" @click="insertInChat" title="Ask this in the chat">
           <span class="material-icons">chat</span>
           Ask in Chat
@@ -295,6 +306,33 @@ function handleKeydown(event: KeyboardEvent) {
   color: var(--text-primary);
   font-style: normal;
   font-weight: 600;
+}
+
+.grounding-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.grounding-badge.google {
+  background: rgba(66, 133, 244, 0.12);
+  color: #4285f4;
+  border: 1px solid rgba(66, 133, 244, 0.3);
+}
+
+.grounding-badge.ddg {
+  background: rgba(222, 88, 55, 0.1);
+  color: #de5837;
+  border: 1px solid rgba(222, 88, 55, 0.25);
+}
+
+.badge-icon {
+  font-size: 0.75rem;
 }
 
 .chat-btn {
