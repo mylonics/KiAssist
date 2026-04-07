@@ -281,6 +281,6 @@ class ConversationStore:
                 for entry in entries:
                     fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
             os.replace(tmp_path, self._history_path)
-        except Exception:
+        except (OSError, IOError, ValueError):
             tmp_path.unlink(missing_ok=True)
             raise

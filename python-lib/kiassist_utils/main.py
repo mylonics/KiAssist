@@ -2303,6 +2303,11 @@ class KiAssistAPI:
             self._async_loop.call_soon_threadsafe(self._async_loop.stop)
         if self._async_thread.is_alive():
             self._async_thread.join(timeout=5)
+            if self._async_thread.is_alive():
+                logger.warning(
+                    "KiAssistAPI background thread did not stop within the timeout; "
+                    "it may still be running."
+                )
 
 
 def get_frontend_path() -> Path:
