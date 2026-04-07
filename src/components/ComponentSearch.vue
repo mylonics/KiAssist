@@ -98,7 +98,8 @@ function copyLibId(libId: string) {
 }
 
 function insertInChat(candidate: ComponentCandidate) {
-  const text = `Component: **${candidate.lib_id}**\nDescription: ${candidate.description || '(none)'}\nPins: ${candidate.pin_count}\nKeywords: ${candidate.keywords.join(', ') || '(none)'}`;
+  const keywords = candidate.keywords.length > 0 ? candidate.keywords.join(', ') : '(none)';
+  const text = `Component: **${candidate.lib_id}**\nDescription: ${candidate.description || '(none)'}\nPins: ${candidate.pin_count}\nKeywords: ${keywords}`;
   emit('insert-in-chat', text);
 }
 
@@ -240,11 +241,11 @@ const detailProperties = computed<[string, string][]>(() => {
               <tbody>
                 <tr>
                   <td class="prop-key">Reference</td>
-                  <td class="prop-val">{{ selectedCandidate.properties['Reference'] ?? '—' }}</td>
+                  <td class="prop-val">{{ selectedCandidate.properties['Reference'] || '—' }}</td>
                 </tr>
                 <tr>
                   <td class="prop-key">Value</td>
-                  <td class="prop-val">{{ selectedCandidate.properties['Value'] ?? '—' }}</td>
+                  <td class="prop-val">{{ selectedCandidate.properties['Value'] || '—' }}</td>
                 </tr>
                 <tr>
                   <td class="prop-key">Footprint</td>
