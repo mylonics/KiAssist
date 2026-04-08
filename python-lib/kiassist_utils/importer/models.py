@@ -99,6 +99,20 @@ class ImportedComponent:
 
 
 @dataclass
+class CadSource:
+    """A third-party CAD model source discovered on Octopart or Ultra Librarian."""
+
+    partner: str = ""
+    has_symbol: bool = False
+    has_footprint: bool = False
+    has_3d_model: bool = False
+    preview_symbol: str = ""
+    preview_footprint: str = ""
+    preview_3d: str = ""
+    download_url: str = ""
+
+
+@dataclass
 class ImportResult:
     """Overall result returned from an import operation."""
 
@@ -106,3 +120,6 @@ class ImportResult:
     component: Optional[ImportedComponent] = None
     warnings: List[str] = field(default_factory=list)
     error: str = ""
+    # Alternative CAD sources when EasyEDA has no data
+    cad_sources: List[CadSource] = field(default_factory=list)
+    octopart_url: str = ""

@@ -8,6 +8,12 @@ import { computed, ref, reactive, watch } from 'vue';
 const props = defineProps<{
   sexpr: string;
   type: 'symbol' | 'footprint';
+  /** Optional second footprint sexpr to render side-by-side in the same viewer */
+  compareSexpr?: string;
+  /** Label for the primary (left) footprint */
+  primaryLabel?: string;
+  /** Label for the comparison (right) footprint */
+  compareLabel?: string;
 }>();
 
 // -----------------------------------------------------------------------
@@ -949,11 +955,76 @@ const renderData = computed(() => {
     const pad = Math.max(w * padFrac, h * padFrac, 0.5);
     return {
       elements: result.elements,
+      bbox: result.bbox,
       viewBox: `${result.bbox.x1 - pad} ${result.bbox.y1 - pad} ${w + pad * 2} ${h + pad * 2}`,
     };
   } catch {
     return null;
   }
+});
+
+/** Parsed comparison footprint (only for footprint type with compareSexpr) */
+const compareData = computed(() => {
+  if (props.type !== 'footprint' || !props.compareSexpr?.trim()) return null;
+  try {
+    return parseFootprint(props.compareSexpr);
+  } catch {
+    return null;
+  }
+});
+
+/** Whether we are in comparison mode */
+const isCompareMode = computed(() => !!renderData.value && !!compareData.value);
+
+/**
+ * Merged view: primary on the left, comparison on the right, with a gap.
+ * Comparison elements are rendered in a <g transform="translate(...)"> group.
+ */
+const mergedViewData = computed(() => {
+  if (!isCompareMode.value || !renderData.value || !compareData.value) return null;
+
+  const pBbox = renderData.value.bbox;
+  const cBbox = compareData.value.bbox;
+
+  // Gap between primary and comparison (in footprint units = mm)
+  const gap = 3;
+
+  // Offset to shift the comparison: move it so its left edge is
+  // at the right edge of the primary + gap.
+  const offsetX = pBbox.x2 - cBbox.x1 + gap;
+
+  // Combined bounding box
+  const x1 = pBbox.x1;
+  const y1 = Math.min(pBbox.y1, cBbox.y1);
+  const x2 = cBbox.x2 + offsetX;
+  const y2 = Math.max(pBbox.y2, cBbox.y2);
+
+  const w = x2 - x1;
+  const h = y2 - y1;
+  const padFrac = 0.10;
+  const pad = Math.max(w * padFrac, h * padFrac, 0.5);
+
+  // Divider line x
+  const dividerX = pBbox.x2 + gap / 2;
+
+  // Label positions (above the footprints)
+  const labelY = y1 - pad * 0.3;
+  const primaryLabelX = (pBbox.x1 + pBbox.x2) / 2;
+  const compareLabelX = (cBbox.x1 + offsetX + cBbox.x2 + offsetX) / 2;
+  const labelSize = Math.max(w * 0.025, 0.8);
+
+  return {
+    compareElements: compareData.value.elements,
+    viewBox: `${x1 - pad} ${y1 - pad * 1.8} ${w + pad * 2} ${h + pad * 2.8}`,
+    offsetX,
+    dividerX,
+    dividerY1: y1 - pad * 0.6,
+    dividerY2: y2 + pad * 0.3,
+    labelY,
+    primaryLabelX,
+    compareLabelX,
+    labelSize,
+  };
 });
 
 // -----------------------------------------------------------------------
@@ -994,7 +1065,7 @@ const MAX_ZOOM = 20;
 const ZOOM_FACTOR = 1.15;
 
 // Reset zoom when the data changes
-watch(() => props.sexpr, () => {
+watch([() => props.sexpr, () => props.compareSexpr], () => {
   zoomLevel.value = 1;
   panOffset.x = 0;
   panOffset.y = 0;
@@ -1094,9 +1165,13 @@ function onDblClick() {
 
 /** The actual viewBox used by the SVG, accounting for zoom + pan */
 const zoomedViewBox = computed(() => {
-  if (!renderData.value) return null;
+  // Choose base viewBox: merged (compare mode) or single
+  const baseViewBoxStr = mergedViewData.value
+    ? mergedViewData.value.viewBox
+    : renderData.value?.viewBox;
+  if (!baseViewBoxStr) return null;
   // Parse the base viewBox
-  const parts = renderData.value.viewBox.split(' ').map(Number);
+  const parts = baseViewBoxStr.split(' ').map(Number);
   const baseX = parts[0], baseY = parts[1], baseW = parts[2], baseH = parts[3];
   // Zoomed dimensions
   const w = baseW / zoomLevel.value;
@@ -1123,7 +1198,7 @@ const zoomedViewBox = computed(() => {
     <svg
       v-else
       ref="svgRef"
-      :viewBox="zoomedViewBox?.str ?? renderData.viewBox"
+      :viewBox="zoomedViewBox?.str ?? (mergedViewData?.viewBox ?? renderData.viewBox)"
       class="preview-svg"
       :class="{ 'is-panning': isPanning }"
       xmlns="http://www.w3.org/2000/svg"
@@ -1133,145 +1208,69 @@ const zoomedViewBox = computed(() => {
       @pointerup="onPointerUp"
       @dblclick="onDblClick"
     >
-      <!-- Grid origin crosshair -->
+      <!-- Grid origin crosshair (primary) -->
       <line x1="-0.6" y1="0" x2="0.6" y2="0" :stroke="type === 'symbol' ? '#CCCCCC' : '#404060'" stroke-width="0.06" />
       <line x1="0" y1="-0.6" x2="0" y2="0.6" :stroke="type === 'symbol' ? '#CCCCCC' : '#404060'" stroke-width="0.06" />
 
-      <template v-for="(el, idx) in renderData.elements" :key="idx">
-        <!-- Line -->
-        <line
-          v-if="el.kind === 'line'"
-          :x1="el.x1" :y1="el.y1" :x2="el.x2" :y2="el.y2"
-          :stroke="el.color"
-          :stroke-width="el.stroke"
-          stroke-linecap="round"
-          :stroke-dasharray="el.dash ? dashArray(el.stroke) : undefined"
-        />
-        <!-- Rect -->
-        <rect
-          v-else-if="el.kind === 'rect'"
-          :x="el.x" :y="el.y" :width="el.w" :height="el.h"
-          :stroke="el.color"
-          :stroke-width="el.stroke"
-          :fill="el.fill"
-          stroke-linejoin="miter"
-        />
-        <!-- Circle -->
-        <circle
-          v-else-if="el.kind === 'circle'"
-          :cx="el.cx" :cy="el.cy" :r="Math.max(el.r, 0.01)"
-          :stroke="el.stroke > 0 ? el.color : 'none'"
-          :stroke-width="el.stroke"
-          :fill="el.fill"
-        />
-        <!-- Arc -->
-        <path
-          v-else-if="el.kind === 'arc'"
-          :d="el.d"
-          :stroke="el.color"
-          :stroke-width="el.stroke"
-          :fill="el.fill"
-          stroke-linecap="round"
-          :stroke-dasharray="el.dash ? dashArray(el.stroke) : undefined"
-        />
-        <!-- Polyline -->
-        <polyline
-          v-else-if="el.kind === 'poly'"
-          :points="el.points"
-          :stroke="el.color"
-          :stroke-width="el.stroke"
-          :fill="el.fill"
-          stroke-linejoin="miter"
-          stroke-linecap="round"
-        />
-        <!-- Pad -->
+      <!-- Compare-mode: origin crosshair for the comparison footprint -->
+      <template v-if="mergedViewData">
+        <line :x1="mergedViewData.offsetX - 0.6" y1="0" :x2="mergedViewData.offsetX + 0.6" y2="0" stroke="#404060" stroke-width="0.06" />
+        <line :x1="mergedViewData.offsetX" y1="-0.6" :x2="mergedViewData.offsetX" y2="0.6" stroke="#404060" stroke-width="0.06" />
+      </template>
+
+      <!-- ===== Primary elements ===== -->
+      <template v-for="(el, idx) in renderData.elements" :key="'p-' + idx">
+        <line v-if="el.kind === 'line'" :x1="el.x1" :y1="el.y1" :x2="el.x2" :y2="el.y2" :stroke="el.color" :stroke-width="el.stroke" stroke-linecap="round" :stroke-dasharray="el.dash ? dashArray(el.stroke) : undefined" />
+        <rect v-else-if="el.kind === 'rect'" :x="el.x" :y="el.y" :width="el.w" :height="el.h" :stroke="el.color" :stroke-width="el.stroke" :fill="el.fill" stroke-linejoin="miter" />
+        <circle v-else-if="el.kind === 'circle'" :cx="el.cx" :cy="el.cy" :r="Math.max(el.r, 0.01)" :stroke="el.stroke > 0 ? el.color : 'none'" :stroke-width="el.stroke" :fill="el.fill" />
+        <path v-else-if="el.kind === 'arc'" :d="el.d" :stroke="el.color" :stroke-width="el.stroke" :fill="el.fill" stroke-linecap="round" :stroke-dasharray="el.dash ? dashArray(el.stroke) : undefined" />
+        <polyline v-else-if="el.kind === 'poly'" :points="el.points" :stroke="el.color" :stroke-width="el.stroke" :fill="el.fill" stroke-linejoin="miter" stroke-linecap="round" />
         <g v-else-if="el.kind === 'pad'" :transform="el.angle ? `rotate(${el.angle},${el.x},${el.y})` : undefined">
-          <!-- SMD pads: filled with slight transparency -->
           <template v-if="el.padType === 'smd' || el.padType === 'connect'">
-            <rect
-              v-if="el.shape !== 'circle'"
-              :x="el.x - el.w / 2" :y="el.y - el.h / 2"
-              :width="el.w" :height="el.h"
-              :rx="el.rx || (el.shape === 'oval' ? Math.min(el.w, el.h) / 2 : 0)"
-              :fill="el.color"
-              fill-opacity="0.7"
-              :stroke="el.color"
-              :stroke-width="0.03"
-            />
-            <ellipse
-              v-else
-              :cx="el.x" :cy="el.y"
-              :rx="el.w / 2" :ry="el.h / 2"
-              :fill="el.color"
-              fill-opacity="0.7"
-              :stroke="el.color"
-              :stroke-width="0.03"
-            />
+            <rect v-if="el.shape !== 'circle'" :x="el.x - el.w / 2" :y="el.y - el.h / 2" :width="el.w" :height="el.h" :rx="el.rx || (el.shape === 'oval' ? Math.min(el.w, el.h) / 2 : 0)" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+            <ellipse v-else :cx="el.x" :cy="el.y" :rx="el.w / 2" :ry="el.h / 2" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
           </template>
-          <!-- Through-hole pads: filled annular ring + drill hole -->
           <template v-else>
-            <rect
-              v-if="el.shape === 'rect'"
-              :x="el.x - el.w / 2" :y="el.y - el.h / 2"
-              :width="el.w" :height="el.h"
-              :fill="el.color"
-              fill-opacity="0.7"
-              :stroke="el.color"
-              :stroke-width="0.03"
-            />
-            <ellipse
-              v-else-if="el.shape === 'oval'"
-              :cx="el.x" :cy="el.y"
-              :rx="el.w / 2" :ry="el.h / 2"
-              :fill="el.color"
-              fill-opacity="0.7"
-              :stroke="el.color"
-              :stroke-width="0.03"
-            />
-            <circle
-              v-else
-              :cx="el.x" :cy="el.y"
-              :r="Math.max(el.w, el.h) / 2"
-              :fill="el.color"
-              fill-opacity="0.7"
-              :stroke="el.color"
-              :stroke-width="0.03"
-            />
-            <!-- Drill hole -->
-            <circle
-              v-if="el.drill > 0"
-              :cx="el.x" :cy="el.y"
-              :r="el.drill / 2"
-              :fill="CLR.bgFootprint"
-              :stroke="el.color"
-              :stroke-width="0.03"
-            />
+            <rect v-if="el.shape === 'rect'" :x="el.x - el.w / 2" :y="el.y - el.h / 2" :width="el.w" :height="el.h" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+            <ellipse v-else-if="el.shape === 'oval'" :cx="el.x" :cy="el.y" :rx="el.w / 2" :ry="el.h / 2" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+            <circle v-else :cx="el.x" :cy="el.y" :r="Math.max(el.w, el.h) / 2" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+            <circle v-if="el.drill > 0" :cx="el.x" :cy="el.y" :r="el.drill / 2" :fill="CLR.bgFootprint" :stroke="el.color" :stroke-width="0.03" />
           </template>
-          <!-- Pad number -->
-          <text
-            :x="el.x" :y="el.y"
-            text-anchor="middle"
-            dominant-baseline="central"
-            :font-size="Math.min(el.w, el.h) * 0.45"
-            fill="white"
-            font-weight="bold"
-            font-family="sans-serif"
-            style="pointer-events: none"
-          >{{ el.label }}</text>
+          <text :x="el.x" :y="el.y" text-anchor="middle" dominant-baseline="central" :font-size="Math.min(el.w, el.h) * 0.45" fill="white" font-weight="bold" font-family="sans-serif" style="pointer-events: none">{{ el.label }}</text>
         </g>
-        <!-- Text -->
-        <text
-          v-else-if="el.kind === 'text'"
-          :x="el.x" :y="el.y"
-          :fill="el.color"
-          :font-size="el.size"
-          :font-weight="el.weight || 'normal'"
-          :text-anchor="textAnchor(el.anchor)"
-          :dominant-baseline="dominantBaseline(el.anchor)"
-          :transform="el.angle ? `rotate(${-el.angle},${el.x},${el.y})` : undefined"
-          font-family="sans-serif"
-          style="pointer-events: none"
-        >{{ el.text }}</text>
+        <text v-else-if="el.kind === 'text'" :x="el.x" :y="el.y" :fill="el.color" :font-size="el.size" :font-weight="el.weight || 'normal'" :text-anchor="textAnchor(el.anchor)" :dominant-baseline="dominantBaseline(el.anchor)" :transform="el.angle ? `rotate(${-el.angle},${el.x},${el.y})` : undefined" font-family="sans-serif" style="pointer-events: none">{{ el.text }}</text>
+      </template>
+
+      <!-- ===== Comparison elements (translated) ===== -->
+      <g v-if="mergedViewData" :transform="`translate(${mergedViewData.offsetX}, 0)`">
+        <template v-for="(el, idx) in mergedViewData.compareElements" :key="'c-' + idx">
+          <line v-if="el.kind === 'line'" :x1="el.x1" :y1="el.y1" :x2="el.x2" :y2="el.y2" :stroke="el.color" :stroke-width="el.stroke" stroke-linecap="round" :stroke-dasharray="el.dash ? dashArray(el.stroke) : undefined" />
+          <rect v-else-if="el.kind === 'rect'" :x="el.x" :y="el.y" :width="el.w" :height="el.h" :stroke="el.color" :stroke-width="el.stroke" :fill="el.fill" stroke-linejoin="miter" />
+          <circle v-else-if="el.kind === 'circle'" :cx="el.cx" :cy="el.cy" :r="Math.max(el.r, 0.01)" :stroke="el.stroke > 0 ? el.color : 'none'" :stroke-width="el.stroke" :fill="el.fill" />
+          <path v-else-if="el.kind === 'arc'" :d="el.d" :stroke="el.color" :stroke-width="el.stroke" :fill="el.fill" stroke-linecap="round" :stroke-dasharray="el.dash ? dashArray(el.stroke) : undefined" />
+          <polyline v-else-if="el.kind === 'poly'" :points="el.points" :stroke="el.color" :stroke-width="el.stroke" :fill="el.fill" stroke-linejoin="miter" stroke-linecap="round" />
+          <g v-else-if="el.kind === 'pad'" :transform="el.angle ? `rotate(${el.angle},${el.x},${el.y})` : undefined">
+            <template v-if="el.padType === 'smd' || el.padType === 'connect'">
+              <rect v-if="el.shape !== 'circle'" :x="el.x - el.w / 2" :y="el.y - el.h / 2" :width="el.w" :height="el.h" :rx="el.rx || (el.shape === 'oval' ? Math.min(el.w, el.h) / 2 : 0)" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+              <ellipse v-else :cx="el.x" :cy="el.y" :rx="el.w / 2" :ry="el.h / 2" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+            </template>
+            <template v-else>
+              <rect v-if="el.shape === 'rect'" :x="el.x - el.w / 2" :y="el.y - el.h / 2" :width="el.w" :height="el.h" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+              <ellipse v-else-if="el.shape === 'oval'" :cx="el.x" :cy="el.y" :rx="el.w / 2" :ry="el.h / 2" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+              <circle v-else :cx="el.x" :cy="el.y" :r="Math.max(el.w, el.h) / 2" :fill="el.color" fill-opacity="0.7" :stroke="el.color" :stroke-width="0.03" />
+              <circle v-if="el.drill > 0" :cx="el.x" :cy="el.y" :r="el.drill / 2" :fill="CLR.bgFootprint" :stroke="el.color" :stroke-width="0.03" />
+            </template>
+            <text :x="el.x" :y="el.y" text-anchor="middle" dominant-baseline="central" :font-size="Math.min(el.w, el.h) * 0.45" fill="white" font-weight="bold" font-family="sans-serif" style="pointer-events: none">{{ el.label }}</text>
+          </g>
+          <text v-else-if="el.kind === 'text'" :x="el.x" :y="el.y" :fill="el.color" :font-size="el.size" :font-weight="el.weight || 'normal'" :text-anchor="textAnchor(el.anchor)" :dominant-baseline="dominantBaseline(el.anchor)" :transform="el.angle ? `rotate(${-el.angle},${el.x},${el.y})` : undefined" font-family="sans-serif" style="pointer-events: none">{{ el.text }}</text>
+        </template>
+      </g>
+
+      <!-- ===== Compare-mode overlay: divider line + labels ===== -->
+      <template v-if="mergedViewData">
+        <line :x1="mergedViewData.dividerX" :y1="mergedViewData.dividerY1" :x2="mergedViewData.dividerX" :y2="mergedViewData.dividerY2" stroke="#606080" :stroke-width="mergedViewData.labelSize * 0.06" stroke-dasharray="0.4,0.3" />
+        <text :x="mergedViewData.primaryLabelX" :y="mergedViewData.labelY" text-anchor="middle" dominant-baseline="auto" :font-size="mergedViewData.labelSize" fill="#80a0ff" font-weight="bold" font-family="sans-serif" style="pointer-events: none">{{ primaryLabel || 'Imported' }}</text>
+        <text :x="mergedViewData.compareLabelX" :y="mergedViewData.labelY" text-anchor="middle" dominant-baseline="auto" :font-size="mergedViewData.labelSize" fill="#80ffa0" font-weight="bold" font-family="sans-serif" style="pointer-events: none">{{ compareLabel || 'Selected' }}</text>
       </template>
     </svg>
   </div>

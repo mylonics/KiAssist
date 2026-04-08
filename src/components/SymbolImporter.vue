@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
-import type { ImportedComponent } from '../types/importer';
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import type { ImportedComponent, CadSource } from '../types/importer';
 
 // -----------------------------------------------------------------------
 // Emits
@@ -33,6 +33,7 @@ interface LibraryInfo {
 // -----------------------------------------------------------------------
 
 const loading = ref(false);
+const lookupStatus = ref('');
 const error = ref('');
 const lcscAvailable = ref(true);
 
@@ -46,11 +47,25 @@ const libraryTab = ref<'symbols' | 'footprints'>('symbols');
 const librariesCollapsed = ref(false);
 const libraryScope = ref<'all' | 'custom'>('all');
 
-// LCSC
-const lcscId = ref('');
+// Part lookup fields
+const partMpn = ref('');
+const partSpn = ref('');
+const partLcsc = ref('');
+
+// CAD sources (when EasyEDA has no data)
+const cadSources = ref<CadSource[]>([]);
+const octopartUrl = ref('');
+const partLookupFailed = ref(false);
+
+// Progress polling timer
+let _progressTimer: ReturnType<typeof setInterval> | null = null;
 
 // ZIP
 const zipPath = ref('');
+
+// Multi-ZIP (used from CAD sources / Part Lookup fallback)
+const zipPaths = ref<string[]>([]);
+const zipsLoading = ref(false);
 
 // KiCad lib search
 const searchQuery = ref('');
@@ -96,6 +111,10 @@ onMounted(async () => {
   }
   // Load libraries on startup
   await loadLibraries();
+});
+
+onBeforeUnmount(() => {
+  if (_progressTimer) clearInterval(_progressTimer);
 });
 
 async function loadLibraries() {
@@ -150,29 +169,52 @@ function leftPanelScrollToSearch() {
 }
 
 // -----------------------------------------------------------------------
-// LCSC import
+// Part lookup import (MPN / SPN / LCSC → Octopart + EasyEDA)
 // -----------------------------------------------------------------------
 
-async function importLcsc() {
+async function importByPart() {
   const api = getApi();
   if (!api) { error.value = 'Backend not available'; return; }
-  if (!lcscId.value.trim()) { error.value = 'Please enter an LCSC part number'; return; }
+  const m = partMpn.value.trim();
+  const s = partSpn.value.trim();
+  const l = partLcsc.value.trim();
+  if (!m && !s && !l) { error.value = 'Please enter at least one part identifier'; return; }
 
   clearError();
+  cadSources.value = [];
+  octopartUrl.value = '';
+  partLookupFailed.value = false;
+  zipPaths.value = [];
+  lookupStatus.value = 'Starting lookup…';
   loading.value = true;
+
+  // Poll backend for progress updates every 400ms
+  _progressTimer = setInterval(async () => {
+    try {
+      const p = await api.importer_import_progress();
+      if (p?.status) lookupStatus.value = p.status;
+    } catch { /* ignore */ }
+  }, 400);
+
   try {
-    const r = await api.importer_import_lcsc(
-      lcscId.value.trim(),
-      '',
-      '',
-      '',
-      false,
-    );
+    const r = await api.importer_import_by_part(m, s, l);
+    console.log('[SymbolImporter] import response:', JSON.stringify(r?.cad_sources), 'octopart_url:', r?.octopart_url);
+    // Capture alternative CAD sources (present on both success and failure)
+    if (r?.cad_sources?.length) {
+      cadSources.value = r.cad_sources;
+      octopartUrl.value = r.octopart_url || '';
+    }
+    if (!r?.success) {
+      partLookupFailed.value = true;
+    }
     handleResult(r);
   } catch (e: any) {
     error.value = e.message || 'Import failed';
+    partLookupFailed.value = true;
   } finally {
+    if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null; }
     loading.value = false;
+    lookupStatus.value = '';
   }
 }
 
@@ -210,6 +252,58 @@ async function importZip() {
   } catch (e: any) {
     error.value = e.message || 'Import failed';
   } finally {
+    loading.value = false;
+  }
+}
+
+// -----------------------------------------------------------------------
+// Multi-ZIP import (from CAD sources fallback)
+// -----------------------------------------------------------------------
+
+async function browseZips() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_browse_zips();
+    if (r?.paths?.length) {
+      // Append new paths, avoiding duplicates
+      const existing = new Set(zipPaths.value);
+      for (const p of r.paths) {
+        if (!existing.has(p)) {
+          zipPaths.value.push(p);
+        }
+      }
+    }
+  } catch (e: any) {
+    error.value = e.message || 'File dialog failed';
+  }
+}
+
+function removeZipPath(index: number) {
+  zipPaths.value.splice(index, 1);
+}
+
+async function importZips() {
+  const api = getApi();
+  if (!api) { error.value = 'Backend not available'; return; }
+  if (!zipPaths.value.length) { error.value = 'Please select at least one ZIP file'; return; }
+
+  clearError();
+  zipsLoading.value = true;
+  loading.value = true;
+  try {
+    const r = await api.importer_import_zips(
+      zipPaths.value,
+      '',
+      '',
+      '',
+      false,
+    );
+    handleResult(r);
+  } catch (e: any) {
+    error.value = e.message || 'Import failed';
+  } finally {
+    zipsLoading.value = false;
     loading.value = false;
   }
 }
@@ -390,43 +484,185 @@ function handleResult(r: any) {
 
       <div class="section-divider"></div>
 
-      <!-- ======== LCSC Section ======== -->
+      <!-- ======== Part Lookup Section ======== -->
       <div class="method-section">
         <div class="method-label">
           <span class="material-icons method-icon">cloud_download</span>
-          LCSC / EasyEDA
+          Part Lookup
         </div>
 
         <div v-if="!lcscAvailable" class="notice warn">
           <span class="material-icons">warning</span>
           <span>
             <strong>easyeda2kicad</strong> is not available.<br>
-            Try restarting the application.
+            Symbol/footprint import will be skipped.
           </span>
         </div>
 
-        <div class="input-row">
-          <input
-            v-model="lcscId"
-            class="text-input"
-            placeholder="e.g. C14663"
-            :disabled="loading || !lcscAvailable"
-            @keydown.enter="importLcsc"
-          />
+        <div class="part-fields">
+          <div class="input-row">
+            <label class="field-label">MPN</label>
+            <input
+              v-model="partMpn"
+              class="text-input"
+              placeholder="e.g. STM32F103C8T6"
+              :disabled="loading"
+              @keydown.enter="importByPart"
+            />
+          </div>
+          <div class="input-row">
+            <label class="field-label">SPN</label>
+            <input
+              v-model="partSpn"
+              class="text-input"
+              placeholder="e.g. 497-6063-ND"
+              :disabled="loading"
+              @keydown.enter="importByPart"
+            />
+          </div>
+          <div class="input-row">
+            <label class="field-label">LCSC</label>
+            <input
+              v-model="partLcsc"
+              class="text-input"
+              placeholder="e.g. C8734"
+              :disabled="loading"
+              @keydown.enter="importByPart"
+            />
+          </div>
+        </div>
+        <div class="button-row" style="margin-top: 0.35rem">
           <button
             class="action-btn primary"
-            @click="importLcsc"
-            :disabled="loading || !lcscAvailable || !lcscId.trim()"
+            style="flex: 1"
+            @click="importByPart"
+            :disabled="loading || (!partMpn.trim() && !partSpn.trim() && !partLcsc.trim())"
           >
             <span class="material-icons">download</span>
-            {{ loading ? '…' : 'Import' }}
+            {{ loading ? (lookupStatus || 'Looking up…') : 'Import' }}
           </button>
+          <button
+            class="action-btn secondary"
+            @click="partMpn = ''; partSpn = ''; partLcsc = ''; cadSources = []; octopartUrl = ''; partLookupFailed = false; zipPaths = []"
+            :disabled="loading || (!partMpn.trim() && !partSpn.trim() && !partLcsc.trim())"
+            title="Clear part lookup fields"
+          >
+            <span class="material-icons">clear</span>
+          </button>
+        </div>
+
+        <!-- CAD Sources (Octopart partners + Ultra Librarian) -->
+        <div v-if="cadSources.length" class="cad-sources-panel">
+          <div class="cad-sources-header">
+            <span class="material-icons" style="font-size:0.85rem">info</span>
+            Additional CAD models available from:
+          </div>
+          <div
+            v-for="src in cadSources"
+            :key="src.partner"
+            class="cad-source-row"
+          >
+            <span class="cad-partner-name">{{ src.partner }}</span>
+            <span v-if="src.has_symbol" class="cad-badge sym" title="Symbol available">SYM</span>
+            <span v-if="src.has_footprint" class="cad-badge fp" title="Footprint available">FP</span>
+            <span v-if="src.has_3d_model" class="cad-badge model3d" title="3D model available">3D</span>
+            <a
+              v-if="src.download_url"
+              :href="src.download_url"
+              target="_blank"
+              class="cad-row-link"
+              title="Open download page"
+            >
+              <span class="material-icons" style="font-size:0.75rem">open_in_new</span>
+            </a>
+          </div>
+          <a
+            v-if="octopartUrl"
+            :href="octopartUrl + '#CadModels'"
+            target="_blank"
+            class="cad-download-link"
+          >
+            <span class="material-icons" style="font-size:0.8rem">open_in_new</span>
+            Download on Octopart
+          </a>
+
+          <!-- Import from ZIP(s) subsection -->
+          <div class="zip-import-section">
+            <div class="zip-import-header">
+              <span class="material-icons" style="font-size:0.8rem">folder_zip</span>
+              Import from downloaded ZIP file(s):
+            </div>
+            <div v-if="zipPaths.length" class="zip-paths-list">
+              <div v-for="(zp, idx) in zipPaths" :key="idx" class="zip-path-row">
+                <span class="zip-path-name" :title="zp">{{ zp.split(/[\\/]/).pop() }}</span>
+                <button class="zip-remove-btn" @click="removeZipPath(idx)" title="Remove">
+                  <span class="material-icons" style="font-size:0.7rem">close</span>
+                </button>
+              </div>
+            </div>
+            <div class="zip-import-actions">
+              <button
+                class="action-btn secondary"
+                @click="browseZips"
+                :disabled="loading"
+                style="flex:1"
+              >
+                <span class="material-icons">folder_open</span>
+                {{ zipPaths.length ? 'Add ZIP files…' : 'Select ZIP files…' }}
+              </button>
+              <button
+                class="action-btn primary"
+                @click="importZips"
+                :disabled="loading || !zipPaths.length"
+                style="flex:1"
+              >
+                <span class="material-icons">download</span>
+                {{ zipsLoading ? '…' : `Import (${zipPaths.length})` }}
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div class="section-divider"></div>
+        <!-- Fallback ZIP import when part lookup failed but no CAD sources found -->
+        <div v-if="partLookupFailed && !cadSources.length" class="cad-sources-panel">
+          <div class="cad-sources-header">
+            <span class="material-icons" style="font-size:0.85rem">info</span>
+            Part not found via EasyEDA. You can import from ZIP files downloaded from SnapEDA, Ultra Librarian, or other sources:
+          </div>
+          <div class="zip-import-section" style="margin-top: 0.2rem; padding-top: 0; border-top: none;">
+            <div v-if="zipPaths.length" class="zip-paths-list">
+              <div v-for="(zp, idx) in zipPaths" :key="idx" class="zip-path-row">
+                <span class="zip-path-name" :title="zp">{{ zp.split(/[\\/]/).pop() }}</span>
+                <button class="zip-remove-btn" @click="removeZipPath(idx)" title="Remove">
+                  <span class="material-icons" style="font-size:0.7rem">close</span>
+                </button>
+              </div>
+            </div>
+            <div class="zip-import-actions">
+              <button
+                class="action-btn secondary"
+                @click="browseZips"
+                :disabled="loading"
+                style="flex:1"
+              >
+                <span class="material-icons">folder_open</span>
+                {{ zipPaths.length ? 'Add ZIP files\u2026' : 'Select ZIP files\u2026' }}
+              </button>
+              <button
+                class="action-btn primary"
+                @click="importZips"
+                :disabled="loading || !zipPaths.length"
+                style="flex:1"
+              >
+                <span class="material-icons">download</span>
+                {{ zipsLoading ? '\u2026' : `Import (${zipPaths.length})` }}
+              </button>
+            </div>
+          </div>
+        </div>
 
-      <!-- ======== ZIP Section ======== -->
+      <div class="section-divider"></div>
       <div class="method-section">
         <div class="method-label">
           <span class="material-icons method-icon">folder_zip</span>
@@ -617,6 +853,12 @@ function handleResult(r: any) {
   align-items: center;
 }
 
+.button-row {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+}
+
 .text-input {
   flex: 1;
   min-width: 0;
@@ -636,6 +878,27 @@ function handleResult(r: any) {
 
 .text-input:disabled {
   opacity: 0.6;
+}
+
+/* ===== Part-lookup fields ===== */
+.part-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.part-fields .input-row {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.field-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  min-width: 2.5rem;
+  flex-shrink: 0;
 }
 
 /* ===== Buttons ===== */
@@ -905,5 +1168,174 @@ code {
 
 .spinning {
   animation: spin 1s linear infinite;
+}
+
+/* ===== CAD Sources Panel ===== */
+
+.cad-sources-panel {
+  margin-top: 0.4rem;
+  padding: 0.45rem;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--accent-color);
+}
+
+.cad-sources-header {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.35rem;
+  line-height: 1.3;
+}
+
+.cad-source-row {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.3rem;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 0.68rem;
+}
+
+.cad-source-row:last-of-type {
+  border-bottom: none;
+}
+
+.cad-partner-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  flex: 1;
+}
+
+.cad-row-link {
+  color: var(--accent-color);
+  display: flex;
+  align-items: center;
+  text-decoration: none;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+
+.cad-row-link:hover {
+  opacity: 1;
+}
+
+.cad-badge {
+  display: inline-block;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.55rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.cad-badge.sym {
+  background: #1b5e20;
+  color: #e8f5e9;
+}
+
+.cad-badge.fp {
+  background: #0d47a1;
+  color: #e3f2fd;
+}
+
+.cad-badge.model3d {
+  background: #e65100;
+  color: #fff3e0;
+}
+
+.cad-download-link {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.35rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--accent-color);
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent-color);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.15s;
+  justify-content: center;
+}
+
+.cad-download-link:hover {
+  background: var(--accent-color);
+  color: #fff;
+}
+
+/* ===== ZIP Import inside CAD Sources ===== */
+
+.zip-import-section {
+  margin-top: 0.45rem;
+  padding-top: 0.4rem;
+  border-top: 1px dashed var(--border-color);
+}
+
+.zip-import-header {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 0.3rem;
+}
+
+.zip-paths-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-bottom: 0.3rem;
+}
+
+.zip-path-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.15rem 0.3rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 0.65rem;
+}
+
+.zip-path-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.zip-remove-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 2px;
+  flex-shrink: 0;
+  padding: 0;
+}
+
+.zip-remove-btn:hover {
+  background: color-mix(in srgb, #e74c3c 20%, transparent);
+  color: #e74c3c;
+}
+
+.zip-import-actions {
+  display: flex;
+  gap: 0.3rem;
 }
 </style>

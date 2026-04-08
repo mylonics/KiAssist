@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue';
+import { ref, watch, nextTick } from 'vue';
 import type { ImportedComponent } from '../types/importer';
 import KicadPreview from './KicadPreview.vue';
 import ModelPreview from './ModelPreview.vue';
@@ -57,21 +57,48 @@ interface FpSearchResult {
 
 const fpSearchResults = ref<FpSearchResult[]>([]);
 const fpSearchLoading = ref(false);
-const fpDropdownVisible = ref(false);
+const fpSearchActive = ref(false);
+const fpSearchQuery = ref('');
+const fpSearchInputRef = ref<HTMLInputElement | null>(null);
+const fpOriginalValue = ref('');
+const libReloading = ref(false);
+const selectedFpSexpr = ref('');
+const selectedFpName = ref('');
+const selectedFpStepData = ref('');
+const selectedFpModelTransform = ref<{ offset: {x:number,y:number,z:number}, scale: {x:number,y:number,z:number}, rotate: {x:number,y:number,z:number} } | null>(null);
+const selectedFpLoading = ref(false);
 let fpSearchTimer: ReturnType<typeof setTimeout> | null = null;
 
-function onFpInput(row: FieldRow) {
+/** Toggle the search panel open/closed */
+function toggleFpSearch(row: FieldRow) {
+  if (fpSearchActive.value) {
+    closeFpSearch();
+    return;
+  }
+  // Store original value on first activation
+  if (!fpOriginalValue.value) {
+    fpOriginalValue.value = row.value;
+  }
+  fpSearchActive.value = true;
+  fpSearchQuery.value = '';
+  fpSearchResults.value = [];
+  nextTick(() => { fpSearchInputRef.value?.focus(); });
+}
+
+function closeFpSearch() {
+  fpSearchActive.value = false;
+  fpSearchResults.value = [];
+  fpSearchQuery.value = '';
+}
+
+function onFpSearchInput() {
   if (fpSearchTimer) clearTimeout(fpSearchTimer);
-  const raw = row.value.trim();
-  // Strip library prefix if present (e.g. "Package_SO:SOIC-8" → "SOIC-8")
-  const query = raw.includes(':') ? raw.split(':').pop()!.trim() : raw;
+  const query = fpSearchQuery.value.trim();
   if (!query) {
     fpSearchResults.value = [];
-    fpDropdownVisible.value = false;
     return;
   }
   fpSearchLoading.value = true;
-  fpDropdownVisible.value = true;
   fpSearchTimer = setTimeout(() => searchFootprints(query), 300);
 }
 
@@ -97,22 +124,60 @@ async function searchFootprints(query: string) {
 
 function selectFootprint(row: FieldRow, result: FpSearchResult) {
   row.value = `${result.library}:${result.name}`;
-  fpDropdownVisible.value = false;
-  fpSearchResults.value = [];
+  closeFpSearch();
+  // Fetch the selected footprint's sexpr for side-by-side preview
+  fetchSelectedFpSexpr(result.library, result.name);
 }
 
-function onFpFocus(row: FieldRow) {
-  if (row.value.trim()) {
-    // Trigger a search on focus if there is already text
-    onFpInput(row);
+async function reloadLibraries() {
+  const api = getApi();
+  if (!api) return;
+  libReloading.value = true;
+  try {
+    await api.importer_reload_libraries();
+  } catch { /* ignore */ }
+  finally {
+    libReloading.value = false;
   }
 }
 
-function onFpBlur() {
-  // Delay hiding so click on dropdown item registers first
-  setTimeout(() => {
-    fpDropdownVisible.value = false;
-  }, 200);
+async function fetchSelectedFpSexpr(library: string, name: string) {
+  const api = getApi();
+  if (!api) return;
+  selectedFpLoading.value = true;
+  selectedFpName.value = `${library}:${name}`;
+  selectedFpSexpr.value = '';
+  selectedFpStepData.value = '';
+  selectedFpModelTransform.value = null;
+  try {
+    const r = await api.importer_get_footprint_sexpr(library, name);
+    if (r?.success) {
+      selectedFpSexpr.value = r.sexpr ?? '';
+      selectedFpStepData.value = r.step_data ?? '';
+      selectedFpModelTransform.value = r.model_transform ?? null;
+    }
+  } catch (err) {
+    console.error('[FP-fetch] error:', err);
+    selectedFpSexpr.value = '';
+    selectedFpStepData.value = '';
+    selectedFpModelTransform.value = null;
+  } finally {
+    selectedFpLoading.value = false;
+  }
+}
+
+function resetFootprint(row: FieldRow) {
+  row.value = fpOriginalValue.value;
+  selectedFpSexpr.value = '';
+  selectedFpName.value = '';
+  selectedFpStepData.value = '';
+  selectedFpModelTransform.value = null;
+  closeFpSearch();
+}
+
+/** True when the footprint value differs from the original imported value */
+function isFpModified(row: FieldRow): boolean {
+  return fpOriginalValue.value !== '' && row.value !== fpOriginalValue.value;
 }
 
 // AI symbol suggestion
@@ -132,6 +197,36 @@ const pinMapApplied = ref(false);
 const aiGenerateLoading = ref(false);
 const aiGenerateError = ref('');
 const aiGeneratedSexpr = ref('');
+
+// -----------------------------------------------------------------------
+// Add Variant (clone a template symbol with updated fields)
+// -----------------------------------------------------------------------
+
+interface LibraryInfo {
+  nickname: string;
+  uri: string;
+}
+
+interface SymbolSearchResult {
+  library: string;
+  name: string;
+  description: string;
+  value: string;
+  footprint: string;
+}
+
+const showAddVariant = ref(false);
+const variantLibraries = ref<LibraryInfo[]>([]);
+const variantSelectedLib = ref('');
+const variantTemplateQuery = ref('');
+const variantTemplateResults = ref<SymbolSearchResult[]>([]);
+const variantTemplateLoading = ref(false);
+const variantSelectedTemplate = ref<SymbolSearchResult | null>(null);
+const variantNewName = ref('');
+const variantLoading = ref(false);
+const variantError = ref('');
+const variantSuccess = ref('');
+let variantTemplateTimer: ReturnType<typeof setTimeout> | null = null;
 
 // -----------------------------------------------------------------------
 // Editable fields system
@@ -203,6 +298,9 @@ function buildFieldRows(c: ImportedComponent): FieldRow[] {
 }
 
 const fieldRows = ref<FieldRow[]>(buildFieldRows(props.component));
+
+// Initialize the original footprint value for reset support
+fpOriginalValue.value = props.component.fields.footprint || '';
 
 // Rebuild if the component prop changes
 watch(() => props.component, (c) => {
@@ -395,6 +493,137 @@ async function saveGeneratedSymbol() {
     aiGenerateError.value = e.message || 'Save failed';
   }
 }
+
+// -----------------------------------------------------------------------
+// Add Variant actions
+// -----------------------------------------------------------------------
+
+async function toggleAddVariant() {
+  showAddVariant.value = !showAddVariant.value;
+  if (showAddVariant.value && !variantLibraries.value.length) {
+    await loadVariantLibraries();
+  }
+}
+
+async function loadVariantLibraries() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_get_sym_libraries();
+    if (r?.success) {
+      variantLibraries.value = r.libraries ?? [];
+    }
+  } catch { /* ignore */ }
+}
+
+function onVariantTemplateInput() {
+  if (variantTemplateTimer) clearTimeout(variantTemplateTimer);
+  const query = variantTemplateQuery.value.trim();
+  if (!query || !variantSelectedLib.value) {
+    variantTemplateResults.value = [];
+    return;
+  }
+  variantTemplateLoading.value = true;
+  variantTemplateTimer = setTimeout(() => searchVariantTemplates(query), 300);
+}
+
+async function searchVariantTemplates(query: string) {
+  const api = getApi();
+  if (!api) {
+    variantTemplateLoading.value = false;
+    return;
+  }
+  try {
+    const r = await api.importer_search_symbols(query, variantSelectedLib.value);
+    if (r?.success) {
+      variantTemplateResults.value = r.results ?? [];
+    } else {
+      variantTemplateResults.value = [];
+    }
+  } catch {
+    variantTemplateResults.value = [];
+  } finally {
+    variantTemplateLoading.value = false;
+  }
+}
+
+function selectVariantTemplate(result: SymbolSearchResult) {
+  variantSelectedTemplate.value = result;
+  variantTemplateResults.value = [];
+  variantTemplateQuery.value = result.name;
+  // Auto-generate new name suggestion from current fields
+  autoGenerateVariantName();
+}
+
+function autoGenerateVariantName() {
+  // Build a name from fieldRows following the pcb-club pattern
+  const ref = getFieldValue('Reference');
+  const value = getFieldValue('Value');
+  const fp = getFieldValue('Footprint');
+
+  if (!ref || !value) {
+    variantNewName.value = '';
+    return;
+  }
+
+  // Extract package size from footprint (e.g. "Resistor_SMD:R_0603_..." → "0603")
+  let pkg = '';
+  const pkgMatch = fp.match(/_(\d{4})_/);
+  if (pkgMatch) pkg = pkgMatch[1];
+
+  // Try to build a descriptive name
+  let name = ref + '_' + value;
+  if (pkg) name += '_' + pkg;
+  variantNewName.value = name;
+}
+
+function getFieldValue(key: string): string {
+  const row = fieldRows.value.find(r => r.key === key);
+  return row?.value || '';
+}
+
+/** Collect current field values into a dict for the backend */
+function collectFieldsDict(): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const row of fieldRows.value) {
+    if (row.enabled && row.key && row.value) {
+      result[row.key] = row.value;
+    }
+  }
+  return result;
+}
+
+async function addVariant() {
+  const api = getApi();
+  if (!api) return;
+  if (!variantSelectedLib.value || !variantSelectedTemplate.value || !variantNewName.value.trim()) {
+    variantError.value = 'Please select a library, template symbol, and enter a name.';
+    return;
+  }
+  variantLoading.value = true;
+  variantError.value = '';
+  variantSuccess.value = '';
+  try {
+    const fields = collectFieldsDict();
+    const r = await api.importer_add_variant(
+      variantSelectedLib.value,
+      variantSelectedTemplate.value.name,
+      variantNewName.value.trim(),
+      fields,
+      '',  // target_library (same as template)
+    );
+    if (r?.success) {
+      variantSuccess.value = `Added "${r.name}" to ${r.library}`;
+      variantNewName.value = '';
+    } else {
+      variantError.value = r?.error || 'Add variant failed';
+    }
+  } catch (e: any) {
+    variantError.value = e.message || 'Add variant failed';
+  } finally {
+    variantLoading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -419,19 +648,48 @@ async function saveGeneratedSymbol() {
           </div>
           <KicadPreview :sexpr="component.symbol_sexpr" type="symbol" />
         </div>
+
+        <!-- Footprint: single viewer with comparison when a different footprint is selected -->
         <div v-if="component.footprint_sexpr" class="preview-card">
           <div class="preview-label">
             <span class="material-icons preview-label-icon">crop_square</span>
-            Footprint Preview
+            <template v-if="selectedFpSexpr">Footprint Comparison</template>
+            <template v-else>Footprint Preview</template>
           </div>
-          <KicadPreview :sexpr="component.footprint_sexpr" type="footprint" />
+          <KicadPreview
+            :sexpr="component.footprint_sexpr"
+            type="footprint"
+            :compareSexpr="selectedFpSexpr || undefined"
+            primaryLabel="Imported"
+            :compareLabel="selectedFpName || 'Selected'"
+          />
         </div>
-        <div v-if="component.step_data" class="preview-card preview-card-3d">
+        <div v-if="selectedFpLoading" class="preview-card">
+          <div class="preview-label">
+            <span class="material-icons preview-label-icon">crop_square</span>
+            Loading footprint…
+          </div>
+          <div class="fp-loading-placeholder">
+            <span class="material-icons fp-spin-icon">sync</span>
+          </div>
+        </div>
+
+        <!-- 3D Model: pass all 4 data sources; toggles inside ModelPreview -->
+        <div v-if="component.step_data || selectedFpStepData" class="preview-card preview-card-3d">
           <div class="preview-label">
             <span class="material-icons preview-label-icon">view_in_ar</span>
-            3D Model
+            <template v-if="selectedFpStepData || selectedFpSexpr">3D Model Comparison</template>
+            <template v-else>3D Model</template>
           </div>
-          <ModelPreview :stepData="component.step_data" :footprintSexpr="component.footprint_sexpr" />
+          <ModelPreview
+            :stepData="component.step_data || undefined"
+            :footprintSexpr="component.footprint_sexpr || undefined"
+            :compareStepData="selectedFpStepData || undefined"
+            :compareFootprintSexpr="selectedFpSexpr || undefined"
+            :compareModelTransform="selectedFpModelTransform || undefined"
+            primaryLabel="Imported"
+            :compareLabel="selectedFpName || 'Selected'"
+          />
         </div>
       </div>
 
@@ -495,36 +753,71 @@ async function saveGeneratedSymbol() {
                         target="_blank"
                         class="ds-link"
                       >{{ row.value }}</a>
-                      <!-- Footprint: searchable combobox -->
-                      <div v-else-if="row.key === 'Footprint'" class="fp-combo">
-                        <input
-                          v-model="row.value"
-                          class="field-input"
-                          placeholder="Search footprint library…"
-                          @input="onFpInput(row)"
-                          @focus="onFpFocus(row)"
-                          @blur="onFpBlur()"
-                        />
-                        <span v-if="fpSearchLoading" class="fp-spinner material-icons">sync</span>
-                        <div
-                          v-if="fpDropdownVisible && (fpSearchResults.length || fpSearchLoading)"
-                          ref="fpDropdownRef"
-                          class="fp-dropdown"
-                        >
-                          <div v-if="fpSearchLoading && !fpSearchResults.length" class="fp-drop-hint">
-                            Searching…
-                          </div>
-                          <div
-                            v-for="sr in fpSearchResults"
-                            :key="sr.library + ':' + sr.name"
-                            class="fp-drop-item"
-                            @mousedown.prevent="selectFootprint(row, sr)"
+                      <!-- Footprint: value + separate search -->
+                      <div v-else-if="row.key === 'Footprint'" class="fp-wrapper">
+                        <div class="fp-value-row">
+                          <input
+                            v-model="row.value"
+                            class="field-input fp-input"
+                            placeholder="Footprint name"
+                            readonly
+                          />
+                          <button
+                            v-if="isFpModified(row)"
+                            class="fp-btn fp-reset-btn"
+                            title="Reset to imported footprint"
+                            @click="resetFootprint(row)"
                           >
-                            <span class="fp-drop-lib">{{ sr.library }}</span>
-                            <span class="fp-drop-name">{{ sr.name }}</span>
+                            <span class="material-icons">undo</span>
+                          </button>
+                          <button
+                            class="fp-btn fp-search-btn"
+                            :class="{ active: fpSearchActive }"
+                            title="Search footprint libraries"
+                            @click="toggleFpSearch(row)"
+                          >
+                            <span class="material-icons">{{ fpSearchActive ? 'close' : 'search' }}</span>
+                          </button>
+                        </div>
+                        <!-- Separate search box -->
+                        <div v-if="fpSearchActive" class="fp-search-panel">
+                          <div class="fp-search-input-row">
+                            <span class="material-icons fp-search-icon">search</span>
+                            <input
+                              ref="fpSearchInputRef"
+                              v-model="fpSearchQuery"
+                              class="field-input fp-search-input"
+                              placeholder="Type to search footprints…"
+                              @input="onFpSearchInput()"
+                            />
+                            <span v-if="fpSearchLoading" class="material-icons fp-spin-icon">sync</span>
+                            <button
+                              class="fp-btn"
+                              title="Reload libraries"
+                              :disabled="libReloading"
+                              @click="reloadLibraries()"
+                            >
+                              <span class="material-icons" :class="{ 'fp-spin-icon': libReloading }">
+                                refresh
+                              </span>
+                            </button>
                           </div>
-                          <div v-if="!fpSearchLoading && !fpSearchResults.length" class="fp-drop-hint">
+                          <div v-if="fpSearchResults.length" class="fp-results">
+                            <div
+                              v-for="sr in fpSearchResults"
+                              :key="sr.library + ':' + sr.name"
+                              class="fp-drop-item"
+                              @click="selectFootprint(row, sr)"
+                            >
+                              <span class="fp-drop-lib">{{ sr.library }}</span>
+                              <span class="fp-drop-name">{{ sr.name }}</span>
+                            </div>
+                          </div>
+                          <div v-else-if="fpSearchQuery.trim() && !fpSearchLoading" class="fp-drop-hint">
                             No matches
+                          </div>
+                          <div v-else-if="!fpSearchQuery.trim() && !fpSearchLoading" class="fp-drop-hint">
+                            Start typing to search
                           </div>
                         </div>
                       </div>
@@ -556,6 +849,88 @@ async function saveGeneratedSymbol() {
               Add Field
             </button>
             <div v-if="!fieldRows.length" class="empty-hint">No field data available.</div>
+          </div>
+
+          <!-- ===== Add Variant Section ===== -->
+          <div class="detail-section">
+            <button class="add-variant-toggle" @click="toggleAddVariant">
+              <span class="material-icons section-icon">library_add</span>
+              <span class="section-label-text">Add Variant to Library</span>
+              <span class="material-icons toggle-chevron">{{ showAddVariant ? 'expand_less' : 'expand_more' }}</span>
+            </button>
+
+            <div v-if="showAddVariant" class="variant-panel">
+              <div class="variant-hint">
+                Clone a template passive symbol and apply the fields above.
+              </div>
+
+              <!-- Library selector -->
+              <label class="variant-label">Target Library</label>
+              <select v-model="variantSelectedLib" class="variant-select" @change="variantSelectedTemplate = null; variantTemplateQuery = ''; variantTemplateResults = []">
+                <option value="">— Select library —</option>
+                <option v-for="lib in variantLibraries" :key="lib.nickname" :value="lib.nickname">
+                  {{ lib.nickname }}
+                </option>
+              </select>
+
+              <!-- Template symbol search -->
+              <label class="variant-label">Template Symbol</label>
+              <div class="variant-search-row">
+                <input
+                  v-model="variantTemplateQuery"
+                  class="field-input variant-search-input"
+                  :placeholder="variantSelectedLib ? 'Search symbols in ' + variantSelectedLib + '…' : 'Select a library first'"
+                  :disabled="!variantSelectedLib"
+                  @input="onVariantTemplateInput()"
+                />
+                <span v-if="variantTemplateLoading" class="material-icons fp-spin-icon">sync</span>
+              </div>
+              <div v-if="variantSelectedTemplate" class="variant-template-badge">
+                <span class="material-icons" style="font-size: 14px">check_circle</span>
+                {{ variantSelectedTemplate.name }}
+                <span v-if="variantSelectedTemplate.value" class="variant-template-val">({{ variantSelectedTemplate.value }})</span>
+              </div>
+              <div v-if="variantTemplateResults.length" class="variant-results">
+                <div
+                  v-for="sr in variantTemplateResults"
+                  :key="sr.library + ':' + sr.name"
+                  class="fp-drop-item"
+                  @click="selectVariantTemplate(sr)"
+                >
+                  <span class="fp-drop-name">{{ sr.name }}</span>
+                  <span v-if="sr.value" class="fp-drop-lib">{{ sr.value }}</span>
+                </div>
+              </div>
+
+              <!-- New symbol name -->
+              <label class="variant-label">New Symbol Name</label>
+              <input
+                v-model="variantNewName"
+                class="field-input variant-name-input"
+                placeholder="e.g. R_4.7k_0603_0.1W_1%"
+              />
+
+              <!-- Action -->
+              <div class="variant-actions">
+                <button
+                  class="action-btn primary"
+                  @click="addVariant"
+                  :disabled="variantLoading || !variantSelectedLib || !variantSelectedTemplate || !variantNewName.trim()"
+                >
+                  <span class="material-icons">{{ variantLoading ? 'sync' : 'library_add' }}</span>
+                  {{ variantLoading ? 'Adding…' : 'Add Variant' }}
+                </button>
+              </div>
+
+              <div v-if="variantSuccess" class="notice success" style="margin-top: 0.5rem">
+                <span class="material-icons">check_circle</span>
+                {{ variantSuccess }}
+              </div>
+              <div v-if="variantError" class="notice error" style="margin-top: 0.5rem">
+                <span class="material-icons">error_outline</span>
+                {{ variantError }}
+              </div>
+            </div>
           </div>
 
           <!-- Files -->
@@ -849,6 +1224,14 @@ async function saveGeneratedSymbol() {
   min-height: 300px;
 }
 
+.fp-loading-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 150px;
+  color: var(--text-secondary);
+}
+
 .preview-label {
   display: flex;
   align-items: center;
@@ -1063,37 +1446,120 @@ async function saveGeneratedSymbol() {
   text-decoration: underline;
 }
 
-/* Footprint combobox */
-.fp-combo {
-  position: relative;
+/* Footprint field */
+.fp-wrapper {
   width: 100%;
 }
 
-.fp-spinner {
-  position: absolute;
-  right: 4px;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 0.85rem;
-  color: var(--text-secondary);
-  animation: fp-spin 0.8s linear infinite;
-  pointer-events: none;
+.fp-value-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 0;
 }
-@keyframes fp-spin { to { transform: translateY(-50%) rotate(360deg); } }
 
-.fp-dropdown {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 100%;
-  z-index: 100;
-  max-height: 200px;
-  overflow-y: auto;
+.fp-input {
+  flex: 1;
+  border-top-right-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+  min-width: 0;
+}
+
+.fp-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 0.2rem 0.3rem;
+  border: 1px solid var(--border-color);
+  border-left: none;
+  background-color: var(--bg-tertiary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+
+.fp-btn:last-child {
+  border-top-right-radius: var(--radius-sm, 3px);
+  border-bottom-right-radius: var(--radius-sm, 3px);
+}
+
+.fp-btn .material-icons {
+  font-size: 0.9rem;
+}
+
+.fp-btn:hover:not(:disabled) {
   background-color: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.fp-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.fp-search-btn:hover:not(:disabled) {
+  color: var(--accent-color);
+}
+
+.fp-search-btn.active {
+  background-color: var(--accent-color);
+  color: #fff;
+  border-color: var(--accent-color);
+}
+
+.fp-reset-btn:hover {
+  color: #e5a33a;
+}
+
+/* Search panel (separate from the value field) */
+.fp-search-panel {
+  margin-top: 0.3rem;
   border: 1px solid var(--accent-color);
-  border-top: none;
-  border-radius: 0 0 var(--radius-sm, 3px) var(--radius-sm, 3px);
-  box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+  border-radius: var(--radius-sm, 3px);
+  background-color: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.fp-search-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.4rem;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-tertiary);
+}
+
+.fp-search-icon {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.fp-search-input {
+  flex: 1;
+  border: none !important;
+  background: transparent !important;
+  padding: 0.15rem 0 !important;
+  min-width: 0;
+}
+
+.fp-search-input:focus {
+  outline: none;
+  border: none !important;
+}
+
+.fp-spin-icon {
+  font-size: 0.85rem;
+  animation: fp-spin 0.8s linear infinite;
+}
+
+@keyframes fp-spin { to { transform: rotate(360deg); } }
+
+.fp-results {
+  max-height: 50vh;
+  overflow-y: auto;
 }
 
 .fp-drop-item {
@@ -1445,5 +1911,120 @@ tr.unmapped {
   overflow-y: auto;
   margin: 0;
   border-bottom: 1px solid var(--border-color);
+}
+
+/* ===== Add Variant Section ===== */
+.add-variant-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  padding: 0.5rem 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-weight: 700;
+  font-size: 0.82rem;
+}
+
+.add-variant-toggle:hover {
+  color: var(--accent-color);
+}
+
+.section-label-text {
+  flex: 1;
+  text-align: left;
+}
+
+.toggle-chevron {
+  font-size: 1.1rem;
+  color: var(--text-secondary);
+}
+
+.variant-panel {
+  padding: 0.5rem 0;
+}
+
+.variant-hint {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.5rem;
+  font-style: italic;
+}
+
+.variant-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 0.5rem 0 0.25rem;
+}
+
+.variant-select {
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+}
+
+.variant-search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.variant-search-input {
+  flex: 1;
+}
+
+.variant-template-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.3rem;
+  padding: 0.25rem 0.5rem;
+  background: color-mix(in srgb, var(--accent-color) 12%, var(--bg-tertiary));
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  color: var(--accent-color);
+}
+
+.variant-template-val {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.variant-results {
+  max-height: 150px;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  margin-top: 0.25rem;
+  background-color: var(--bg-input);
+}
+
+.variant-name-input {
+  width: 100%;
+}
+
+.variant-actions {
+  margin-top: 0.6rem;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.notice.success {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, #27ae60 10%, var(--bg-tertiary));
+  color: #27ae60;
 }
 </style>

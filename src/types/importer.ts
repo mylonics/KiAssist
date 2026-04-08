@@ -15,6 +15,18 @@ export interface ImportedFields {
   extra: Record<string, string>;
 }
 
+/** Alternative CAD model source discovered on Octopart. */
+export interface CadSource {
+  partner: string;
+  has_symbol: boolean;
+  has_footprint: boolean;
+  has_3d_model: boolean;
+  preview_symbol: string;
+  preview_footprint: string;
+  preview_3d: string;
+  download_url: string;
+}
+
 export interface ImportedComponent {
   name: string;
   import_method: string;

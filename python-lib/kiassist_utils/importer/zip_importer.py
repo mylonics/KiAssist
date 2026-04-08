@@ -244,6 +244,15 @@ def import_zip(
         sym_text = sym_path.read_text(encoding="utf-8") if sym_path else ""
         fp_text = fp_path.read_text(encoding="utf-8") if fp_path else ""
 
+        # Extract the footprint name from the S-expression if not already set
+        if fp_text and not fields.footprint:
+            import re as _re
+            m = _re.search(r'\(footprint\s+"([^"]+)"', fp_text)
+            if not m:
+                m = _re.search(r'\(module\s+"([^"]+)"', fp_text)
+            if m:
+                fields.footprint = m.group(1)
+
         component = ImportedComponent(
             name=fields.mpn or name_hint,
             fields=fields,

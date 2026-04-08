@@ -22,16 +22,19 @@ Typical usage::
             )
 """
 
-from .models import FieldSet, ImportedComponent, ImportMethod, ImportResult
+from .models import CadSource, FieldSet, ImportedComponent, ImportMethod, ImportResult
 from .field_normalizer import normalize_fields
 from .lcsc_importer import import_lcsc, is_available as lcsc_available
 from .zip_importer import import_zip, import_zip_bytes
+from .part_lookup import lookup_part, import_by_part
 from .kicad_lib_importer import (
     search_symbols,
     search_footprints,
     import_from_symbol_lib,
     import_from_footprint_lib,
+    add_variant,
 )
+from .library_index import LibraryIndex
 from .library_writer import commit_import
 from .ai_symbol import (
     SymbolSuggestion,
@@ -56,10 +59,15 @@ __all__ = [
     "lcsc_available",
     "import_zip",
     "import_zip_bytes",
+    "lookup_part",
+    "import_by_part",
     "search_symbols",
     "search_footprints",
     "import_from_symbol_lib",
     "import_from_footprint_lib",
+    "add_variant",
+    # Index
+    "LibraryIndex",
     # Writing
     "commit_import",
     # AI helpers

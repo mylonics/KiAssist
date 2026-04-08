@@ -35,6 +35,7 @@ export interface StreamPollResult extends ApiResult {
   text?: string;
   thinking?: string;
   done?: boolean;
+  tool_activity?: string;
 }
 
 export interface LLMLogEntry {

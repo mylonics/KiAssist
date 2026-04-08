@@ -157,7 +157,10 @@ class KiAssistAPI:
         self._stream_in_thinking = False
         self._stream_done = True
         self._stream_error = None
+        self._stream_tool_activity: Optional[str] = None  # e.g. "Searching the web…"
         self._stream_cancel = threading.Event()
+        # Part import progress (polled by frontend)
+        self._import_progress = ""
         # Persistent event loop for async streaming (avoids closing the loop
         # between calls which would destroy the genai client's async session)
         self._async_loop = asyncio.new_event_loop()
@@ -165,6 +168,12 @@ class KiAssistAPI:
             target=self._async_loop.run_forever, daemon=True
         )
         self._async_thread.start()
+
+        # Pre-built library index for fast symbol/footprint search
+        from .importer.library_index import LibraryIndex
+        self._library_index = LibraryIndex()
+        # Start building the index in the background immediately
+        self._library_index.build_async()
 
         # Restore persisted model selections from config
         self._restore_model_selections()
@@ -1056,6 +1065,66 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    # ------------------------------------------------------------------
+    # Built-in tool schemas for the chat stream
+    # ------------------------------------------------------------------
+
+    _WEB_SEARCH_TOOL_SCHEMA = {
+        "name": "web_search",
+        "description": (
+            "Search the web for information about electronic components, "
+            "datasheets, PCB design techniques, or any other technical topic. "
+            "Use this tool when the user asks about specific components, needs "
+            "product recommendations, wants to compare parts, or asks questions "
+            "that require up-to-date information from the internet."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "The search query. Be specific and include relevant "
+                        "technical terms (e.g. 'TXS0108E 8-channel bidirectional "
+                        "level shifter datasheet')."
+                    ),
+                },
+            },
+            "required": ["query"],
+        },
+    }
+
+    _BUILTIN_TOOL_SCHEMAS = [_WEB_SEARCH_TOOL_SCHEMA]
+
+    def _execute_builtin_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+        """Execute a built-in tool and return the result as a string.
+
+        Args:
+            name: Tool name (e.g. ``"web_search"``).
+            arguments: Parsed arguments dict.
+
+        Returns:
+            String result to feed back to the model.
+        """
+        if name == "web_search":
+            from .web_search import web_search
+            query = arguments.get("query", "")
+            if not query:
+                return "Error: empty search query."
+            results = web_search(query)
+            if not results:
+                return f"No web search results found for: {query}"
+            # Format results for the model
+            lines = [f"Web search results for: {query}\n"]
+            for i, r in enumerate(results, 1):
+                lines.append(
+                    f"[{i}] {r.get('title', 'Untitled')}\n"
+                    f"    URL: {r.get('url', '')}\n"
+                    f"    {r.get('snippet', '').strip()}"
+                )
+            return "\n".join(lines)
+        return f"Error: unknown tool '{name}'."
+
     def start_stream_message(self, message: str, model: Optional[str] = None, raw_mode: bool = False) -> dict:
         """Start streaming a response from the active AI provider in a background thread.
 
@@ -1064,6 +1133,11 @@ class KiAssistAPI:
         The full conversation history from the current session is sent to the
         AI provider so it has context from prior turns, along with a system
         prompt containing project/PCB environment information.
+
+        When the provider supports tool calling, a ``web_search`` tool is
+        made available so the model can search the web for component data,
+        datasheets, and other technical information without requiring a
+        separate UI panel.
 
         When *raw_mode* is ``True``, only the user message is sent to the
         provider—no system prompt or conversation history is included.
@@ -1099,6 +1173,7 @@ class KiAssistAPI:
                 self._stream_in_thinking = False
                 self._stream_done = False
                 self._stream_error = None
+                self._stream_tool_activity = None
 
             if raw_mode:
                 # Raw mode: send only the bare user message, no history or system prompt
@@ -1111,6 +1186,13 @@ class KiAssistAPI:
                 system_prompt = self._build_system_prompt()
             cancel_event = self._stream_cancel
 
+            # Determine whether to offer built-in tools to the model
+            use_tools = (
+                not raw_mode
+                and provider.supports_tool_calling()
+            )
+            tool_schemas = self._BUILTIN_TOOL_SCHEMAS if use_tools else None
+
             log_id = llm_logger.start(
                 provider=self.current_provider_name,
                 model=model or self.current_model,
@@ -1119,20 +1201,101 @@ class KiAssistAPI:
                 is_stream=True,
             )
 
+            # Maximum number of tool-call round-trips before giving up
+            max_tool_rounds = 5
+
             def _run_stream():
                 async def _async_stream():
+                    nonlocal msgs
                     try:
                         last_usage = {}
-                        async for chunk in provider.chat_stream(
-                            msgs, system_prompt=system_prompt
-                        ):
+                        tool_round = 0
+
+                        while True:
+                            accumulated_tool_calls = []
+                            async for chunk in provider.chat_stream(
+                                msgs,
+                                tools=tool_schemas,
+                                system_prompt=system_prompt,
+                            ):
+                                if cancel_event.is_set():
+                                    break
+                                if chunk.text:
+                                    with self._stream_lock:
+                                        self._process_stream_chunk(chunk.text)
+                                if chunk.tool_calls:
+                                    accumulated_tool_calls = chunk.tool_calls
+                                if chunk.usage:
+                                    last_usage = chunk.usage
+
                             if cancel_event.is_set():
                                 break
-                            if chunk.text:
+
+                            # If no tool calls, we're done
+                            if not accumulated_tool_calls or not use_tools:
+                                break
+
+                            # Safety: limit tool round-trips
+                            tool_round += 1
+                            if tool_round > max_tool_rounds:
+                                logger.warning(
+                                    "Exceeded max tool rounds (%d); stopping.",
+                                    max_tool_rounds,
+                                )
+                                break
+
+                            # Execute tool calls and feed results back
+                            from .ai.base import AIToolCall, AIToolResult
+
+                            # Append assistant message with tool calls
+                            with self._stream_lock:
+                                assistant_text = self._stream_buffer
+
+                            msgs.append(AIMessage(
+                                role="assistant",
+                                content=assistant_text,
+                                tool_calls=accumulated_tool_calls,
+                            ))
+
+                            # Execute each tool call
+                            tool_results = []
+                            for tc in accumulated_tool_calls:
+                                # Notify the frontend about the tool activity
+                                activity_label = {
+                                    "web_search": "Searching the web\u2026",
+                                }.get(tc.name, f"Running {tc.name}\u2026")
                                 with self._stream_lock:
-                                    self._process_stream_chunk(chunk.text)
-                            if chunk.usage:
-                                last_usage = chunk.usage
+                                    self._stream_tool_activity = activity_label
+
+                                logger.info(
+                                    "Executing built-in tool: %s(%s)",
+                                    tc.name, tc.arguments,
+                                )
+                                result_text = self._execute_builtin_tool(
+                                    tc.name, tc.arguments,
+                                )
+                                tool_results.append(AIToolResult(
+                                    tool_call_id=tc.id,
+                                    content=result_text,
+                                    is_error=result_text.startswith("Error:"),
+                                ))
+
+                            # Clear tool activity before re-streaming
+                            with self._stream_lock:
+                                self._stream_tool_activity = None
+
+                            # Append tool results to conversation
+                            msgs.append(AIMessage(
+                                role="tool",
+                                tool_results=tool_results,
+                            ))
+
+                            # The model will now re-stream with the search
+                            # results available.  The existing stream buffer
+                            # already contains any text the model produced
+                            # before deciding to call a tool — the next
+                            # stream iteration will append to it.
+
                     except Exception as exc:
                         with self._stream_lock:
                             self._stream_error = str(exc)
@@ -1217,13 +1380,16 @@ class KiAssistAPI:
     def poll_stream(self) -> dict:
         """Poll for new streaming content."""
         with self._stream_lock:
-            return {
+            result = {
                 "success": True,
                 "text": self._stream_buffer,
                 "thinking": self._stream_thinking_buffer,
                 "done": self._stream_done,
                 "error": self._stream_error,
             }
+            if self._stream_tool_activity:
+                result["tool_activity"] = self._stream_tool_activity
+            return result
 
     # ------------------------------------------------------------------
     # LLM interaction log
@@ -1365,6 +1531,10 @@ class KiAssistAPI:
             self._requirements_manager = None
             # Start a new session for the new project
             self.current_session_id = None
+            # Rebuild library index with new project dir
+            project_dir = str(Path(new_path).parent) if new_path else None
+            self._library_index.set_project_dir(project_dir)
+            self._library_index.rebuild_async()
             return {"success": True}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -2422,6 +2592,81 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc), "warnings": []}
 
+    def importer_import_by_part(
+        self,
+        mpn: str = "",
+        spn: str = "",
+        lcsc: str = "",
+    ) -> Dict[str, Any]:
+        """Import a component by MPN, Supplier PN, or LCSC number.
+
+        Queries Octopart for cross-reference data (DigiKey PN, LCSC,
+        Mouser, datasheet, manufacturer, description) then imports
+        symbol/footprint/3D via EasyEDA if an LCSC number is available.
+
+        Args:
+            mpn: Manufacturer Part Number.
+            spn: Supplier Part Number (e.g. Digi-Key, Mouser).
+            lcsc: LCSC / EasyEDA part number.
+
+        Returns:
+            Dict with ``success``, ``component`` summary, ``warnings``,
+            and ``error`` keys.
+        """
+        try:
+            from .importer.part_lookup import import_by_part
+
+            def _push_progress(msg: str) -> None:
+                self._import_progress = msg
+
+            with tempfile.TemporaryDirectory(prefix="kiassist_part_") as tmp_dir:
+                result = import_by_part(
+                    mpn=mpn, spn=spn, lcsc=lcsc, output_dir=tmp_dir,
+                    on_progress=_push_progress,
+                )
+                if not result.success:
+                    return {
+                        "success": False,
+                        "error": result.error,
+                        "warnings": result.warnings,
+                        "cad_sources": [
+                            {
+                                "partner": s.partner,
+                                "has_symbol": s.has_symbol,
+                                "has_footprint": s.has_footprint,
+                                "has_3d_model": s.has_3d_model,
+                                "preview_symbol": s.preview_symbol,
+                                "preview_footprint": s.preview_footprint,
+                                "preview_3d": s.preview_3d,
+                                "download_url": s.download_url,
+                            }
+                            for s in (result.cad_sources or [])
+                        ],
+                        "octopart_url": result.octopart_url or "",
+                    }
+
+                # Preview-only — temp dir will be deleted, clear paths.
+                result_dict = self._import_result_to_dict(result)
+                if result_dict.get("success") and "component" in result_dict:
+                    result_dict["component"]["symbol_path"] = ""
+                    result_dict["component"]["footprint_path"] = ""
+                    result_dict["component"]["model_paths"] = []
+                logger.info(
+                    "[DEBUG] importer_import_by_part result keys=%s cad_sources=%s octopart_url=%s",
+                    list(result_dict.keys()),
+                    result_dict.get("cad_sources", "NOT_PRESENT"),
+                    result_dict.get("octopart_url", "NOT_PRESENT"),
+                )
+                return result_dict
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "warnings": []}
+        finally:
+            self._import_progress = ""
+
+    def importer_import_progress(self) -> Dict[str, Any]:
+        """Return the current part-import progress message (polled by frontend)."""
+        return {"status": self._import_progress}
+
     def importer_import_zip(
         self,
         zip_path: str,
@@ -2469,6 +2714,8 @@ class KiAssistAPI:
     ) -> Dict[str, Any]:
         """Search existing KiCad symbol libraries.
 
+        Uses the pre-built library index for near-instant results.
+
         Args:
             query: Case-insensitive substring to match.
             library_name: Restrict search to this library nickname, or ``""``
@@ -2478,14 +2725,9 @@ class KiAssistAPI:
             Dict with ``success`` and ``results`` list.
         """
         try:
-            from .importer import search_symbols
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            results = search_symbols(
+            results = self._library_index.search_symbols(
                 query,
                 library_name=library_name or None,
-                project_dir=project_dir,
             )
             return {"success": True, "results": results}
         except Exception as exc:
@@ -2498,6 +2740,8 @@ class KiAssistAPI:
     ) -> Dict[str, Any]:
         """Search existing KiCad footprint libraries.
 
+        Uses the pre-built library index for near-instant results.
+
         Args:
             query: Case-insensitive substring.
             library_name: Library nickname, or ``""`` for all.
@@ -2506,18 +2750,112 @@ class KiAssistAPI:
             Dict with ``success`` and ``results`` list.
         """
         try:
-            from .importer import search_footprints
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            results = search_footprints(
+            results = self._library_index.search_footprints(
                 query,
                 library_name=library_name or None,
-                project_dir=project_dir,
             )
             return {"success": True, "results": results}
         except Exception as exc:
             return {"success": False, "error": str(exc), "results": []}
+
+    def importer_reload_libraries(self) -> Dict[str, Any]:
+        """Rebuild the library index to pick up any changes.
+
+        Returns:
+            Dict with ``success`` and index ``status``.
+        """
+        try:
+            self._library_index.rebuild()
+            return {"success": True, "status": self._library_index.status()}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_library_index_status(self) -> Dict[str, Any]:
+        """Return the current state of the library index.
+
+        Returns:
+            Dict with ``ready``, ``building``, ``symbol_count``,
+            ``footprint_count``, and ``build_time``.
+        """
+        return self._library_index.status()
+
+    def importer_get_footprint_sexpr(
+        self,
+        library_name: str,
+        footprint_name: str,
+    ) -> Dict[str, Any]:
+        """Read a footprint's S-expression from an existing KiCad library.
+
+        Also resolves the 3-D model referenced in the footprint (if any)
+        and returns its content as base64-encoded data.
+
+        Args:
+            library_name: Library nickname (e.g. ``"Package_SO"``).
+            footprint_name: Footprint name (e.g. ``"SOIC-8_3.9x4.9mm_P1.27mm"``).
+
+        Returns:
+            Dict with ``success``, ``sexpr`` (string), optional ``step_data``
+            (base64 string), and optional ``error``.
+        """
+        try:
+            import re, base64
+            from .kicad_parser.library import LibraryDiscovery, _default_env
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            lib_path = disc.resolve_footprint_library(library_name)
+            if not lib_path:
+                return {"success": False, "error": f"Library '{library_name}' not found"}
+            mod_file = Path(lib_path) / f"{footprint_name}.kicad_mod"
+            if not mod_file.exists():
+                return {"success": False, "error": f"Footprint '{footprint_name}' not found in '{library_name}'"}
+            sexpr = mod_file.read_text(encoding="utf-8")
+
+            # --- Resolve 3-D model (STEP file) if referenced ---
+            step_data = None
+            model_transform = None
+            model_match = re.search(r'\(model\s+"([^"]+)"', sexpr)
+            if model_match:
+                model_path_raw = model_match.group(1)
+                # Expand ${VAR} using KiCad env variables
+                env = _default_env()
+                if self._current_project_path:
+                    env = {**env, "KIPRJMOD": str(Path(self._current_project_path).parent)}
+                resolved = model_path_raw
+                for var, val in env.items():
+                    resolved = resolved.replace(f"${{{var}}}", val)
+                model_file = Path(resolved)
+                if model_file.exists():
+                    raw_bytes = model_file.read_bytes()
+                    step_data = base64.b64encode(raw_bytes).decode("ascii")
+
+                # Extract offset / scale / rotate from the (model …) block
+                def _parse_xyz(tag: str) -> Optional[Dict[str, float]]:
+                    pat = rf'\({tag}\s*\(xyz\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s*\)'
+                    m = re.search(pat, sexpr)
+                    if m:
+                        return {"x": float(m.group(1)), "y": float(m.group(2)), "z": float(m.group(3))}
+                    return None
+
+                offset = _parse_xyz("offset")
+                scale = _parse_xyz("scale")
+                rotate = _parse_xyz("rotate")
+                if offset or scale or rotate:
+                    model_transform = {
+                        "offset": offset or {"x": 0, "y": 0, "z": 0},
+                        "scale": scale or {"x": 1, "y": 1, "z": 1},
+                        "rotate": rotate or {"x": 0, "y": 0, "z": 0},
+                    }
+
+            result: Dict[str, Any] = {"success": True, "sexpr": sexpr}
+            if step_data:
+                result["step_data"] = step_data
+            if model_transform:
+                result["model_transform"] = model_transform
+            return result
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
 
     def importer_import_from_kicad(
         self,
@@ -2562,6 +2900,47 @@ class KiAssistAPI:
             return self._import_result_to_dict(result)
         except Exception as exc:
             return {"success": False, "error": str(exc), "warnings": []}
+
+    def importer_add_variant(
+        self,
+        template_library: str,
+        template_symbol: str,
+        new_symbol_name: str,
+        fields: Dict[str, str] = None,
+        target_library: str = "",
+    ) -> Dict[str, Any]:
+        """Clone a template symbol and create a new variant with updated fields.
+
+        Designed for passive component libraries (e.g. pcb-club-res,
+        pcb-club-cap) where all symbols share the same graphics/pins and
+        only differ in their property values (Value, MPN, DKPN, LCSC, etc.).
+
+        Args:
+            template_library: Library nickname containing the template symbol.
+            template_symbol: Symbol name to clone as a template.
+            new_symbol_name: Name for the new symbol variant.
+            fields: Dict of property key→value to set on the new symbol.
+            target_library: Library to write to (defaults to template_library).
+
+        Returns:
+            Dict with ``success``, ``name``, ``library``, ``library_path``,
+            ``error``.
+        """
+        try:
+            from .importer.kicad_lib_importer import add_variant
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            return add_variant(
+                template_library=template_library,
+                template_symbol=template_symbol,
+                new_symbol_name=new_symbol_name,
+                fields=fields or {},
+                project_dir=project_dir,
+                target_library=target_library or None,
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
 
     def importer_open_in_kicad(self, footprint_path: str) -> Dict[str, Any]:
         """Open a footprint file in the KiCad footprint editor.
@@ -2619,6 +2998,141 @@ class KiAssistAPI:
             return {"success": True, "path": ""}
         except Exception as exc:
             return {"success": False, "error": str(exc), "path": ""}
+
+    def importer_browse_zips(self) -> Dict[str, Any]:
+        """Open a file-chooser dialog for selecting multiple ZIP files.
+
+        Returns:
+            Dict with ``success`` and ``paths`` (list of selected file paths,
+            empty list if cancelled).
+        """
+        try:
+            import webview
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No webview window available"}
+            result = windows[0].create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=("ZIP files (*.zip)", "All files (*.*)"),
+            )
+            if result:
+                return {"success": True, "paths": list(result)}
+            return {"success": True, "paths": []}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "paths": []}
+
+    def importer_import_zips(
+        self,
+        zip_paths: list,
+        target_sym_lib: str = "",
+        target_fp_lib_dir: str = "",
+        models_dir: str = "",
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """Import and merge components from multiple ZIP files.
+
+        Each ZIP may contribute a symbol, footprint, 3-D model, or metadata.
+        Results are merged into a single :class:`ImportedComponent`: the first
+        symbol found is used, the first footprint found is used, all 3-D
+        models are collected, and fields are merged (earlier ZIPs win on
+        conflicts).
+
+        Args:
+            zip_paths: List of absolute paths to ``.zip`` files.
+            target_sym_lib: Destination ``.kicad_sym`` file.
+            target_fp_lib_dir: Destination ``.pretty`` directory.
+            models_dir: Directory for 3-D model files.
+            overwrite: Replace existing entries if True.
+
+        Returns:
+            Dict with ``success``, ``component`` summary, ``warnings``, ``error``.
+        """
+        if not zip_paths:
+            return {"success": False, "error": "No ZIP files specified", "warnings": []}
+
+        try:
+            from .importer import import_zip, commit_import
+            from .importer.models import ImportedComponent, FieldSet, ImportMethod
+
+            all_warnings: list[str] = []
+            merged_component: ImportedComponent | None = None
+
+            with tempfile.TemporaryDirectory(prefix="kiassist_multzip_") as tmp_dir:
+                for i, zp in enumerate(zip_paths):
+                    sub_dir = os.path.join(tmp_dir, f"zip_{i}")
+                    os.makedirs(sub_dir, exist_ok=True)
+                    result = import_zip(zp, output_dir=sub_dir)
+                    all_warnings.extend(result.warnings)
+
+                    if not result.success:
+                        all_warnings.append(f"ZIP {os.path.basename(zp)}: {result.error}")
+                        continue
+
+                    comp = result.component
+                    if merged_component is None:
+                        # First successful ZIP becomes the base
+                        merged_component = comp
+                        merged_component.source_info = ", ".join(
+                            os.path.basename(p) for p in zip_paths
+                        )
+                    else:
+                        # Merge: fill in missing pieces from subsequent ZIPs
+                        if not merged_component.symbol_sexpr and comp.symbol_sexpr:
+                            merged_component.symbol_sexpr = comp.symbol_sexpr
+                            merged_component.symbol_path = comp.symbol_path
+                        if not merged_component.footprint_sexpr and comp.footprint_sexpr:
+                            merged_component.footprint_sexpr = comp.footprint_sexpr
+                            merged_component.footprint_path = comp.footprint_path
+                        # Always collect additional 3-D models
+                        merged_component.model_paths.extend(comp.model_paths)
+                        # Merge fields: keep existing non-empty, fill blanks
+                        mf = merged_component.fields
+                        cf = comp.fields
+                        for attr in (
+                            "mpn", "manufacturer", "digikey_pn", "mouser_pn",
+                            "lcsc_pn", "value", "reference", "footprint",
+                            "datasheet", "description", "package",
+                        ):
+                            if not getattr(mf, attr) and getattr(cf, attr):
+                                setattr(mf, attr, getattr(cf, attr))
+                        for k, v in cf.extra.items():
+                            if k not in mf.extra:
+                                mf.extra[k] = v
+
+                if merged_component is None:
+                    return {
+                        "success": False,
+                        "error": "No valid components found in the provided ZIP files",
+                        "warnings": all_warnings,
+                    }
+
+                # Build the ImportResult wrapper
+                from .importer.models import ImportResult
+                merged_result = ImportResult(
+                    success=True,
+                    component=merged_component,
+                    warnings=all_warnings,
+                )
+
+                if target_sym_lib or target_fp_lib_dir:
+                    merged_result = commit_import(
+                        merged_component,
+                        target_sym_lib=target_sym_lib or None,
+                        target_fp_lib_dir=target_fp_lib_dir or None,
+                        models_dir=models_dir or None,
+                        overwrite=overwrite,
+                    )
+                    return self._import_result_to_dict(merged_result)
+                else:
+                    result_dict = self._import_result_to_dict(merged_result)
+                    if result_dict.get("success") and "component" in result_dict:
+                        result_dict["component"]["symbol_path"] = ""
+                        result_dict["component"]["footprint_path"] = ""
+                        result_dict["component"]["model_paths"] = []
+                    return result_dict
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "warnings": []}
 
     def importer_browse_output_dir(self) -> Dict[str, Any]:
         """Open a folder-chooser dialog for the output library directory.
@@ -2969,7 +3483,7 @@ class KiAssistAPI:
             return {"success": False, "error": result.error, "warnings": result.warnings}
         comp = result.component
         fields = comp.fields
-        return {
+        data: Dict[str, Any] = {
             "success": True,
             "warnings": result.warnings,
             "component": {
@@ -2999,6 +3513,22 @@ class KiAssistAPI:
                 },
             },
         }
+        # Include alternative CAD sources (always present, may be empty)
+        data["cad_sources"] = [
+            {
+                "partner": s.partner,
+                "has_symbol": s.has_symbol,
+                "has_footprint": s.has_footprint,
+                "has_3d_model": s.has_3d_model,
+                "preview_symbol": s.preview_symbol,
+                "preview_footprint": s.preview_footprint,
+                "preview_3d": s.preview_3d,
+                "download_url": s.download_url,
+            }
+            for s in (result.cad_sources or [])
+        ]
+        data["octopart_url"] = result.octopart_url or ""
+        return data
 
     # ------------------------------------------------------------------
     # Session management

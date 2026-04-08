@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { ref, reactive, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
@@ -8,10 +8,20 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 // -----------------------------------------------------------------------
 
 const props = defineProps<{
-  /** Base64-encoded STEP file data */
-  stepData: string;
+  /** Base64-encoded STEP file data for the primary/imported component */
+  stepData?: string;
   /** Footprint S-expression string (optional – rendered as PCB board beneath the model) */
   footprintSexpr?: string;
+  /** Base64-encoded STEP data for the comparison/selected footprint's 3D model */
+  compareStepData?: string;
+  /** Footprint S-expression for the comparison/selected footprint's board */
+  compareFootprintSexpr?: string;
+  /** Label for primary items */
+  primaryLabel?: string;
+  /** Label for comparison items */
+  compareLabel?: string;
+  /** Transform (offset/scale/rotate) to apply to the comparison 3D model */
+  compareModelTransform?: { offset: {x:number,y:number,z:number}, scale: {x:number,y:number,z:number}, rotate: {x:number,y:number,z:number} };
 }>();
 
 // -----------------------------------------------------------------------
@@ -32,17 +42,41 @@ const xform = reactive({
   rotZ: 0,
 });
 
+/** Visibility toggles for the 4 renderable items */
+const visibility = reactive({
+  primaryModel: true,
+  primaryBoard: true,
+  compareModel: true,
+  compareBoard: true,
+});
+
+type VisKey = keyof typeof visibility;
+
+function toggleVis(key: VisKey) {
+  visibility[key] = !visibility[key];
+}
+
+const hasCompare = computed(() => !!props.compareStepData || !!props.compareFootprintSexpr);
+
 let renderer: THREE.WebGLRenderer | null = null;
 let scene: THREE.Scene | null = null;
 let camera: THREE.PerspectiveCamera | null = null;
 let controls: OrbitControls | null = null;
 let animFrameId = 0;
 
-/** Group that holds the STEP model – we apply xform to this */
-let modelGroup: THREE.Group | null = null;
-/** Group that holds the PCB board */
-let boardGroup: THREE.Group | null = null;
-/** All groups (model + board) – used for camera fitting */
+/** Primary (imported) STEP model – transform controls apply to this */
+let primaryModelGroup: THREE.Group | null = null;
+/** Inner transform group for user-controlled transforms on primary model */
+let primaryTransformGroup: THREE.Group | null = null;
+/** Primary (imported) PCB board */
+let primaryBoardGroup: THREE.Group | null = null;
+/** Comparison (selected) STEP model (outer container with coordinate conversion) */
+let compareModelGroup: THREE.Group | null = null;
+/** Inner transform group for KiCad 3D transforms on comparison model */
+let compareTransformGroup: THREE.Group | null = null;
+/** Comparison (selected) PCB board */
+let compareBoardGroup: THREE.Group | null = null;
+/** Root group for camera fitting */
 let rootGroup: THREE.Group | null = null;
 
 // -----------------------------------------------------------------------
@@ -118,72 +152,6 @@ function str(v: SExpr | undefined): string {
 }
 
 // -----------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------
-
-/** Decode base64 → Uint8Array */
-function b64ToUint8(b64: string): Uint8Array {
-  const bin = atob(b64);
-  const buf = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-  return buf;
-}
-
-// -----------------------------------------------------------------------
-// Build Three.js meshes from OCCT result
-// -----------------------------------------------------------------------
-
-function buildMeshesFromResult(result: any): THREE.Group {
-  const group = new THREE.Group();
-  if (!result || !result.meshes) return group;
-
-  for (const mesh of result.meshes) {
-    const geo = new THREE.BufferGeometry();
-
-    if (mesh.attributes?.position?.array) {
-      geo.setAttribute('position', new THREE.Float32BufferAttribute(mesh.attributes.position.array, 3));
-    }
-    if (mesh.attributes?.normal?.array) {
-      geo.setAttribute('normal', new THREE.Float32BufferAttribute(mesh.attributes.normal.array, 3));
-    }
-    if (mesh.index?.array) {
-      geo.setIndex(new THREE.BufferAttribute(new Uint32Array(mesh.index.array), 1));
-    }
-    if (!geo.attributes.normal) geo.computeVertexNormals();
-
-    // Use PBR material for better shading
-    let color = 0x8c8c8c;
-    let metalness = 0.1;
-    let roughness = 0.6;
-    if (mesh.color && mesh.color.length >= 3) {
-      color = new THREE.Color(mesh.color[0] / 255, mesh.color[1] / 255, mesh.color[2] / 255).getHex();
-      // Heuristic: greyish colours → more metallic
-      const avg = (mesh.color[0] + mesh.color[1] + mesh.color[2]) / 3;
-      if (avg > 120 && avg < 200
-        && Math.abs(mesh.color[0] - mesh.color[1]) < 30
-        && Math.abs(mesh.color[1] - mesh.color[2]) < 30) {
-        metalness = 0.6;
-        roughness = 0.3;
-      }
-    }
-
-    const mat = new THREE.MeshStandardMaterial({
-      color,
-      metalness,
-      roughness,
-      side: THREE.DoubleSide,
-      envMapIntensity: 0.8,
-    });
-
-    const m = new THREE.Mesh(geo, mat);
-    m.castShadow = true;
-    m.receiveShadow = true;
-    group.add(m);
-  }
-  return group;
-}
-
-// -----------------------------------------------------------------------
 // Build PCB board from footprint S-expression
 // -----------------------------------------------------------------------
 
@@ -222,8 +190,15 @@ function buildPcbBoard(sexpr: string): THREE.Group {
     allY.push(py - ph / 2, py + ph / 2);
 
     let padGeo: THREE.BufferGeometry;
-    if (padShape === 'circle' || padShape === 'oval') {
+    if (padShape === 'circle') {
       padGeo = new THREE.CylinderGeometry(pw / 2, pw / 2, 0.04, 32);
+    } else if (padShape === 'oval') {
+      // Oval / oblong pad = stadium shape (rounded rect with r = min dimension / 2)
+      const rr = Math.min(pw, ph) / 2;
+      const shape = new THREE.Shape();
+      roundedRect(shape, -pw / 2, -ph / 2, pw, ph, rr);
+      padGeo = new THREE.ExtrudeGeometry(shape, { depth: 0.04, bevelEnabled: false });
+      padGeo.rotateX(-Math.PI / 2);
     } else if (padShape === 'roundrect') {
       const rrNode = find(pad, 'roundrect_rratio');
       const ratio = rrNode ? num(rrNode[1]) : 0.25;
@@ -395,9 +370,9 @@ function fitCamera(obj: THREE.Object3D) {
   const maxDim = Math.max(size.x, size.y, size.z);
   if (maxDim === 0) return;
   const fov = camera.fov * (Math.PI / 180);
-  const dist = (maxDim / 2) / Math.tan(fov / 2) * 1.8;
+  const dist = (maxDim / 2) / Math.tan(fov / 2) * 0.85;
 
-  camera.position.set(centre.x + dist * 0.5, centre.y + dist * 0.6, centre.z + dist * 0.7);
+  camera.position.set(centre.x + dist * 0.3, centre.y + dist * 0.32, centre.z + dist * 0.36);
   camera.near = dist / 1000;
   camera.far = dist * 100;
   camera.updateProjectionMatrix();
@@ -509,8 +484,10 @@ function disposeGroup(g: THREE.Group) {
 
 function clearScene() {
   if (!rootGroup) return;
-  if (modelGroup) { disposeGroup(modelGroup); rootGroup.remove(modelGroup); modelGroup = null; }
-  if (boardGroup) { disposeGroup(boardGroup); rootGroup.remove(boardGroup); boardGroup = null; }
+  if (primaryModelGroup) { disposeGroup(primaryModelGroup); rootGroup.remove(primaryModelGroup); primaryModelGroup = null; primaryTransformGroup = null; }
+  if (primaryBoardGroup) { disposeGroup(primaryBoardGroup); rootGroup.remove(primaryBoardGroup); primaryBoardGroup = null; }
+  if (compareModelGroup) { disposeGroup(compareModelGroup); rootGroup.remove(compareModelGroup); compareModelGroup = null; compareTransformGroup = null; }
+  if (compareBoardGroup) { disposeGroup(compareBoardGroup); rootGroup.remove(compareBoardGroup); compareBoardGroup = null; }
 }
 
 // -----------------------------------------------------------------------
@@ -518,22 +495,72 @@ function clearScene() {
 // -----------------------------------------------------------------------
 
 function applyTransform() {
-  if (!modelGroup) return;
-  modelGroup.position.set(xform.offsetX, xform.offsetZ, xform.offsetY);
-  modelGroup.rotation.set(
+  if (!primaryModelGroup) return;
+  primaryModelGroup.position.set(xform.offsetX, xform.offsetZ, xform.offsetY);
+  primaryModelGroup.rotation.set(
     xform.rotX * Math.PI / 180,
     xform.rotZ * Math.PI / 180,
     xform.rotY * Math.PI / 180,
   );
 }
 
+/** Apply the footprint-defined offset / scale / rotate to the comparison model.
+ *
+ * KiCad 3D models are authored with Z-up.  The PCB board built by
+ * `buildPcbBoard` lives on the Three.js XZ plane with Y-up.  To align:
+ *
+ *   outerGroup  (rotation.x = -π/2  →  Z-up ➜ Y-up conversion)
+ *     └─ transformGroup  (KiCad offset / scale / rotate in KiCad 3D space)
+ *         └─ STEP meshes
+ */
+function buildCompareModelContainer(stepMeshes: THREE.Group): THREE.Group {
+  const deg = Math.PI / 180;
+
+  // Inner group: footprint-defined transform (operates in KiCad 3D space, Z-up)
+  compareTransformGroup = new THREE.Group();
+  const t = props.compareModelTransform;
+  if (t) {
+    compareTransformGroup.scale.set(t.scale.x, t.scale.y, t.scale.z);
+    compareTransformGroup.rotation.set(t.rotate.x * deg, t.rotate.y * deg, t.rotate.z * deg);
+    compareTransformGroup.position.set(t.offset.x, t.offset.y, t.offset.z);
+  }
+  compareTransformGroup.add(stepMeshes);
+
+  // Outer group: coordinate conversion KiCad 3D (Z-up) → Three.js (Y-up)
+  const container = new THREE.Group();
+  container.rotation.x = -Math.PI / 2;
+  container.add(compareTransformGroup);
+  return container;
+}
+
+/** Update the inner transform group when compareModelTransform prop changes */
+function updateCompareTransform() {
+  if (!compareTransformGroup) return;
+  const t = props.compareModelTransform;
+  const deg = Math.PI / 180;
+  if (t) {
+    compareTransformGroup.scale.set(t.scale.x, t.scale.y, t.scale.z);
+    compareTransformGroup.rotation.set(t.rotate.x * deg, t.rotate.y * deg, t.rotate.z * deg);
+    compareTransformGroup.position.set(t.offset.x, t.offset.y, t.offset.z);
+  } else {
+    compareTransformGroup.scale.set(1, 1, 1);
+    compareTransformGroup.rotation.set(0, 0, 0);
+    compareTransformGroup.position.set(0, 0, 0);
+  }
+}
+
 watch(xform, () => { applyTransform(); });
 
 type XformKey = 'offsetX' | 'offsetY' | 'offsetZ' | 'rotX' | 'rotY' | 'rotZ';
 
+
 function nudge(key: string, delta: number) {
   const k = key as XformKey;
-  xform[k] = Math.round((xform[k] + delta) * 1000) / 1000;
+  let val = xform[k] + delta;
+  if (k.startsWith('rot')) {
+    val = ((val % 360) + 360) % 360; // wrap 0-359
+  }
+  xform[k] = Math.round(val * 1000) / 1000;
 }
 
 function setVal(key: string, raw: string) {
@@ -543,47 +570,145 @@ function setVal(key: string, raw: string) {
 }
 
 // -----------------------------------------------------------------------
-// Load STEP + Board
+// STEP parser – runs in a Web Worker so the UI stays responsive
 // -----------------------------------------------------------------------
 
-async function loadStep(b64: string) {
+let stepWorker: Worker | null = null;
+let stepMsgId = 0;
+
+function getStepWorker(): Worker {
+  if (!stepWorker) {
+    stepWorker = new Worker(
+      new URL('../workers/stepParser.worker.ts', import.meta.url),
+      { type: 'module' },
+    );
+  }
+  return stepWorker;
+}
+
+async function parseStepB64(b64: string): Promise<THREE.Group | null> {
+  const worker = getStepWorker();
+  const id = ++stepMsgId;
+
+  return new Promise<THREE.Group | null>((resolve, reject) => {
+    const handler = (e: MessageEvent) => {
+      if (e.data.id !== id) return;
+      worker.removeEventListener('message', handler);
+      if (e.data.error) { reject(new Error(e.data.error)); return; }
+      if (!e.data.meshes) { resolve(null); return; }
+      resolve(buildMeshesFromWorker(e.data.meshes));
+    };
+    worker.addEventListener('message', handler);
+    worker.postMessage({ id, b64 });
+  });
+}
+
+/**
+ * Build Three.js meshes from the serialised worker result.
+ * The worker sends typed arrays directly (position, normal, index, color).
+ */
+function buildMeshesFromWorker(meshes: any[]): THREE.Group {
+  const group = new THREE.Group();
+  for (const mesh of meshes) {
+    const geo = new THREE.BufferGeometry();
+
+    if (mesh.position) {
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(mesh.position, 3));
+    }
+    if (mesh.normal) {
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(mesh.normal, 3));
+    }
+    if (mesh.index) {
+      geo.setIndex(new THREE.BufferAttribute(mesh.index, 1));
+    }
+    if (!geo.attributes.normal) geo.computeVertexNormals();
+
+    let color = 0x8c8c8c;
+    let metalness = 0.1;
+    let roughness = 0.6;
+    if (mesh.color && mesh.color.length >= 3) {
+      color = new THREE.Color(mesh.color[0] / 255, mesh.color[1] / 255, mesh.color[2] / 255).getHex();
+      const avg = (mesh.color[0] + mesh.color[1] + mesh.color[2]) / 3;
+      if (avg > 120 && avg < 200
+        && Math.abs(mesh.color[0] - mesh.color[1]) < 30
+        && Math.abs(mesh.color[1] - mesh.color[2]) < 30) {
+        metalness = 0.6;
+        roughness = 0.3;
+      }
+    }
+
+    const mat = new THREE.MeshStandardMaterial({
+      color,
+      metalness,
+      roughness,
+      side: THREE.DoubleSide,
+      envMapIntensity: 0.8,
+    });
+
+    const m = new THREE.Mesh(geo, mat);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    group.add(m);
+  }
+  return group;
+}
+
+// -----------------------------------------------------------------------
+// Load all models + boards
+// -----------------------------------------------------------------------
+
+async function loadAll() {
   loading.value = true;
   errorMsg.value = '';
 
   try {
-    const occtModule = await import('occt-import-js');
-    const occtFactory = occtModule.default || occtModule;
-    const occt = await occtFactory({
-      locateFile: (name: string) => {
-        if (name.endsWith('.wasm')) return '/occt-import-js.wasm';
-        return name;
-      },
-    });
-
-    const fileBuffer = b64ToUint8(b64);
-    const result = occt.ReadStepFile(fileBuffer, { linearUnit: 'millimeter' });
-
-    if (!result || !result.success) {
-      errorMsg.value = 'Failed to parse STEP file';
-      loading.value = false;
-      return;
-    }
-
     if (!scene) initScene();
     clearScene();
 
-    modelGroup = buildMeshesFromResult(result);
-    applyTransform();
-    rootGroup!.add(modelGroup);
-
-    if (props.footprintSexpr) {
-      boardGroup = buildPcbBoard(props.footprintSexpr);
-      rootGroup!.add(boardGroup);
+    // Primary STEP model
+    if (props.stepData) {
+      const stepMeshes = await parseStepB64(props.stepData);
+      if (stepMeshes) {
+        // Inner group: user-controlled transforms (KiCad 3D space, Z-up)
+        primaryTransformGroup = new THREE.Group();
+        primaryTransformGroup.add(stepMeshes);
+        // Outer group: coordinate conversion KiCad 3D (Z-up) → Three.js (Y-up)
+        primaryModelGroup = new THREE.Group();
+        primaryModelGroup.rotation.x = -Math.PI / 2;
+        primaryModelGroup.add(primaryTransformGroup);
+        primaryModelGroup.visible = visibility.primaryModel;
+        applyTransform();
+        rootGroup!.add(primaryModelGroup);
+      }
     }
 
-    fitCamera(rootGroup!);
+    // Primary board
+    if (props.footprintSexpr) {
+      primaryBoardGroup = buildPcbBoard(props.footprintSexpr);
+      primaryBoardGroup.visible = visibility.primaryBoard;
+      rootGroup!.add(primaryBoardGroup);
+    }
+
+    // Comparison STEP model
+    if (props.compareStepData) {
+      const stepMeshes = await parseStepB64(props.compareStepData);
+      if (stepMeshes) {
+        compareModelGroup = buildCompareModelContainer(stepMeshes);
+        compareModelGroup.visible = visibility.compareModel;
+        rootGroup!.add(compareModelGroup);
+      }
+    }
+
+    // Comparison board
+    if (props.compareFootprintSexpr) {
+      compareBoardGroup = buildPcbBoard(props.compareFootprintSexpr);
+      compareBoardGroup.visible = visibility.compareBoard;
+      rootGroup!.add(compareBoardGroup);
+    }
+
+    if (rootGroup) fitCamera(rootGroup);
   } catch (err: any) {
-    console.error('STEP load error:', err);
+    console.error('Model load error:', err);
     errorMsg.value = err?.message || 'Failed to load 3D model';
   } finally {
     loading.value = false;
@@ -627,7 +752,7 @@ function resetView() {
 onMounted(async () => {
   await nextTick();
   initScene();
-  if (props.stepData) loadStep(props.stepData);
+  loadAll();
 
   if (canvasContainer.value) {
     resizeObserver = new ResizeObserver(onResize);
@@ -640,19 +765,81 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   controls?.dispose();
   renderer?.dispose();
+  stepWorker?.terminate();
+  stepWorker = null;
 });
 
-watch(() => props.stepData, (val) => { if (val) loadStep(val); });
-watch(() => props.footprintSexpr, () => {
-  if (rootGroup && boardGroup) {
-    disposeGroup(boardGroup);
-    rootGroup.remove(boardGroup);
-    boardGroup = null;
+// --- Primary prop watchers ---
+watch(() => props.stepData, async (val) => {
+  if (!rootGroup) return;
+  if (primaryModelGroup) { disposeGroup(primaryModelGroup); rootGroup.remove(primaryModelGroup); primaryModelGroup = null; primaryTransformGroup = null; }
+  if (val) {
+    try {
+      loading.value = true;
+      const stepMeshes = await parseStepB64(val);
+      if (stepMeshes) {
+        primaryTransformGroup = new THREE.Group();
+        primaryTransformGroup.add(stepMeshes);
+        primaryModelGroup = new THREE.Group();
+        primaryModelGroup.rotation.x = -Math.PI / 2;
+        primaryModelGroup.add(primaryTransformGroup);
+        primaryModelGroup.visible = visibility.primaryModel;
+        applyTransform();
+        rootGroup.add(primaryModelGroup);
+        fitCamera(rootGroup);
+      }
+    } catch { /* ignore */ } finally { loading.value = false; }
   }
-  if (props.footprintSexpr && rootGroup) {
-    boardGroup = buildPcbBoard(props.footprintSexpr);
-    rootGroup.add(boardGroup);
+});
+
+watch(() => props.footprintSexpr, (val) => {
+  if (!rootGroup) return;
+  if (primaryBoardGroup) { disposeGroup(primaryBoardGroup); rootGroup.remove(primaryBoardGroup); primaryBoardGroup = null; }
+  if (val) {
+    primaryBoardGroup = buildPcbBoard(val);
+    primaryBoardGroup.visible = visibility.primaryBoard;
+    rootGroup.add(primaryBoardGroup);
   }
+});
+
+// --- Comparison prop watchers ---
+watch(() => props.compareStepData, async (val) => {
+  if (!rootGroup) return;
+  if (compareModelGroup) { disposeGroup(compareModelGroup); rootGroup.remove(compareModelGroup); compareModelGroup = null; compareTransformGroup = null; }
+  if (val) {
+    try {
+      loading.value = true;
+      const stepMeshes = await parseStepB64(val);
+      if (stepMeshes) {
+        compareModelGroup = buildCompareModelContainer(stepMeshes);
+        compareModelGroup.visible = visibility.compareModel;
+        rootGroup.add(compareModelGroup);
+        fitCamera(rootGroup);
+      }
+    } catch (err) { console.error('[ModelPreview] compare STEP parse error:', err); } finally { loading.value = false; }
+  }
+});
+
+watch(() => props.compareFootprintSexpr, (val) => {
+  if (!rootGroup) return;
+  if (compareBoardGroup) { disposeGroup(compareBoardGroup); rootGroup.remove(compareBoardGroup); compareBoardGroup = null; }
+  if (val) {
+    compareBoardGroup = buildPcbBoard(val);
+    compareBoardGroup.visible = visibility.compareBoard;
+    rootGroup.add(compareBoardGroup);
+  }
+});
+
+watch(() => props.compareModelTransform, () => {
+  updateCompareTransform();
+}, { deep: true });
+
+// --- Visibility watcher ---
+watch(visibility, () => {
+  if (primaryModelGroup) primaryModelGroup.visible = visibility.primaryModel;
+  if (primaryBoardGroup) primaryBoardGroup.visible = visibility.primaryBoard;
+  if (compareModelGroup) compareModelGroup.visible = visibility.compareModel;
+  if (compareBoardGroup) compareBoardGroup.visible = visibility.compareBoard;
 });
 </script>
 
@@ -672,36 +859,55 @@ watch(() => props.footprintSexpr, () => {
     <!-- Canvas -->
     <div ref="canvasContainer" class="canvas-container"></div>
 
+    <!-- Visibility toggles -->
+    <div v-if="!loading && !errorMsg" class="visibility-panel">
+      <div class="vis-group">
+        <span class="vis-group-label">{{ primaryLabel || 'Imported' }}</span>
+        <button v-if="stepData" class="vis-btn" :class="{ active: visibility.primaryModel }" @click="toggleVis('primaryModel')" title="Toggle imported 3D model">
+          <span class="material-icons vis-icon">view_in_ar</span>
+        </button>
+        <button v-if="footprintSexpr" class="vis-btn" :class="{ active: visibility.primaryBoard }" @click="toggleVis('primaryBoard')" title="Toggle imported PCB board">
+          <span class="material-icons vis-icon">developer_board</span>
+        </button>
+      </div>
+      <template v-if="hasCompare">
+        <div class="vis-divider"></div>
+        <div class="vis-group">
+          <span class="vis-group-label">{{ compareLabel || 'Selected' }}</span>
+          <button v-if="compareStepData" class="vis-btn" :class="{ active: visibility.compareModel }" @click="toggleVis('compareModel')" title="Toggle comparison 3D model">
+            <span class="material-icons vis-icon">view_in_ar</span>
+          </button>
+          <button v-if="compareFootprintSexpr" class="vis-btn" :class="{ active: visibility.compareBoard }" @click="toggleVis('compareBoard')" title="Toggle comparison PCB board">
+            <span class="material-icons vis-icon">developer_board</span>
+          </button>
+        </div>
+      </template>
+    </div>
+
     <!-- Transform controls -->
     <div v-if="!loading && !errorMsg" class="xform-panel">
       <div class="xform-group">
         <div class="xform-section-label">Pos mm</div>
         <div class="xform-row">
           <label>X</label>
-          <button class="xform-btn" @click="nudge('offsetX', -1)" title="-1">-1</button>
           <button class="xform-btn xform-btn-sm" @click="nudge('offsetX', -0.1)" title="-.1">-.1</button>
+          <button class="xform-btn xform-btn-sm" @click="nudge('offsetX', 0.1)" title="+.1">.1</button>
           <input type="number" class="xform-input" :value="xform.offsetX.toFixed(2)" step="0.1"
             @change="setVal('offsetX', ($event.target as HTMLInputElement).value)" />
-          <button class="xform-btn xform-btn-sm" @click="nudge('offsetX', 0.1)" title="+.1">.1</button>
-          <button class="xform-btn" @click="nudge('offsetX', 1)" title="+1">+1</button>
         </div>
         <div class="xform-row">
           <label>Y</label>
-          <button class="xform-btn" @click="nudge('offsetY', -1)" title="-1">-1</button>
           <button class="xform-btn xform-btn-sm" @click="nudge('offsetY', -0.1)" title="-.1">-.1</button>
+          <button class="xform-btn xform-btn-sm" @click="nudge('offsetY', 0.1)" title="+.1">.1</button>
           <input type="number" class="xform-input" :value="xform.offsetY.toFixed(2)" step="0.1"
             @change="setVal('offsetY', ($event.target as HTMLInputElement).value)" />
-          <button class="xform-btn xform-btn-sm" @click="nudge('offsetY', 0.1)" title="+.1">.1</button>
-          <button class="xform-btn" @click="nudge('offsetY', 1)" title="+1">+1</button>
         </div>
         <div class="xform-row">
           <label>Z</label>
-          <button class="xform-btn" @click="nudge('offsetZ', -1)" title="-1">-1</button>
           <button class="xform-btn xform-btn-sm" @click="nudge('offsetZ', -0.1)" title="-.1">-.1</button>
+          <button class="xform-btn xform-btn-sm" @click="nudge('offsetZ', 0.1)" title="+.1">.1</button>
           <input type="number" class="xform-input" :value="xform.offsetZ.toFixed(2)" step="0.1"
             @change="setVal('offsetZ', ($event.target as HTMLInputElement).value)" />
-          <button class="xform-btn xform-btn-sm" @click="nudge('offsetZ', 0.1)" title="+.1">.1</button>
-          <button class="xform-btn" @click="nudge('offsetZ', 1)" title="+1">+1</button>
         </div>
       </div>
       <div class="xform-divider-v"></div>
@@ -710,23 +916,23 @@ watch(() => props.footprintSexpr, () => {
         <div class="xform-row">
           <label>X</label>
           <button class="xform-btn" @click="nudge('rotX', -90)" title="-90°">-90</button>
+          <button class="xform-btn" @click="nudge('rotX', 90)" title="+90°">+90</button>
           <input type="number" class="xform-input" :value="xform.rotX.toFixed(0)" step="1"
             @change="setVal('rotX', ($event.target as HTMLInputElement).value)" />
-          <button class="xform-btn" @click="nudge('rotX', 90)" title="+90°">+90</button>
         </div>
         <div class="xform-row">
           <label>Y</label>
           <button class="xform-btn" @click="nudge('rotY', -90)" title="-90°">-90</button>
+          <button class="xform-btn" @click="nudge('rotY', 90)" title="+90°">+90</button>
           <input type="number" class="xform-input" :value="xform.rotY.toFixed(0)" step="1"
             @change="setVal('rotY', ($event.target as HTMLInputElement).value)" />
-          <button class="xform-btn" @click="nudge('rotY', 90)" title="+90°">+90</button>
         </div>
         <div class="xform-row">
           <label>Z</label>
           <button class="xform-btn" @click="nudge('rotZ', -90)" title="-90°">-90</button>
+          <button class="xform-btn" @click="nudge('rotZ', 90)" title="+90°">+90</button>
           <input type="number" class="xform-input" :value="xform.rotZ.toFixed(0)" step="1"
             @change="setVal('rotZ', ($event.target as HTMLInputElement).value)" />
-          <button class="xform-btn" @click="nudge('rotZ', 90)" title="+90°">+90</button>
         </div>
       </div>
       <button class="xform-reset" @click="resetView" title="Reset">
@@ -913,5 +1119,82 @@ watch(() => props.footprintSexpr, () => {
 .xform-reset:hover {
   background: rgba(255, 255, 255, 0.12);
   color: #fff;
+}
+
+/* ---- Visibility panel ---- */
+.visibility-panel {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(20, 20, 30, 0.85);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  padding: 4px 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 3;
+  user-select: none;
+}
+
+.vis-group {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.vis-group-label {
+  font-size: 8px;
+  font-weight: 600;
+  color: #8af;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  margin-right: 2px;
+  max-width: 60px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vis-divider {
+  width: 1px;
+  height: 20px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.vis-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #555;
+  cursor: pointer;
+  transition: all 0.15s;
+  padding: 0;
+}
+
+.vis-btn.active {
+  color: #8af;
+  background: rgba(106, 159, 255, 0.15);
+  border-color: rgba(106, 159, 255, 0.3);
+}
+
+.vis-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ccc;
+}
+
+.vis-btn.active:hover {
+  background: rgba(106, 159, 255, 0.25);
+  color: #adf;
+}
+
+.vis-icon {
+  font-size: 15px;
 }
 </style>

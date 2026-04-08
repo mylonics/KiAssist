@@ -221,6 +221,17 @@ def import_lcsc(
             except Exception as exc:
                 warnings.append(f"Footprint format upgrade failed (kept original): {exc}")
 
+        # Extract the footprint name from the S-expression so the Footprint
+        # field is populated with the EasyEDA-generated name (e.g.
+        # "VSSOP-10_L3.0-W3.0-P0.50-LS4.9-BL").
+        if fp_text and not fields.footprint:
+            import re as _re
+            m = _re.search(r'\(footprint\s+"([^"]+)"', fp_text)
+            if not m:
+                m = _re.search(r'\(module\s+"([^"]+)"', fp_text)
+            if m:
+                fields.footprint = m.group(1)
+
         component = ImportedComponent(
             name=fields.mpn or lcsc_id,
             fields=fields,

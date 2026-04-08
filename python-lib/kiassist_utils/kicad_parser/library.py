@@ -48,51 +48,97 @@ def _atom(tree: List[SExpr], tag: str, default: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
+def _find_latest_version_dir(base: Path) -> Optional[Path]:
+    """Return the highest versioned kicad sub-directory under *base*.
+
+    Scans for directories whose names look like ``X.Y`` (e.g. ``10.0``,
+    ``11.0``) and returns the one with the highest version number.
+    Only KiCad 10+ is supported; directories with major version < 10 are
+    ignored.  Directories ending in ``.99`` are skipped because KiCad
+    uses ``x.99`` for nightly / development builds which may have
+    incomplete configurations.
+    """
+    best: Optional[Path] = None
+    best_ver: tuple = (0,)
+    if not base.is_dir():
+        return None
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        parts = child.name.split(".")
+        try:
+            ver = tuple(int(p) for p in parts)
+        except ValueError:
+            continue
+        # Only support KiCad 10+
+        if ver[0] < 10:
+            continue
+        # Skip nightly/dev builds (e.g. 10.99, 11.99)
+        if ver[-1] == 99:
+            continue
+        if ver > best_ver:
+            best_ver = ver
+            best = child
+    return best
+
+
 def _kicad_config_dir() -> Path:
     """Return the platform-specific KiCad user configuration directory."""
     system = platform.system()
     if system == "Windows":
         appdata = os.environ.get("APPDATA", "")
-        return Path(appdata) / "kicad" / "8.0"
-    if system == "Darwin":
-        return Path.home() / "Library" / "Preferences" / "kicad" / "8.0"
-    # Linux / other POSIX
-    xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
-    if xdg_config:
-        base = Path(xdg_config)
+        base = Path(appdata) / "kicad"
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Preferences" / "kicad"
     else:
-        base = Path.home() / ".config"
-    return base / "kicad" / "8.0"
+        # Linux / other POSIX
+        xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
+        if xdg_config:
+            base = Path(xdg_config) / "kicad"
+        else:
+            base = Path.home() / ".config" / "kicad"
+    latest = _find_latest_version_dir(base)
+    return latest if latest else base / "10.0"
 
 
 def _kicad_install_share_dir() -> Optional[Path]:
     """Attempt to locate the KiCad installation share directory.
 
-    Returns ``None`` when KiCad is not installed or the directory cannot
+    Scans for the highest installed version (e.g. 10.0, 9.0, 8.0) and
+    returns ``None`` when KiCad is not installed or the directory cannot
     be determined.
     """
     system = platform.system()
-    candidates: List[Path] = []
     if system == "Windows":
         prog = os.environ.get("PROGRAMFILES", r"C:\Program Files")
-        candidates = [
-            Path(prog) / "KiCad" / "8.0" / "share" / "kicad",
-            Path(prog) / "KiCad" / "share" / "kicad",
-        ]
+        kicad_base = Path(prog) / "KiCad"
+        # Try versioned sub-directory first (e.g. KiCad/10.0/share/kicad)
+        ver_dir = _find_latest_version_dir(kicad_base)
+        if ver_dir:
+            share = ver_dir / "share" / "kicad"
+            if share.exists():
+                return share
+        # Fallback: un-versioned layout
+        share = kicad_base / "share" / "kicad"
+        if share.exists():
+            return share
     elif system == "Darwin":
         candidates = [
             Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport"),
             Path("/usr/local/share/kicad"),
         ]
+        for c in candidates:
+            if c.exists():
+                return c
     else:
         candidates = [
             Path("/usr/share/kicad"),
             Path("/usr/local/share/kicad"),
             Path("/opt/kicad/share/kicad"),
         ]
-    for c in candidates:
-        if c.exists():
-            return c
+        for c in candidates:
+            if c.exists():
+                return c
     return None
 
 
@@ -145,18 +191,40 @@ class LibraryEntry:
 
 @lru_cache(maxsize=1)
 def _default_env() -> Dict[str, str]:
-    """Return a best-effort mapping of common KiCad path variables."""
-    share = _kicad_install_share_dir()
+    """Return a best-effort mapping of common KiCad path variables.
+
+    This includes built-in KiCad directory variables (e.g.
+    ``KICAD_SYMBOL_DIR``) **and** any custom path variables the user has
+    defined in KiCad's ``kicad_common.json`` (stored under the
+    ``environment.vars`` key).
+    """
+    import json
+
     env: Dict[str, str] = {}
+
+    # --- Custom user variables from kicad_common.json ---
+    try:
+        common_json = _kicad_config_dir() / "kicad_common.json"
+        if common_json.is_file():
+            data = json.loads(common_json.read_text(encoding="utf-8"))
+            user_vars = data.get("environment", {}).get("vars", {})
+            if isinstance(user_vars, dict):
+                env.update(user_vars)
+    except Exception:
+        pass  # non-fatal – continue with built-in vars
+
+    # --- Built-in KiCad installation directories ---
+    share = _kicad_install_share_dir()
     if share:
-        env["KICAD8_SYMBOL_DIR"] = str(share / "symbols")
-        env["KICAD8_FOOTPRINT_DIR"] = str(share / "footprints")
-        env["KICAD7_SYMBOL_DIR"] = str(share / "symbols")
-        env["KICAD7_FOOTPRINT_DIR"] = str(share / "footprints")
-        env["KICAD6_SYMBOL_DIR"] = str(share / "symbols")
-        env["KICAD6_FOOTPRINT_DIR"] = str(share / "footprints")
-        env["KICAD_SYMBOL_DIR"] = str(share / "symbols")
-        env["KICAD_FOOTPRINT_DIR"] = str(share / "footprints")
+        sym_dir = str(share / "symbols")
+        fp_dir = str(share / "footprints")
+        model_dir = str(share / "3dmodels")
+        # KiCad 10+ variable names
+        for ver in ("", "10", "11", "12"):
+            prefix = f"KICAD{ver}" if ver else "KICAD"
+            env[f"{prefix}_SYMBOL_DIR"] = sym_dir
+            env[f"{prefix}_FOOTPRINT_DIR"] = fp_dir
+            env[f"{prefix}_3DMODEL_DIR"] = model_dir
     return env
 
 
@@ -165,8 +233,12 @@ def _default_env() -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _parse_lib_table(path: Path) -> List[LibraryEntry]:
+def _parse_lib_table(path: Path, _depth: int = 0) -> List[LibraryEntry]:
     """Parse a ``sym-lib-table`` or ``fp-lib-table`` file.
+
+    KiCad 10+ may include ``(type "Table")`` entries whose *uri* points
+    to another lib-table file.  These are followed recursively (up to a
+    reasonable depth limit).
 
     Args:
         path: Path to the library table file.
@@ -174,6 +246,9 @@ def _parse_lib_table(path: Path) -> List[LibraryEntry]:
     Returns:
         List of :class:`LibraryEntry` instances.
     """
+    if _depth > 5:
+        return []  # guard against infinite recursion
+
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -193,7 +268,14 @@ def _parse_lib_table(path: Path) -> List[LibraryEntry]:
             options=_atom(lib_node, "options"),
             description=_atom(lib_node, "descr"),
         )
-        if entry.nickname:
+        if not entry.nickname:
+            continue
+        # KiCad 10+: follow nested table references
+        if entry.plugin_type == "Table":
+            sub_path = Path(entry.uri)
+            if sub_path.is_file():
+                entries.extend(_parse_lib_table(sub_path, _depth + 1))
+        else:
             entries.append(entry)
     return entries
 

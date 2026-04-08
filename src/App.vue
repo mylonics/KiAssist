@@ -5,7 +5,6 @@ import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
-import ComponentSearch from './components/ComponentSearch.vue';
 import SymbolImporter from './components/SymbolImporter.vue';
 import ImporterDetails from './components/ImporterDetails.vue';
 import type { ImportedComponent } from './types/importer';
@@ -14,7 +13,7 @@ const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const rightPanelCollapsed = ref(true);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
-const leftPanelTab = ref<'kicad' | 'search' | 'importer'>('kicad');
+const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
 
 // Importer details overlay state
 const importedComponent = ref<ImportedComponent | null>(null);
@@ -28,10 +27,6 @@ function handleComponentImported(component: ImportedComponent, warnings: string[
 function handleImporterClose() {
   importedComponent.value = null;
   importWarnings.value = [];
-}
-
-function handleInsertInChat(text: string) {
-  chatBox.value?.insertText(text);
 }
 
 function handleContextQuestionsReady(questions: Array<{ question: string; suggestions: string[] }>) {
@@ -53,14 +48,6 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
           KiCad
         </button>
         <button
-          :class="['left-tab-btn', { active: leftPanelTab === 'search' }]"
-          @click="leftPanelTab = 'search'"
-          title="Search for components"
-        >
-          <span class="material-icons tab-icon">search</span>
-          Components
-        </button>
-        <button
           :class="['left-tab-btn', { active: leftPanelTab === 'importer' }]"
           @click="leftPanelTab = 'importer'"
           title="Symbol / Footprint Importer"
@@ -73,10 +60,6 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
         <KiCadInstanceSelector
           v-show="leftPanelTab === 'kicad'"
           @context-questions-ready="handleContextQuestionsReady"
-        />
-        <ComponentSearch
-          v-show="leftPanelTab === 'search'"
-          @insert-in-chat="handleInsertInChat"
         />
         <SymbolImporter
           v-show="leftPanelTab === 'importer'"

@@ -21,6 +21,7 @@ dependencies = [
     # pin until clr_loader is updated for cffi 2.x.
     "cffi>=1.15,<2.0; sys_platform == 'win32'",
     "easyeda2kicad>=0.0.1",
+    "cloudscraper>=1.2.0",
 ]
 authors = [
     {name = "KiAssist Contributors"}

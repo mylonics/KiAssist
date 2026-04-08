@@ -90,6 +90,7 @@ interface Message {
   timestamp: Date;
   isStreaming?: boolean;
   thinking?: string;
+  toolActivity?: string;
 }
 
 const STORAGE_KEY = 'kiassist-chat-messages';
@@ -825,6 +826,8 @@ async function sendMessageWithText(messageText: string) {
             if (poll.thinking) {
               messages.value[streamIdx].thinking = poll.thinking;
             }
+            // Show tool activity indicator (e.g. "Searching the web…")
+            messages.value[streamIdx].toolActivity = poll.tool_activity || '';
 
             if (poll.done) {
               clearInterval(pollInterval);
@@ -950,6 +953,7 @@ async function steerMessage() {
           if (poll.thinking) {
             messages.value[streamIdx].thinking = poll.thinking;
           }
+          messages.value[streamIdx].toolActivity = poll.tool_activity || '';
           if (poll.done) {
             clearInterval(pollInterval);
             messages.value[streamIdx].isStreaming = false;
@@ -1876,6 +1880,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
               <span class="message-time">{{ message.timestamp.toLocaleTimeString() }}</span>
               <span v-if="message.isStreaming" class="streaming-indicator">
                 <span class="streaming-dot"></span>
+                <span v-if="message.toolActivity" class="tool-activity-label">{{ message.toolActivity }}</span>
               </span>
               <div class="message-actions">
                 <button
@@ -2317,6 +2322,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 .streaming-indicator {
   display: flex;
   align-items: center;
+  gap: 0.35rem;
 }
 
 .streaming-dot {
@@ -2325,6 +2331,13 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
   border-radius: 50%;
   background-color: var(--accent-color);
   animation: pulse 1s infinite;
+}
+
+.tool-activity-label {
+  font-size: 0.7rem;
+  color: var(--accent-color);
+  font-weight: 500;
+  animation: pulse 1.5s infinite;
 }
 
 @keyframes pulse {
