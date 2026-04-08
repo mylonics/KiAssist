@@ -2,6 +2,8 @@
 import { ref, computed, onMounted, nextTick, watch } from 'vue';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 import '../types/pywebview';
 import type { ProviderInfo, SessionInfo, ProviderModel, GemmaModelInfo, GemmaServerStatus, GemmaDownloadProgress } from '../types/pywebview';
 import type ApiActivityPanel from './ApiActivityPanel.vue';
@@ -76,6 +78,11 @@ marked.use({
   breaks: true,
 });
 
+interface ContextQuestion {
+  question: string;
+  suggestions: string[];
+}
+
 interface Message {
   id: string;
   text: string;
@@ -91,6 +98,7 @@ const MODEL_KEY = 'kiassist-model';
 const SECONDARY_PROVIDER_KEY = 'kiassist-secondary-provider';
 const SECONDARY_MODEL_KEY = 'kiassist-secondary-model';
 
+const rawMode = ref(false);
 const copiedMessageId = ref<string | null>(null);
 const copiedChatHistory = ref(false);
 const messages = ref<Message[]>([]);
@@ -128,9 +136,17 @@ const gemmaDownloadPollTimer = ref<ReturnType<typeof setInterval> | null>(null);
 const gemmaError = ref('');
 const isLoadingGemmaModels = ref(false);
 const gemmaModelsLoaded = ref(false);
+const isStartingGemmaServer = ref(false);
 
 // Provider list is populated from the backend via get_providers()
 const providers = ref<ProviderInfo[]>([]);
+
+// Context lifecycle Q&A mode
+const contextQAMode = ref(false);
+const contextQAQuestions = ref<ContextQuestion[]>([]);
+const contextQAIndex = ref(0);
+/** Suggestions for the currently displayed question (empty if none). */
+const contextQASuggestions = ref<string[]>([]);
 
 const sessions = ref<SessionInfo[]>([]);
 
@@ -185,6 +201,50 @@ const gemmaReady = computed(() =>
   gemmaHasDownloadedModel.value
 );
 
+/** Whether the currently selected primary provider is available and ready to use. */
+const providerReady = computed(() => {
+  const id = selectedProvider.value;
+  if (id === 'gemma4') return gemmaServerStatus.value.running;
+  if (id === 'local') return detectedLocalModels.value.length > 0;
+  return currentProviderInfo.value?.has_key ?? false;
+});
+
+/**
+ * Render LaTeX math expressions using KaTeX.
+ * Protects math blocks from the markdown parser by replacing them with
+ * placeholders, running marked, then restoring the rendered KaTeX HTML.
+ */
+function renderMath(html: string): { text: string; placeholders: string[] } {
+  const placeholders: string[] = [];
+  const ph = (i: number) => `\x00MATH${i}\x00`;
+
+  // Block math: $$...$$  (may span multiple lines)
+  html = html.replace(/\$\$([\s\S]+?)\$\$/g, (_match, tex: string) => {
+    try {
+      placeholders.push(katex.renderToString(tex.trim(), { displayMode: true, throwOnError: false }));
+    } catch {
+      placeholders.push(`<span class="katex-error">${tex}</span>`);
+    }
+    return ph(placeholders.length - 1);
+  });
+
+  // Inline math: $...$ (not preceded/followed by $ and not spanning newlines)
+  html = html.replace(/(?<!\$)\$(?!\$)([^\n$]+?)(?<!\$)\$(?!\$)/g, (_match, tex: string) => {
+    try {
+      placeholders.push(katex.renderToString(tex.trim(), { displayMode: false, throwOnError: false }));
+    } catch {
+      placeholders.push(`<span class="katex-error">${tex}</span>`);
+    }
+    return ph(placeholders.length - 1);
+  });
+
+  return { text: html, placeholders };
+}
+
+function restoreMath(html: string, placeholders: string[]): string {
+  return html.replace(/\x00MATH(\d+)\x00/g, (_m, idx) => placeholders[Number(idx)] ?? '');
+}
+
 function renderMarkdown(text: string, isUser: boolean = false): string {
   if (!text) return '';
   if (isUser) {
@@ -194,7 +254,10 @@ function renderMarkdown(text: string, isUser: boolean = false): string {
       .replace(/>/g, '&gt;')
       .replace(/\n/g, '<br>');
   }
-  return marked.parse(text) as string;
+  // Protect math from the markdown parser, render markdown, then restore math
+  const { text: protected_text, placeholders } = renderMath(text);
+  const html = marked.parse(protected_text) as string;
+  return restoreMath(html, placeholders);
 }
 
 function scrollToBottom() {
@@ -672,13 +735,18 @@ async function deleteGemmaModel(modelId: string) {
 async function startGemmaServer(modelId: string) {
   if (!window.pywebview?.api) return;
   gemmaError.value = '';
-  const result = await trackedApiCall('start_gemma_server', [modelId], () =>
-    window.pywebview!.api.start_gemma_server(modelId)
-  );
-  if (result.success) {
-    gemmaServerStatus.value = { running: true, url: result.url ?? null, model_id: result.model_id ?? modelId, port: 8741 };
-  } else {
-    gemmaError.value = result.error || 'Failed to start server.';
+  isStartingGemmaServer.value = true;
+  try {
+    const result = await trackedApiCall('start_gemma_server', [modelId], () =>
+      window.pywebview!.api.start_gemma_server(modelId)
+    );
+    if (result.success) {
+      gemmaServerStatus.value = { running: true, url: result.url ?? null, model_id: result.model_id ?? modelId, port: 8741 };
+    } else {
+      gemmaError.value = result.error || 'Failed to start server.';
+    }
+  } finally {
+    isStartingGemmaServer.value = false;
   }
 }
 
@@ -721,8 +789,8 @@ async function sendMessageWithText(messageText: string) {
 
   try {
     if (window.pywebview?.api) {
-      const startResult = await trackedApiCall('start_stream_message', [messageText, selectedModel.value], () =>
-        window.pywebview!.api.start_stream_message(messageText, selectedModel.value)
+      const startResult = await trackedApiCall('start_stream_message', [messageText, selectedModel.value, rawMode.value], () =>
+        window.pywebview!.api.start_stream_message(messageText, selectedModel.value, rawMode.value)
       );
 
       if (!startResult.success) {
@@ -804,6 +872,13 @@ async function sendMessageWithText(messageText: string) {
 
 async function sendMessage() {
   if (!inputMessage.value.trim()) return;
+
+  // If in context Q&A mode, route to context lifecycle instead of chat
+  if (contextQAMode.value) {
+    await handleContextAnswer();
+    return;
+  }
+
   const userMessage: Message = {
     id: generateMessageId(),
     text: inputMessage.value,
@@ -1103,7 +1178,234 @@ function insertText(text: string) {
   });
 }
 
-defineExpose({ insertText });
+// ---- Context lifecycle Q&A via chat ----
+
+/** Start context Q&A mode: inject the first question as an assistant message. */
+function startContextQA(questions: ContextQuestion[]) {
+  console.log('[ChatBox] startContextQA called with', questions.length, 'questions');
+  if (!questions.length) {
+    console.warn('[ChatBox] startContextQA: empty questions array, aborting');
+    return;
+  }
+  contextQAMode.value = true;
+  contextQAQuestions.value = questions;
+  contextQAIndex.value = 0;
+  contextQASuggestions.value = [];
+
+  // Announce in chat
+  messages.value.push({
+    id: generateMessageId(),
+    text: `I'm building your project context. I have **${questions.length}** question${questions.length > 1 ? 's' : ''} to help me understand your project.\n\nAnswer each one, pick a suggestion, or press **Skip** to leave it out of the requirements.`,
+    sender: 'assistant',
+    timestamp: new Date(),
+  });
+
+  // Show first question
+  showNextContextQuestion();
+  saveMessages();
+  scrollToBottom();
+}
+
+/** Show the current context question as an assistant message. */
+function showNextContextQuestion() {
+  const idx = contextQAIndex.value;
+  if (idx >= contextQAQuestions.value.length) return;
+  const total = contextQAQuestions.value.length;
+  const q = contextQAQuestions.value[idx];
+  const qText = typeof q === 'string' ? q : q.question;
+  messages.value.push({
+    id: generateMessageId(),
+    text: `**Question ${idx + 1} of ${total}:**\n\n${qText}`,
+    sender: 'assistant',
+    timestamp: new Date(),
+  });
+  // Update live suggestions for this question
+  contextQASuggestions.value = (typeof q === 'string' ? [] : q.suggestions) ?? [];
+  scrollToBottom();
+}
+
+/** Skip the current context Q&A question entirely. */
+function skipContextQuestion() {
+  handleContextAnswer('__SKIP__');
+}
+
+/** Handle the user's answer during context Q&A. */
+async function handleContextAnswer(overrideAnswer?: string) {
+  const answerText = overrideAnswer ?? inputMessage.value.trim();
+  if (!answerText) return;
+
+  const isSkip = answerText === '__SKIP__';
+
+  // Clear suggestions immediately so they don't linger
+  contextQASuggestions.value = [];
+
+  // Show user message (show "Skipped" for skips, not the sentinel)
+  messages.value.push({
+    id: generateMessageId(),
+    text: isSkip ? '*Skipped*' : answerText,
+    sender: 'user',
+    timestamp: new Date(),
+  });
+  inputMessage.value = '';
+
+  // Send the raw answer to the backend — __SKIP__ tells it to drop this Q
+  const answer = answerText;
+
+  isLoading.value = true;
+  try {
+    const api = (window as any).pywebview?.api;
+    if (!api) throw new Error('Backend not available');
+
+    const result = await api.submit_context_answer(answer);
+    if (!result.success) {
+      messages.value.push({
+        id: generateMessageId(),
+        text: `Error: ${result.error || 'Failed to submit answer'}`,
+        sender: 'assistant',
+        timestamp: new Date(),
+      });
+      isLoading.value = false;
+      return;
+    }
+
+    contextQAIndex.value = result.current_question_index ?? contextQAIndex.value + 1;
+
+    if (result.state === 'questioning') {
+      // More questions — update the question list (might have new ones) and show next
+      const rawQs = result.questions ?? contextQAQuestions.value;
+      // Normalise: backend may return dicts or strings
+      contextQAQuestions.value = rawQs.map((q: any) =>
+        typeof q === 'string' ? { question: q, suggestions: [] } : q
+      );
+      showNextContextQuestion();
+    } else if (result.state === 'extracting' || result.state === 'refining') {
+      // Wizard questions done — LLM is refining/generating follow-up questions
+      messages.value.push({
+        id: generateMessageId(),
+        text: 'Thanks! Analyzing your project to generate follow-up questions...',
+        sender: 'assistant',
+        timestamp: new Date(),
+      });
+      scrollToBottom();
+      // Poll until LLM questions arrive (state → questioning) or finalization
+      await pollContextFinalization();
+    } else if (result.state === 'generating') {
+      messages.value.push({
+        id: generateMessageId(),
+        text: 'All questions answered! Generating requirements and synthesized context...',
+        sender: 'assistant',
+        timestamp: new Date(),
+      });
+      scrollToBottom();
+      // Poll until finalization completes
+      await pollContextFinalization();
+    } else if (result.state === 'done') {
+      finishContextQA(result);
+    }
+  } catch (e: any) {
+    messages.value.push({
+      id: generateMessageId(),
+      text: `Error: ${e.message || 'Unknown error'}`,
+      sender: 'assistant',
+      timestamp: new Date(),
+    });
+  } finally {
+    isLoading.value = false;
+    saveMessages();
+    scrollToBottom();
+  }
+}
+
+/** Poll for the context lifecycle to finish after all answers submitted. */
+async function pollContextFinalization() {
+  const api = (window as any).pywebview?.api;
+  if (!api) return;
+
+  // The finalization runs in the background with streaming, so poll until
+  // the state transitions to done, questioning (more Qs), or error.
+  let attempts = 0;
+  while (attempts < 120) {
+    await new Promise(r => setTimeout(r, 1000));
+    attempts++;
+    try {
+      const st = await api.get_context_lifecycle_state();
+      if (st.state === 'done') {
+        finishContextQA(st);
+        return;
+      }
+      if (st.state === 'questioning') {
+        // LLM asked more questions — normalise to ContextQuestion objects
+        const rawQs = st.questions ?? [];
+        contextQAQuestions.value = rawQs.map((q: any) =>
+          typeof q === 'string' ? { question: q, suggestions: [] } : q
+        );
+        contextQAIndex.value = st.current_question_index ?? 0;
+        messages.value.push({
+          id: generateMessageId(),
+          text: `The model has **${contextQAQuestions.value.length - contextQAIndex.value}** additional question(s):`,
+          sender: 'assistant',
+          timestamp: new Date(),
+        });
+        showNextContextQuestion();
+        saveMessages();
+        scrollToBottom();
+        return;
+      }
+      if (st.state === 'idle' && st.error) {
+        messages.value.push({
+          id: generateMessageId(),
+          text: `Context generation failed: ${st.error}`,
+          sender: 'assistant',
+          timestamp: new Date(),
+        });
+        exitContextQA();
+        return;
+      }
+    } catch {
+      // ignore poll errors
+    }
+  }
+}
+
+/** Finish context Q&A mode and display results in chat. */
+function finishContextQA(result: any) {
+  contextQAMode.value = false;
+  contextQAQuestions.value = [];
+  contextQAIndex.value = 0;
+  contextQASuggestions.value = [];
+
+  let summary = '**Context generation complete!**\n\n';
+  if (result.requirements) {
+    summary += '### Requirements\n\n' + result.requirements + '\n\n';
+  }
+  if (result.synthesized_context) {
+    summary += '### Synthesized Context\n\n' + result.synthesized_context;
+  }
+
+  messages.value.push({
+    id: generateMessageId(),
+    text: summary,
+    sender: 'assistant',
+    timestamp: new Date(),
+  });
+  saveMessages();
+  scrollToBottom();
+}
+
+/** Exit context Q&A mode without results (on error / cancel). */
+function exitContextQA() {
+  contextQAMode.value = false;
+  contextQAQuestions.value = [];
+  contextQAIndex.value = 0;
+  contextQASuggestions.value = [];
+}
+
+/** Select a suggested answer during context Q&A. */
+function selectContextSuggestion(suggestion: string) {
+  handleContextAnswer(suggestion);
+}
+
+defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 </script>
 
 <template>
@@ -1271,15 +1573,19 @@ defineExpose({ insertText });
           </p>
 
           <!-- Server status -->
-          <div class="gemma-server-status" :class="{ 'server-running': gemmaServerStatus.running }">
-            <span class="material-icons status-icon">{{ gemmaServerStatus.running ? 'check_circle' : 'radio_button_unchecked' }}</span>
-            <span v-if="gemmaServerStatus.running">
+          <div class="gemma-server-status" :class="{ 'server-running': gemmaServerStatus.running, 'server-starting': isStartingGemmaServer }">
+            <span v-if="isStartingGemmaServer" class="material-icons status-icon spinning">sync</span>
+            <span v-else class="material-icons status-icon">{{ gemmaServerStatus.running ? 'check_circle' : 'radio_button_unchecked' }}</span>
+            <span v-if="isStartingGemmaServer">
+              Starting server&hellip; This may take a moment while the model loads.
+            </span>
+            <span v-else-if="gemmaServerStatus.running">
               Server running &mdash; <code>{{ gemmaServerStatus.url }}</code>
               (model: <strong>{{ gemmaServerStatus.model_id }}</strong>)
             </span>
             <span v-else>Server not running</span>
             <button
-              v-if="gemmaServerStatus.running"
+              v-if="gemmaServerStatus.running && !isStartingGemmaServer"
               class="btn-secondary btn-sm gemma-stop-btn"
               @click="stopGemmaServer"
             >Stop Server</button>
@@ -1370,10 +1676,11 @@ defineExpose({ insertText });
                     v-if="gemmaServerStatus.model_id !== model.id"
                     class="btn-primary btn-sm"
                     @click="startGemmaServer(model.id)"
-                    :disabled="gemmaServerStatus.running"
+                    :disabled="gemmaServerStatus.running || isStartingGemmaServer"
                   >
-                    <span class="material-icons btn-icon">play_arrow</span>
-                    Start
+                    <span v-if="isStartingGemmaServer" class="material-icons btn-icon spinning">sync</span>
+                    <span v-else class="material-icons btn-icon">play_arrow</span>
+                    {{ isStartingGemmaServer ? 'Starting…' : 'Start' }}
                   </button>
                   <span
                     v-else
@@ -1500,6 +1807,7 @@ defineExpose({ insertText });
       <div class="header-controls">
         <!-- Compact model summary -->
         <button class="model-summary-btn" @click="openSettings()" title="Change model settings">
+          <span class="provider-status-dot" :class="providerReady ? 'ready' : 'unavailable'"></span>
           <span class="material-icons model-summary-icon">smart_toy</span>
           <span class="model-summary-text">
             {{ currentProviderInfo?.name ?? 'AI' }}
@@ -1619,24 +1927,66 @@ defineExpose({ insertText });
     </div>
 
     <div class="chat-input">
-      <textarea
-        ref="chatInputRef"
-        v-model="inputMessage"
-        @keypress="handleKeyPress"
-        :placeholder="isLoading ? 'Enter to queue · Ctrl+Enter to steer' : 'Type your message here... (Press Enter to send)'"
-        rows="2"
-      />
-      <div v-if="!isLoading" class="send-actions">
-        <button @click="sendMessage" :disabled="!inputMessage.trim()" class="send-btn" title="Send message">
-          <span class="material-icons">send</span>
-        </button>
+      <!-- Context Q&A answer card (suggestions + custom input in one area) -->
+      <div v-if="contextQAMode" class="context-answer-card">
+        <div v-if="contextQASuggestions.length > 0" class="context-suggestions">
+          <button
+            v-for="(suggestion, i) in contextQASuggestions"
+            :key="i"
+            class="suggestion-chip"
+            :disabled="isLoading"
+            @click="selectContextSuggestion(suggestion)"
+            :title="suggestion"
+          >{{ suggestion }}</button>
+        </div>
+        <div class="context-custom-input">
+          <textarea
+            ref="chatInputRef"
+            v-model="inputMessage"
+            @keypress="handleKeyPress"
+            placeholder="Type your own answer..."
+            rows="2"
+          />
+          <button @click="skipContextQuestion" :disabled="isLoading" class="skip-btn" title="Skip this question">
+            <span class="material-icons">skip_next</span>
+          </button>
+          <button @click="sendMessage" :disabled="!inputMessage.trim() || isLoading" class="send-btn" title="Send answer">
+            <span class="material-icons">send</span>
+          </button>
+        </div>
       </div>
-      <div v-else class="send-actions">
-        <button @click="steerMessage()" :disabled="!inputMessage.trim()" class="send-btn steer-btn" title="Steer: interrupt and redirect the model (Ctrl+Enter)">
-          <span class="material-icons">alt_route</span>
-        </button>
-        <button @click="queueMessage()" :disabled="!inputMessage.trim()" class="send-btn queue-btn" title="Queue: send after current response finishes (Enter)">
-          <span class="material-icons">queue</span>
+      <!-- Normal chat input -->
+      <div v-else class="input-row">
+        <textarea
+          ref="chatInputRef"
+          v-model="inputMessage"
+          @keypress="handleKeyPress"
+          :placeholder="isLoading ? 'Enter to queue · Ctrl+Enter to steer' : 'Type your message here... (Press Enter to send)'"
+          rows="2"
+        />
+        <div v-if="!isLoading" class="send-actions">
+          <button @click="sendMessage" :disabled="!inputMessage.trim()" class="send-btn" title="Send message">
+            <span class="material-icons">send</span>
+          </button>
+        </div>
+        <div v-else class="send-actions">
+          <button @click="steerMessage()" :disabled="!inputMessage.trim()" class="send-btn steer-btn" title="Steer: interrupt and redirect the model (Ctrl+Enter)">
+            <span class="material-icons">alt_route</span>
+          </button>
+          <button @click="queueMessage()" :disabled="!inputMessage.trim()" class="send-btn queue-btn" title="Queue: send after current response finishes (Enter)">
+            <span class="material-icons">queue</span>
+          </button>
+        </div>
+      </div>
+      <div class="input-toolbar">
+        <button
+          class="raw-mode-btn"
+          :class="{ active: rawMode }"
+          @click="rawMode = !rawMode"
+          :title="rawMode ? 'Raw mode ON – no context sent' : 'Raw mode OFF – context included'"
+        >
+          <span class="material-icons">{{ rawMode ? 'code_off' : 'code' }}</span>
+          <span class="raw-label">Raw</span>
         </button>
       </div>
     </div>
@@ -1710,6 +2060,22 @@ defineExpose({ insertText });
 .model-summary-btn:hover {
   border-color: var(--accent-color);
   background-color: var(--bg-input);
+}
+
+.provider-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background-color 0.2s ease;
+}
+.provider-status-dot.ready {
+  background-color: #22c55e;
+  box-shadow: 0 0 4px rgba(34, 197, 94, 0.4);
+}
+.provider-status-dot.unavailable {
+  background-color: #ef4444;
+  box-shadow: 0 0 4px rgba(239, 68, 68, 0.4);
 }
 
 .model-summary-icon {
@@ -2149,12 +2515,148 @@ defineExpose({ insertText });
 
 .chat-input {
   display: flex;
-  gap: 0.75rem;
+  flex-direction: column;
+  gap: 0.375rem;
   padding: 1rem;
   background-color: var(--bg-primary);
   border-top: 1px solid var(--border-color);
   flex-shrink: 0;
   box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.04);
+}
+
+/* ---- Context Q&A answer card ---- */
+.context-answer-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.625rem;
+  border-radius: var(--radius-md, 6px);
+  border: 1px solid var(--accent-color, #4f8cff);
+  background: var(--bg-secondary, #f8f9fa);
+}
+
+.context-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.context-custom-input {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-end;
+}
+
+.context-custom-input textarea {
+  flex: 1;
+  resize: none;
+  border: 1px solid var(--border-color, #ddd);
+  border-radius: var(--radius-sm, 4px);
+  padding: 0.4rem 0.5rem;
+  font-size: 0.85rem;
+  font-family: inherit;
+  background: var(--bg-input, #fff);
+  color: var(--text-primary, #1a1a1a);
+}
+
+.context-custom-input .send-btn {
+  flex-shrink: 0;
+}
+
+.context-custom-input .skip-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--text-secondary, #888);
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.context-custom-input .skip-btn:hover:not(:disabled) {
+  background: var(--bg-hover, #f0f0f0);
+  color: var(--text-primary, #333);
+}
+
+.context-custom-input .skip-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.suggestion-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.3;
+  border-radius: var(--radius-md, 6px);
+  background: var(--bg-input, #f3f4f6);
+  color: var(--accent-color, #4f8cff);
+  border: 1px solid var(--accent-color, #4f8cff);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  max-width: 100%;
+  text-align: left;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.suggestion-chip:hover:not(:disabled) {
+  background: var(--accent-color, #4f8cff);
+  color: #fff;
+}
+
+.suggestion-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.input-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.input-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.raw-mode-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.75rem;
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.raw-mode-btn:hover {
+  border-color: var(--accent-color);
+  color: var(--text-primary);
+}
+
+.raw-mode-btn.active {
+  background: var(--accent-color);
+  color: white;
+  border-color: var(--accent-color);
+}
+
+.raw-mode-btn .material-icons {
+  font-size: 0.95rem;
+}
+
+.raw-label {
+  font-weight: 500;
 }
 
 textarea {
@@ -2773,6 +3275,15 @@ code {
 .gemma-server-status.server-running {
   border-color: #34a853;
   background-color: rgba(52, 168, 83, 0.08);
+}
+
+.gemma-server-status.server-starting {
+  border-color: #fbbc04;
+  background-color: rgba(251, 188, 4, 0.08);
+}
+
+.gemma-server-status.server-starting .status-icon {
+  color: #fbbc04;
 }
 
 .gemma-server-status .status-icon {

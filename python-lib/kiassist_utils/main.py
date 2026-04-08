@@ -1,6 +1,8 @@
 """Main KiAssist application module using pywebview."""
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import shutil
@@ -26,10 +28,12 @@ from .requirements_wizard import (
     build_synthesize_prompt,
     parse_refined_questions,
     parse_synthesized_docs,
+    INITIAL_QUESTIONS_COUNT,
 )
 from .kicad_schematic import inject_test_note, is_schematic_api_available
 from .context.history import ConversationStore
 from .context.prompts import SystemPromptBuilder
+from .context.requirements import RequirementsManager, ContextState
 from .ai.llm_logger import llm_logger
 
 logger = logging.getLogger(__name__)
@@ -117,6 +121,13 @@ _PROVIDER_REGISTRY: List[Dict[str, Any]] = [
 class KiAssistAPI:
     """Backend API exposed to the frontend via pywebview."""
 
+    # Config keys for persisted model selections
+    _CFG_LAST_GEMMA_MODEL = "last_gemma_server_model"
+    _CFG_PROVIDER = "last_provider"
+    _CFG_MODEL = "last_model"
+    _CFG_SECONDARY_PROVIDER = "last_secondary_provider"
+    _CFG_SECONDARY_MODEL = "last_secondary_model"
+
     def __init__(self):
         """Initialize the backend API."""
         self.api_key_store = ApiKeyStore()
@@ -136,6 +147,9 @@ class KiAssistAPI:
         # Project context caches (cleared on project switch / new session)
         self._raw_context_cache: Optional[str] = None
         self._synthesized_context_cache: Optional[str] = None
+        # Context lifecycle state (RequirementsManager-backed)
+        self._requirements_manager: Optional[RequirementsManager] = None
+        self._context_lifecycle: Dict[str, Any] = self._default_lifecycle_state()
         # Streaming state
         self._stream_lock = threading.Lock()
         self._stream_buffer = ""
@@ -151,6 +165,148 @@ class KiAssistAPI:
             target=self._async_loop.run_forever, daemon=True
         )
         self._async_thread.start()
+
+        # Restore persisted model selections from config
+        self._restore_model_selections()
+
+        # Auto-start last Gemma server in background so it's ready by the
+        # time the user sends a message.
+        self._auto_start_last_server()
+
+    # ------------------------------------------------------------------
+    # Context lifecycle helpers
+    # ------------------------------------------------------------------
+
+    # Maximum number of question rounds before forcing finalization.
+    _MAX_QUESTION_ROUNDS = 2
+
+    @staticmethod
+    def _default_lifecycle_state() -> Dict[str, Any]:
+        """Return a fresh context-lifecycle state dict."""
+        return {
+            "state": "idle",
+            "raw_context": "",
+            "questions": [],
+            "current_question_index": 0,
+            "answers": [],
+            "requirements": "",
+            "synthesized_context": "",
+            "error": "",
+            "wizard_phase": False,
+            "question_round": 0,
+        }
+
+    def _ensure_requirements_manager(self) -> Optional[RequirementsManager]:
+        """Lazily create a :class:`RequirementsManager` for the active project."""
+        if not self._current_project_path:
+            return None
+        if self._requirements_manager is None or str(
+            self._requirements_manager.project_dir
+        ) != str(Path(self._current_project_path).parent if Path(self._current_project_path).is_file() else Path(self._current_project_path)):
+            self._requirements_manager = RequirementsManager(self._current_project_path)
+        return self._requirements_manager
+
+    # ------------------------------------------------------------------
+    # Config persistence helpers
+    # ------------------------------------------------------------------
+
+    def _get_config(self) -> Dict[str, Any]:
+        """Load the full ``~/.kiassist/config.json`` dictionary."""
+        try:
+            config_path = self.api_key_store._get_config_path()
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _save_config_field(self, key: str, value: Any) -> None:
+        """Persist a single key in ``~/.kiassist/config.json``."""
+        try:
+            config_path = self.api_key_store._ensure_config_dir()
+            config = self._get_config()
+            config[key] = value
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+        except Exception:
+            logger.warning("Failed to save config key %s", key)
+
+    def _restore_model_selections(self) -> None:
+        """Restore provider/model selections from ``~/.kiassist/config.json``."""
+        config = self._get_config()
+        valid_ids = {p["id"] for p in _PROVIDER_REGISTRY}
+
+        saved_provider = config.get(self._CFG_PROVIDER)
+        saved_model = config.get(self._CFG_MODEL)
+        if saved_provider and saved_provider in valid_ids:
+            self.current_provider_name = saved_provider
+            if saved_model:
+                self.current_model = saved_model
+
+        saved_sec_provider = config.get(self._CFG_SECONDARY_PROVIDER)
+        saved_sec_model = config.get(self._CFG_SECONDARY_MODEL)
+        if saved_sec_provider and saved_sec_provider in valid_ids:
+            self.secondary_provider_name = saved_sec_provider
+            if saved_sec_model:
+                self.secondary_model = saved_sec_model
+
+        logger.info(
+            "Restored model selections: primary=%s/%s, secondary=%s/%s",
+            self.current_provider_name, self.current_model,
+            self.secondary_provider_name, self.secondary_model,
+        )
+
+    def _persist_model_selections(self) -> None:
+        """Save current provider/model selections to config file."""
+        try:
+            config_path = self.api_key_store._ensure_config_dir()
+            config = self._get_config()
+            config[self._CFG_PROVIDER] = self.current_provider_name
+            config[self._CFG_MODEL] = self.current_model
+            config[self._CFG_SECONDARY_PROVIDER] = self.secondary_provider_name
+            config[self._CFG_SECONDARY_MODEL] = self.secondary_model
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+        except Exception:
+            logger.warning("Failed to persist model selections")
+
+    def _auto_start_last_server(self) -> None:
+        """Auto-start the last-used Gemma server model in a background thread.
+
+        Only starts if a model was previously recorded and is still downloaded.
+        Runs in a daemon thread so it doesn't block the UI from loading.
+        """
+        config = self._get_config()
+        last_model = config.get(self._CFG_LAST_GEMMA_MODEL)
+        if not last_model:
+            return
+
+        # Check the model is still downloaded before starting
+        variant = self._local_model_manager._find_variant(last_model)
+        if not variant:
+            return
+        model_path = self._local_model_manager._models_dir / variant["filename"]
+        if not model_path.is_file():
+            return
+
+        def _start():
+            try:
+                logger.info("Auto-starting last Gemma server model: %s", last_model)
+                result = self._local_model_manager.start_server(last_model)
+                if result.get("success"):
+                    logger.info("Auto-started Gemma server for %s", last_model)
+                else:
+                    logger.warning(
+                        "Auto-start Gemma server failed: %s",
+                        result.get("error", "unknown"),
+                    )
+            except Exception:
+                logger.exception("Auto-start Gemma server error")
+
+        thread = threading.Thread(target=_start, daemon=True, name="gemma-auto-start")
+        thread.start()
     
     def echo_message(self, message: str) -> str:
         """Echo a message (for testing).
@@ -228,6 +384,7 @@ class KiAssistAPI:
         self.current_provider_name = provider
         self.current_model = model
         self.current_provider = None  # force re-creation
+        self._persist_model_selections()
 
         try:
             new_provider = self._create_provider(provider, model)
@@ -509,6 +666,7 @@ class KiAssistAPI:
         self.secondary_provider_name = provider
         self.secondary_model = model
         self.secondary_provider = None  # force re-creation on next use
+        self._persist_model_selections()
 
         try:
             new_provider = self._create_provider(provider, model)
@@ -726,9 +884,12 @@ class KiAssistAPI:
             Result dictionary with ``url`` on success.
         """
         try:
-            return self._local_model_manager.start_server(
+            result = self._local_model_manager.start_server(
                 model_id, n_ctx=n_ctx, n_gpu_layers=n_gpu_layers
             )
+            if result.get("success"):
+                self._save_config_field(self._CFG_LAST_GEMMA_MODEL, model_id)
+            return result
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
@@ -895,7 +1056,7 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    def start_stream_message(self, message: str, model: Optional[str] = None) -> dict:
+    def start_stream_message(self, message: str, model: Optional[str] = None, raw_mode: bool = False) -> dict:
         """Start streaming a response from the active AI provider in a background thread.
 
         The user prompt is persisted immediately; the final assembled assistant
@@ -904,9 +1065,14 @@ class KiAssistAPI:
         AI provider so it has context from prior turns, along with a system
         prompt containing project/PCB environment information.
 
+        When *raw_mode* is ``True``, only the user message is sent to the
+        provider—no system prompt or conversation history is included.
+
         Args:
             message: The message to send.
             model: Optional model override.
+            raw_mode: If ``True``, send only the bare user message with no
+                context, system prompt, or conversation history.
 
         Returns:
             ``{"success": True}`` on successful start, or an error dict.
@@ -934,10 +1100,15 @@ class KiAssistAPI:
                 self._stream_done = False
                 self._stream_error = None
 
-            # Build full conversation history (the new user message is
-            # already persisted above and will be included)
-            msgs = self._build_conversation_messages(store, session_id)
-            system_prompt = self._build_system_prompt()
+            if raw_mode:
+                # Raw mode: send only the bare user message, no history or system prompt
+                msgs = [AIMessage(role="user", content=message)]
+                system_prompt = None
+            else:
+                # Build full conversation history (the new user message is
+                # already persisted above and will be included)
+                msgs = self._build_conversation_messages(store, session_id)
+                system_prompt = self._build_system_prompt()
             cancel_event = self._stream_cancel
 
             log_id = llm_logger.start(
@@ -1175,12 +1346,23 @@ class KiAssistAPI:
             p = Path(path)
             if not p.exists():
                 return {"success": False, "error": f"Path does not exist: {path}"}
-            self._current_project_path = str(p)
+
+            new_path = str(p)
+
+            # If the path hasn't changed, skip the reset so an in-progress
+            # context lifecycle (wizard Q&A, LLM generation, etc.) is not lost.
+            if self._current_project_path == new_path:
+                return {"success": True}
+
+            self._current_project_path = new_path
             # Clear prompt cache so project context refreshes
             self._prompt_builder.clear_cache()
             # Clear cached project context
             self._raw_context_cache = None
             self._synthesized_context_cache = None
+            # Reset context lifecycle state for the new project
+            self._context_lifecycle = self._default_lifecycle_state()
+            self._requirements_manager = None
             # Start a new session for the new project
             self.current_session_id = None
             return {"success": True}
@@ -1423,6 +1605,482 @@ class KiAssistAPI:
             return {"success": False, "error": str(e), "open_projects": [], "recent_projects": []}
     
     # Requirements Wizard API methods
+
+    # ------------------------------------------------------------------
+    # Context Lifecycle API  (raw → questions → answers → requirements)
+    # ------------------------------------------------------------------
+
+    def start_context_lifecycle(self) -> Dict[str, Any]:
+        """Start the context lifecycle.
+
+        If ``requirements.md`` already exists the wizard questions are skipped
+        and the lifecycle proceeds directly to LLM-based question generation
+        with the raw context and existing requirements.
+
+        Otherwise only the first two wizard questions (objectives & known parts)
+        are presented so the LLM can refine the remaining questions quickly.
+
+        Returns:
+            Dictionary with lifecycle state or error.
+        """
+        if not self._current_project_path:
+            return {"success": False, "error": "No project selected."}
+
+        try:
+            # Reset lifecycle state
+            self._context_lifecycle = self._default_lifecycle_state()
+            self._context_lifecycle["state"] = "extracting"
+
+            # 1. Extract raw context
+            from .context.project_context import get_raw_context
+            raw_ctx = get_raw_context(self._current_project_path)
+            self._raw_context_cache = raw_ctx
+            self._context_lifecycle["raw_context"] = raw_ctx
+
+            # 2. Check for existing requirements.md
+            project_dir = (
+                Path(self._current_project_path).parent
+                if Path(self._current_project_path).is_file()
+                else Path(self._current_project_path)
+            )
+            req_path = project_dir / "requirements.md"
+            existing_req = ""
+            if req_path.is_file():
+                existing_req = req_path.read_text(encoding="utf-8")
+
+            if existing_req.strip():
+                # requirements.md exists — skip ALL user questions and go
+                # straight to finalization with raw context + requirements.
+                provider = self._get_or_create_provider()
+                if not provider:
+                    self._context_lifecycle["state"] = "idle"
+                    return {
+                        "success": False,
+                        "error": "No AI provider configured. Add an API key or start a local model.",
+                    }
+                self._context_lifecycle["state"] = "generating"
+                self._run_context_llm_stream(
+                    "finalize", raw_ctx, existing_req, [], provider,
+                )
+                return {"success": True, **self._context_lifecycle}
+
+            # 3. No requirements.md — present the first N wizard questions
+            wizard_qs = get_default_questions()
+            initial_qs = wizard_qs[:INITIAL_QUESTIONS_COUNT]
+            self._context_lifecycle["questions"] = [
+                {
+                    "question": q["question"],
+                    "suggestions": [],
+                }
+                for q in initial_qs
+            ]
+            self._context_lifecycle["current_question_index"] = 0
+            self._context_lifecycle["state"] = "questioning"
+            self._context_lifecycle["wizard_phase"] = True
+
+            return {"success": True, **self._context_lifecycle}
+
+        except Exception as exc:
+            logger.error("start_context_lifecycle failed: %s", exc, exc_info=True)
+            self._context_lifecycle["state"] = "idle"
+            self._context_lifecycle["error"] = str(exc)
+            return {"success": False, "error": str(exc)}
+
+    def get_context_lifecycle_state(self) -> Dict[str, Any]:
+        """Return the current context lifecycle state.
+
+        Returns:
+            Dictionary with full lifecycle state.
+        """
+        return {"success": True, **self._context_lifecycle}
+
+    def submit_context_answer(self, answer: str) -> Dict[str, Any]:
+        """Submit an answer to the current pending question.
+
+        If the answer is the literal ``"__SKIP__"`` sentinel the question is
+        dropped entirely — it will not appear in the answers list sent to the
+        LLM, so the model won't attempt to infer or re-ask it.
+
+        If more questions remain, the next question index is advanced.
+        When all questions have been answered the finalization is launched
+        in the background (streaming) so the frontend can poll for updates.
+
+        Args:
+            answer: The user's answer text, or ``"__SKIP__"`` to skip.
+
+        Returns:
+            Updated lifecycle state.
+        """
+        lc = self._context_lifecycle
+        if lc["state"] != "questioning":
+            return {"success": False, "error": "Not in questioning state."}
+
+        idx = lc["current_question_index"]
+        questions = lc["questions"]
+        if idx >= len(questions):
+            return {"success": False, "error": "No more questions."}
+
+        # Record answer — but skip entirely if the user chose to skip.
+        is_skip = answer.strip() == "__SKIP__"
+        if not is_skip:
+            q_obj = questions[idx]
+            q_text = q_obj["question"] if isinstance(q_obj, dict) else str(q_obj)
+            lc["answers"].append({
+                "question": q_text,
+                "answer": answer,
+            })
+        lc["current_question_index"] = idx + 1
+
+        # If more questions remain, just return updated state
+        if lc["current_question_index"] < len(questions):
+            return {"success": True, **lc}
+
+        # ── All current questions answered ──────────────────────────────
+        try:
+            provider = self._get_or_create_provider()
+            if not provider:
+                return {
+                    "success": False,
+                    "error": "No AI provider configured.",
+                }
+
+            project_dir = (
+                Path(self._current_project_path).parent
+                if Path(self._current_project_path).is_file()
+                else Path(self._current_project_path)
+            )
+            existing_req = ""
+            req_path = project_dir / "requirements.md"
+            if req_path.is_file():
+                existing_req = req_path.read_text(encoding="utf-8")
+
+            # Bump the question round counter
+            lc["question_round"] = lc.get("question_round", 0) + 1
+
+            if lc.get("wizard_phase"):
+                # Initial wizard questions done — send answers + remaining
+                # wizard questions to LLM for quick refinement (no raw context).
+                lc["wizard_phase"] = False
+                lc["state"] = "refining"  # signals LLM is refining Qs
+                self._run_context_llm_stream(
+                    "refine", "", "",
+                    lc["answers"], provider,
+                )
+            elif lc["question_round"] >= self._MAX_QUESTION_ROUNDS:
+                # Hit the question-round limit — force finalization now.
+                logger.info(
+                    "[ContextLifecycle] Reached max question rounds (%d) — "
+                    "forcing finalization",
+                    self._MAX_QUESTION_ROUNDS,
+                )
+                lc["state"] = "generating"
+                self._run_context_llm_stream(
+                    "finalize", lc["raw_context"], existing_req,
+                    lc["answers"], provider,
+                )
+            else:
+                # All (refined/LLM) questions done — launch finalization
+                lc["state"] = "generating"
+                self._run_context_llm_stream(
+                    "finalize", lc["raw_context"], existing_req,
+                    lc["answers"], provider,
+                )
+
+            return {"success": True, **self._context_lifecycle}
+
+        except Exception as exc:
+            logger.error("submit_context_answer finalise failed: %s", exc, exc_info=True)
+            lc["state"] = "questioning"
+            lc["error"] = str(exc)
+            return {"success": False, "error": str(exc)}
+
+    def _run_context_llm_stream(
+        self,
+        phase: str,
+        raw_context: str,
+        existing_requirements: str,
+        answers: List[Dict[str, str]],
+        provider: Any,
+    ) -> None:
+        """Run a context-lifecycle LLM call via streaming in the background.
+
+        Args:
+            phase: ``"refine"``, ``"questions"``, or ``"finalize"``.
+            raw_context: Raw context text.
+            existing_requirements: Existing requirements text.
+            answers: List of Q&A dicts.
+            provider: AI provider instance.
+        """
+        from .context.project_context import (
+            build_context_questions_prompt,
+            build_refine_questions_prompt,
+            build_requirements_and_context_prompt,
+        )
+
+        if phase == "refine":
+            prompt_data = build_refine_questions_prompt(answers)
+        elif phase == "questions":
+            prompt_data = build_context_questions_prompt(
+                raw_context, existing_requirements,
+                wizard_answers=answers or None,
+            )
+        elif phase == "finalize_force":
+            # Force finalization — tell the LLM it MUST produce a result now.
+            prompt_data = build_requirements_and_context_prompt(
+                raw_context, existing_requirements, answers,
+                force_complete=True,
+            )
+        else:
+            prompt_data = build_requirements_and_context_prompt(
+                raw_context, existing_requirements, answers,
+            )
+
+        messages = prompt_data["messages"]
+        system_prompt = prompt_data["system_prompt"]
+
+        log_id = llm_logger.start(
+            provider=self.current_provider_name,
+            model=self.current_model,
+            messages=messages,
+            system_prompt=system_prompt,
+            is_stream=True,
+        )
+
+        lc = self._context_lifecycle
+        captured_phase = phase
+        captured_raw = raw_context
+        captured_req = existing_requirements
+        captured_answers = list(answers)
+
+        async def _stream():
+            accumulated = ""
+            try:
+                async for chunk in provider.chat_stream(
+                    messages, system_prompt=system_prompt
+                ):
+                    if chunk.text:
+                        accumulated += chunk.text
+                        llm_logger.update_stream_response(log_id, accumulated)
+            except Exception as exc:
+                llm_logger.finish(log_id, error=str(exc))
+                lc["state"] = "idle"
+                lc["error"] = str(exc)
+                return
+
+            response_text = accumulated.strip()
+
+            # Strip <think>...</think> reasoning blocks that models like
+            # Gemma emit — these would break JSON parsing downstream.
+            import re as _re
+            response_text = _re.sub(
+                r"<think>.*?</think>", "", response_text, flags=_re.DOTALL,
+            ).strip()
+
+            logger.info(
+                "[ContextLifecycle] Stream complete for phase=%s, "
+                "response length=%d, first 200 chars: %.200s",
+                captured_phase, len(response_text), response_text,
+            )
+
+            llm_logger.finish(log_id, response_text=response_text)
+
+            # Process the result on the main context lifecycle state
+            try:
+                self._handle_context_llm_result(
+                    captured_phase, response_text, captured_raw,
+                    captured_req, captured_answers, provider,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[ContextLifecycle] _handle_context_llm_result CRASHED: %s",
+                    exc, exc_info=True,
+                )
+                lc["state"] = "idle"
+                lc["error"] = f"Internal error: {exc}"
+
+        def _run():
+            try:
+                future = asyncio.run_coroutine_threadsafe(_stream(), self._async_loop)
+                future.result()  # block this thread until done
+            except Exception as exc:
+                logger.error(
+                    "[ContextLifecycle] Background stream thread crashed: %s",
+                    exc, exc_info=True,
+                )
+                lc["state"] = "idle"
+                lc["error"] = f"Stream error: {exc}"
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+    def _handle_context_llm_result(
+        self,
+        phase: str,
+        response_text: str,
+        raw_context: str,
+        existing_requirements: str,
+        answers: List[Dict[str, str]],
+        provider: Any,
+    ) -> None:
+        """Process completed LLM response for the context lifecycle."""
+        from .context.project_context import (
+            parse_context_questions_response,
+            parse_requirements_and_context_response,
+        )
+
+        lc = self._context_lifecycle
+
+        if phase == "refine":
+            # LLM refined the remaining wizard questions based on initial
+            # answers.  The response is the same JSON array format as the
+            # questions phase.
+            questions = parse_context_questions_response(response_text)
+            logger.info(
+                "[ContextLifecycle] Refined questions: %d returned",
+                len(questions),
+            )
+
+            if not questions:
+                # Refinement failed or returned nothing — fall through to
+                # full LLM question generation with raw context.
+                logger.info("[ContextLifecycle] No refined questions — falling back to full generation")
+                project_dir = (
+                    Path(self._current_project_path).parent
+                    if Path(self._current_project_path).is_file()
+                    else Path(self._current_project_path)
+                )
+                existing_req = ""
+                req_path = project_dir / "requirements.md"
+                if req_path.is_file():
+                    existing_req = req_path.read_text(encoding="utf-8")
+
+                lc["state"] = "extracting"
+                self._run_context_llm_stream(
+                    "questions", lc["raw_context"], existing_req,
+                    lc["answers"], provider,
+                )
+                return
+
+            # Present refined questions to the user
+            lc["state"] = "questioning"
+            lc["questions"] = lc["questions"] + questions
+            lc["current_question_index"] = len(lc["answers"])
+            logger.info(
+                "[ContextLifecycle] State set to 'questioning' with %d refined questions",
+                len(questions),
+            )
+            return
+
+        if phase == "questions":
+            questions = parse_context_questions_response(response_text)
+            logger.info(
+                "[ContextLifecycle] Parsed %d questions from LLM response",
+                len(questions),
+            )
+            for i, q in enumerate(questions):
+                logger.info("  Q%d: %s", i + 1, q)
+
+            if not questions:
+                # No questions — go straight to finalization
+                logger.info("[ContextLifecycle] No questions parsed — skipping to finalization")
+                lc["state"] = "generating"
+                self._run_context_llm_stream(
+                    "finalize", raw_context, existing_requirements,
+                    lc["answers"], provider,
+                )
+                return
+
+            # Append LLM questions after any existing wizard questions and
+            # set the index to point at the first new question.
+            lc["state"] = "questioning"
+            lc["questions"] = lc["questions"] + questions
+            lc["current_question_index"] = len(lc["answers"])
+            logger.info(
+                "[ContextLifecycle] State set to 'questioning' with %d questions",
+                len(questions),
+            )
+
+            # Wire into RequirementsManager if available
+            mgr = self._ensure_requirements_manager()
+            if mgr:
+                try:
+                    req = mgr.start_raw_context_generation()
+                    mgr.set_raw_context(req, raw_context)
+                    mgr.set_auto_context(req, "", pending_questions=questions)
+                except Exception:
+                    pass  # non-critical persistence
+            return
+
+        # phase == "finalize" or "finalize_force"
+        result = parse_requirements_and_context_response(response_text)
+
+        if result.get("status") == "needs_more_info" and phase != "finalize_force":
+            # Only allow more questions if we haven't hit the round limit.
+            current_round = lc.get("question_round", 0)
+            if current_round >= self._MAX_QUESTION_ROUNDS:
+                logger.info(
+                    "[ContextLifecycle] Finalize returned needs_more_info "
+                    "but we're at round %d (max %d) — forcing done with "
+                    "available info",
+                    current_round,
+                    self._MAX_QUESTION_ROUNDS,
+                )
+                # Re-run finalization with force_complete flag
+                lc["state"] = "generating"
+                self._run_context_llm_stream(
+                    "finalize_force", lc["raw_context"],
+                    existing_requirements, lc["answers"], provider,
+                )
+                return
+
+            raw_qs = result.get("questions", [])
+            # Wrap plain strings as question dicts for consistency
+            new_questions = [
+                q if isinstance(q, dict) else {"question": str(q), "suggestions": []}
+                for q in raw_qs
+            ]
+            lc["state"] = "questioning"
+            lc["questions"] = lc["questions"] + new_questions
+            return
+
+        if result.get("status") == "error":
+            lc["state"] = "idle"
+            lc["error"] = result.get("error", "Unknown error")
+            return
+
+        # Done — store results
+        lc["state"] = "done"
+        lc["requirements"] = result.get("requirements", "")
+        lc["synthesized_context"] = result.get("synthesized_context", "")
+        lc["error"] = ""
+
+        # Cache synthesized context for chat system-prompt injection
+        self._synthesized_context_cache = lc["synthesized_context"]
+
+        # Persist requirements.md if generated
+        if lc["requirements"]:
+            project_dir = (
+                Path(self._current_project_path).parent
+                if Path(self._current_project_path).is_file()
+                else Path(self._current_project_path)
+            )
+            try:
+                save_requirements_file(str(project_dir), lc["requirements"])
+            except Exception as exc:
+                logger.warning("Failed to save requirements.md: %s", exc)
+
+        # Update RequirementsManager
+        mgr = self._ensure_requirements_manager()
+        if mgr:
+            try:
+                req = mgr.load_or_create()
+                if req.state == ContextState.GENERATING_REQUIREMENTS:
+                    mgr.set_auto_context(req, lc["synthesized_context"])
+                elif req.state == ContextState.QUERYING_USER:
+                    mgr.submit_user_answers(req, lc["requirements"])
+                    mgr.mark_up_to_date(req)
+            except Exception:
+                pass  # non-critical persistence
 
     def get_wizard_questions(self) -> Dict[str, Any]:
         """Get the default wizard questions.
@@ -2324,6 +2982,7 @@ class KiAssistAPI:
                 # Include S-expressions so the frontend can pass them to AI tools
                 "symbol_sexpr": comp.symbol_sexpr,
                 "footprint_sexpr": comp.footprint_sexpr,
+                "step_data": base64.b64encode(comp.step_data).decode("ascii") if comp.step_data else "",
                 "fields": {
                     "mpn": fields.mpn,
                     "manufacturer": fields.manufacturer,

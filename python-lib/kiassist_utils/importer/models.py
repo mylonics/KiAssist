@@ -90,6 +90,9 @@ class ImportedComponent:
     symbol_sexpr: str = ""
     footprint_sexpr: str = ""
 
+    # Raw STEP 3D model binary data (base64-encoded for transport)
+    step_data: Optional[bytes] = None
+
     # Source method
     import_method: ImportMethod = ImportMethod.ZIP
     source_info: str = ""

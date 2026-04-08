@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -56,9 +57,15 @@ def get_raw_context(project_path: str | Path) -> str:
     # -----------------------------------------------------------------
     # 1. Discover all schematic and board files
     # -----------------------------------------------------------------
-    all_schematics = sorted(project_dir.rglob("*.kicad_sch"))
-    all_boards = sorted(project_dir.rglob("*.kicad_pcb"))
-    pro_files = sorted(project_dir.rglob("*.kicad_pro"))
+    # Folders to skip: version-control, backups, history, caches
+    _IGNORE_DIRS = {".history", ".git", "__pycache__", "backups", "_autosave"}
+
+    def _is_ignored(path: Path) -> bool:
+        return any(part.startswith(".") or part in _IGNORE_DIRS for part in path.relative_to(project_dir).parts[:-1])
+
+    all_schematics = sorted(f for f in project_dir.rglob("*.kicad_sch") if not _is_ignored(f))
+    all_boards = sorted(f for f in project_dir.rglob("*.kicad_pcb") if not _is_ignored(f))
+    pro_files = sorted(f for f in project_dir.rglob("*.kicad_pro") if not _is_ignored(f))
 
     if pro_files:
         lines.append(f"\n## Project Files")
@@ -241,6 +248,457 @@ def get_llm_synthesized_context(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def build_refine_questions_prompt(
+    initial_answers: List[Dict[str, str]],
+) -> Dict[str, Any]:
+    """Build a lightweight prompt for refining wizard questions.
+
+    This prompt is intentionally kept small (no raw context) so the LLM can
+    respond quickly.  It receives the user's initial answers and the list of
+    remaining default wizard questions.  The LLM decides which remaining
+    questions are still relevant and may add new ones.
+
+    Args:
+        initial_answers: Q&A dicts from the first wizard questions.
+
+    Returns:
+        Dict with ``messages`` (list of :class:`AIMessage`) and
+        ``system_prompt`` (str).
+    """
+    from ..ai.base import AIMessage
+    from ..requirements_wizard import get_default_questions, INITIAL_QUESTIONS_COUNT
+
+    # Format initial Q&A
+    qa_lines = "\n".join(
+        f"Q: {qa['question']}\nA: {qa['answer']}"
+        for qa in initial_answers
+    )
+
+    # Remaining default wizard questions (used as reference categories only)
+    remaining = get_default_questions()[INITIAL_QUESTIONS_COUNT:]
+    category_hints = ", ".join(sorted({q["category"] for q in remaining}))
+
+    prompt = (
+        "A user is defining requirements for a PCB project.  They have "
+        "answered these initial questions:\n\n"
+        f"{qa_lines}\n\n"
+        "Your job is to identify the **3 to 5 most important** unanswered "
+        "requirements for this specific project.  Focus only on questions "
+        "whose answers would materially affect the PCB design.\n\n"
+        "## Rules\n"
+        "- Do NOT re-ask anything the user already answered above.\n"
+        "- Do NOT ask vague or generic questions.  Every question must be "
+        "specific to what the user described.\n"
+        "- Ask only about things that drive schematic/layout decisions: "
+        "power architecture, key interfaces, physical constraints, or "
+        "critical component choices.\n"
+        f"- Categories to consider: {category_hints}.  Drop any category "
+        "that does not apply to this project.\n"
+        "- Limit yourself to **5 questions maximum**.\n\n"
+        "## Suggestions\n"
+        "For EACH question, provide 2-4 suggested answers that are:\n"
+        "- Concrete and specific (include part numbers, values, or specs)\n"
+        "- Realistically different options an engineer would weigh\n"
+        "- Self-contained — the user should be able to pick one as-is\n"
+        "Bad example: \"Depends on project needs\" — this is useless.\n"
+        "Good example: \"3.3 V single rail via AMS1117-3.3 LDO from 5 V USB\" "
+        "— this is specific and actionable.\n\n"
+        "Return ONLY a JSON array of objects:\n"
+        '  { "question": "<text>", "suggestions": ["<a1>", "<a2>", ...] }\n\n'
+        "Return ONLY valid JSON — no markdown fences, no explanation."
+    )
+
+    return {
+        "messages": [AIMessage(role="user", content=prompt)],
+        "system_prompt": (
+            "You are an experienced PCB design engineer helping define "
+            "project requirements.  Ask only high-impact questions whose "
+            "answers directly affect the board design.  Provide realistic, "
+            "specific suggested answers with concrete specs or part numbers.  "
+            "Return ONLY a valid JSON array — no prose."
+        ),
+    }
+
+def build_context_questions_prompt(
+    raw_context: str,
+    existing_requirements: str,
+    wizard_answers: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Build the messages and system prompt for context-question generation.
+
+    Args:
+        raw_context: Extracted project context text.
+        existing_requirements: Contents of an existing ``requirements.md``, if
+            any.
+        wizard_answers: Optional list of Q&A dicts from the initial wizard
+            questions the user answered before this LLM call.
+
+    Returns:
+        Dict with ``messages`` (list of :class:`AIMessage`) and
+        ``system_prompt`` (str).
+    """
+    from ..ai.base import AIMessage
+
+    requirements_section = ""
+    if existing_requirements.strip():
+        requirements_section = (
+            "\n\n## Existing Requirements\n\n" + existing_requirements
+        )
+
+    wizard_section = ""
+    if wizard_answers:
+        qa_lines = "\n".join(
+            f"Q: {qa['question']}\nA: {qa['answer']}\n"
+            for qa in wizard_answers
+        )
+        wizard_section = (
+            "\n\n## Already Answered (DO NOT re-ask)\n\n"
+            "The user has already provided the following information.  "
+            "Treat these as settled — do NOT ask about any topic already "
+            "covered here.\n\n" + qa_lines
+        )
+
+    prompt = (
+        "You are a KiCad PCB design assistant reviewing a real project."
+        + requirements_section
+        + wizard_section
+        + "\n\nBelow is the raw project context extracted from KiCad "
+        "schematic and board files.  Analyze it and ask **3 to 5** "
+        "questions that address the most critical gaps preventing you "
+        "from writing a complete requirements document.\n\n"
+        "## Rules\n"
+        "- Only ask questions whose answers **directly affect** the PCB "
+        "schematic or layout.  Skip nice-to-know questions.\n"
+        "- Never re-ask something already answered above or clearly "
+        "visible in the raw context (e.g. don't ask about voltage rails "
+        "that are already in the netlist).\n"
+        "- Reference specific components, nets, or sheets from the context "
+        "to make questions concrete.\n"
+        "- Maximum **5 questions**.  Fewer is better.\n"
+        "- If the context and existing answers are already sufficient to "
+        "write a requirements document, return an **empty array** `[]`.\n\n"
+        "## Suggestions\n"
+        "For EACH question, provide 2-4 suggested answers that:\n"
+        "- Are specific and actionable (include values, part numbers, or "
+        "specs where possible)\n"
+        "- Represent realistically different engineering trade-offs\n"
+        "- Could be selected as-is without modification\n"
+        "BAD: \"It depends on the application\" — useless.\n"
+        "GOOD: \"100 mm × 80 mm, 4-layer, 1.6 mm FR4\" — actionable.\n\n"
+        "IMPORTANT: If the context lists 'Unreferenced Sheets (not in "
+        "hierarchy)', those sheets are NOT actively used.  Focus on the "
+        "main hierarchy.\n\n"
+        "Return ONLY a JSON array of objects:\n"
+        '  { "question": "<text>", "suggestions": ["<a1>", "<a2>", ...] }\n\n'
+        "Return an empty array `[]` if no questions are needed.\n\n"
+        "---\n\n"
+        f"{raw_context}"
+    )
+
+    return {
+        "messages": [AIMessage(role="user", content=prompt)],
+        "system_prompt": (
+            "You are an experienced PCB design engineer.  Identify only "
+            "the critical gaps in the project information.  Ask at most 5 "
+            "questions.  Provide specific, actionable suggested answers "
+            "with real specs/values.  Return ONLY valid JSON — no prose, "
+            "no markdown fences."
+        ),
+    }
+
+
+def _fix_json_escapes(text: str) -> str:
+    r"""Fix invalid JSON escape sequences produced by LLMs.
+
+    LLMs often emit Windows paths (``C:\Users\...``) or other bare
+    backslashes inside JSON string values.  ``json.loads`` rejects
+    ``\U``, ``\S``, etc. because only ``\" \\ \/ \b \f \n \r \t \uXXXX``
+    are valid.  This function doubles any backslash that is NOT part of a
+    recognised JSON escape so that the result is valid JSON.
+    """
+    # Protect already-escaped backslash pairs (\\) so the regex below
+    # doesn't treat the second \ as a new escape start.
+    _PH = "\x00_DBLBS_\x00"
+    text = text.replace("\\\\", _PH)
+    # Fix lone backslashes not followed by a valid JSON escape character.
+    text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', text)
+    # Restore the protected pairs.
+    text = text.replace(_PH, "\\\\")
+    return text
+
+
+def _fix_raw_newlines_in_json_strings(text: str) -> str:
+    r"""Escape literal newlines / carriage-returns that sit inside JSON string values.
+
+    LLMs frequently produce multi-line content (e.g. Markdown) as the value
+    of a JSON key and forget to escape the newlines.  ``json.loads`` then
+    fails with ``Expecting ',' delimiter`` because a raw newline terminates
+    the string token.
+
+    Strategy: walk through the text character-by-character, tracking whether
+    we are inside a JSON string (between unescaped double-quotes).  Any raw
+    ``\n`` or ``\r`` found inside a string is replaced with ``\\n`` / ``\\r``.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch == '\\' and in_string and i + 1 < length:
+            # Escaped character — emit both and skip next
+            out.append(ch)
+            out.append(text[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+        elif in_string and ch == '\n':
+            out.append('\\n')
+        elif in_string and ch == '\r':
+            # skip \r if next char is \n (will be handled next iteration)
+            if i + 1 < length and text[i + 1] == '\n':
+                pass  # swallow bare \r before \n
+            else:
+                out.append('\\r')
+        elif in_string and ch == '\t':
+            out.append('\\t')
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _clean_llm_json(text: str) -> str:
+    """Strip thinking tags, code fences, and surrounding prose from LLM output.
+
+    Models like Gemma emit ``<think>...</think>`` reasoning blocks and may
+    wrap JSON in markdown fences or add explanatory text.  This helper
+    progressively cleans the text so that ``json.loads`` has the best chance
+    of succeeding.
+    """
+    # 1. Strip <think>...</think> blocks (defence-in-depth; main.py also does this)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    # 2. Extract content from markdown code fences (```json ... ``` etc.)
+    fence_match = re.search(r"```(?:\w*)\s*\n(.*?)```", text, flags=re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    # 3. If the text still doesn't start with [ or {, try to find the first
+    #    JSON array or object within the text.
+    if text and text[0] not in ("[", "{"):
+        arr = re.search(r"(\[.*\])", text, flags=re.DOTALL)
+        obj = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+        if arr:
+            text = arr.group(1)
+        elif obj:
+            text = obj.group(1)
+
+    # 4. Fix literal newlines/tabs inside JSON string values
+    text = _fix_raw_newlines_in_json_strings(text)
+
+    # 5. Fix invalid backslash escapes (e.g. Windows paths like C:\Users)
+    text = _fix_json_escapes(text)
+
+    # 6. Remove trailing commas before ] or } (common LLM mistake)
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+
+    return text.strip()
+
+
+def parse_context_questions_response(
+    response_text: str,
+) -> List[Dict[str, Any]]:
+    """Parse the LLM response into a list of question dicts.
+
+    Each dict has ``question`` (str) and ``suggestions`` (list of str).
+    Falls back to the old plain-string format for backwards compatibility.
+    """
+    import json as _json
+
+    text = _clean_llm_json(response_text)
+    if not text:
+        logger.error("Context questions response was empty after cleaning")
+        return []
+
+    try:
+        parsed = _json.loads(text)
+    except Exception as exc:
+        logger.error(
+            "Failed to parse context questions: %s  (cleaned text: %.200s)",
+            exc,
+            text,
+        )
+        return []
+
+    if not isinstance(parsed, list) or not parsed:
+        logger.warning("LLM returned non-list for questions: %s", type(parsed))
+        return []
+
+    result: List[Dict[str, Any]] = []
+    for item in parsed:
+        if isinstance(item, str):
+            # Legacy plain-string format
+            result.append({"question": item, "suggestions": []})
+        elif isinstance(item, dict) and "question" in item:
+            suggestions = item.get("suggestions", [])
+            if not isinstance(suggestions, list):
+                suggestions = []
+            result.append({
+                "question": str(item["question"]),
+                "suggestions": [str(s) for s in suggestions[:4]],
+            })
+        else:
+            logger.warning("Skipping unrecognised question item: %s", item)
+    return result
+
+
+def build_requirements_and_context_prompt(
+    raw_context: str,
+    existing_requirements: str,
+    questions_and_answers: List[Dict[str, str]],
+    *,
+    force_complete: bool = False,
+) -> Dict[str, Any]:
+    """Build the messages and system prompt for requirements/context generation.
+
+    Args:
+        raw_context: Raw context text from KiCad files.
+        existing_requirements: Existing ``requirements.md`` content (may be
+            empty).
+        questions_and_answers: List of Q&A dicts the user provided.
+        force_complete: When ``True`` the LLM is told it **must** produce a
+            final result — ``"needs_more_info"`` is not an option.
+
+    Returns:
+        Dict with ``messages`` (list of :class:`AIMessage`) and
+        ``system_prompt`` (str).
+    """
+    from ..ai.base import AIMessage
+
+    qa_text = "\n".join(
+        f"Q: {qa['question']}\nA: {qa['answer']}\n"
+        for qa in questions_and_answers
+    )
+
+    requirements_section = ""
+    if existing_requirements.strip():
+        requirements_section = (
+            "\n\n## Existing Requirements\n\n" + existing_requirements
+        )
+
+    if force_complete:
+        decision_block = (
+            "You MUST produce the final output now.  Do NOT return "
+            '"needs_more_info".  Use reasonable engineering defaults for '
+            "any information you do not have.  Mark assumptions clearly "
+            "in the requirements document with *(assumed)*."
+        )
+    else:
+        decision_block = (
+            "Decide whether you have enough information:\n"
+            "- **Strongly prefer producing a result.**  If you can write a "
+            "reasonable requirements document with the information provided, "
+            "do so — even if some details are missing.  Mark assumptions "
+            "with *(assumed)* in the document.\n"
+            '- Only return "needs_more_info" if a **critical** piece of '
+            "information is completely missing AND would fundamentally "
+            "change the design (e.g. you don't know the purpose of the "
+            "board at all).  Nice-to-have details are NOT critical."
+        )
+
+    prompt = (
+        "You are a KiCad PCB design assistant.  You have:\n"
+        "1. Raw project context extracted from KiCad files\n"
+        "2. The user's answers to clarifying questions\n"
+        + (
+            "3. Existing requirements for this project\n"
+            if existing_requirements.strip()
+            else ""
+        )
+        + "\n" + decision_block + "\n\n"
+        "When producing the result, create:\n"
+        "a) A concise technical **requirements document** (Markdown) — "
+        "organised into clear sections, written as an engineer would write "
+        "it.  Use standard ASCII only, no emojis.\n"
+        "b) A **synthesized project context** — a compact summary of the "
+        "design (project overview, schematic structure, key components by "
+        "function, power nets, signal nets, design notes).\n\n"
+        "Return ONLY a JSON object:\n"
+        '{"status": "done", "requirements": "<markdown>", '
+        '"synthesized_context": "<markdown>"}\n\n'
+        + (
+            ""
+            if force_complete
+            else (
+                "Or, ONLY if truly critical info is missing:\n"
+                '{"status": "needs_more_info", "questions": ["Q1", "Q2"]}\n'
+                "(maximum 3 questions)\n\n"
+            )
+        )
+        + "Return ONLY valid JSON — no markdown fences around the entire "
+        "response, no extra text.\n\n"
+        "---\n\n"
+        f"## Raw Project Context\n\n{raw_context}\n\n"
+        f"## User Q&A\n\n{qa_text}"
+        + requirements_section
+    )
+
+    return {
+        "messages": [AIMessage(role="user", content=prompt)],
+        "system_prompt": (
+            "You are an experienced PCB design engineer producing a "
+            "requirements document and project summary.  Strongly prefer "
+            "producing a final result over asking more questions.  "
+            "Return ONLY valid JSON — no prose, no markdown fences."
+        ),
+    }
+
+
+def parse_requirements_and_context_response(response_text: str) -> Dict[str, Any]:
+    """Parse the LLM response text into a requirements/context result dict.
+
+    Returns:
+        Dict with ``status`` (``"done"`` | ``"needs_more_info"`` | ``"error"``)
+        and associated data.
+    """
+    import json as _json
+
+    text = _clean_llm_json(response_text)
+    if not text:
+        logger.error("Requirements/context response was empty after cleaning")
+        return {"status": "error", "error": "Empty response from LLM"}
+
+    try:
+        result = _json.loads(text)
+        if isinstance(result, dict):
+            status = result.get("status", "")
+            if status == "done":
+                return {
+                    "status": "done",
+                    "requirements": result.get("requirements", ""),
+                    "synthesized_context": result.get("synthesized_context", ""),
+                }
+            elif status == "needs_more_info":
+                questions = result.get("questions", [])
+                if isinstance(questions, list):
+                    return {
+                        "status": "needs_more_info",
+                        "questions": [str(q) for q in questions],
+                    }
+        logger.warning("Unexpected LLM response structure: %s", text[:200])
+        return {"status": "done", "requirements": "", "synthesized_context": text}
+    except Exception as exc:
+        logger.error(
+            "Requirements/context parse failed: %s  (cleaned text: %.200s)",
+            exc,
+            text,
+        )
+        return {"status": "error", "error": str(exc)}
 
 
 def _find_main_schematic(

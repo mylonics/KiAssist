@@ -115,6 +115,23 @@ export interface SynthesizeResult extends ApiResult {
   todo?: string;
 }
 
+// Context Lifecycle types
+export interface ContextLifecycleQA {
+  question: string;
+  answer: string;
+}
+
+export interface ContextLifecycleState extends ApiResult {
+  state?: string;
+  raw_context?: string;
+  questions?: string[];
+  current_question_index?: number;
+  answers?: ContextLifecycleQA[];
+  requirements?: string;
+  synthesized_context?: string;
+  error?: string;
+}
+
 export interface InjectTestNoteResult extends ApiResult {
   message?: string;
   schematic_path?: string;
@@ -274,7 +291,7 @@ export interface PyWebViewAPI {
   // Chat API
   send_message: (message: string, model?: string) => Promise<SendMessageResult>;
   // Streaming API
-  start_stream_message: (message: string, model?: string) => Promise<ApiResult>;
+  start_stream_message: (message: string, model?: string, raw_mode?: boolean) => Promise<ApiResult>;
   poll_stream: () => Promise<StreamPollResult>;
   steer_stream: (message: string, model?: string) => Promise<ApiResult>;
   // LLM interaction log
@@ -302,6 +319,10 @@ export interface PyWebViewAPI {
   save_requirements: (projectDir: string, requirementsContent: string, todoContent?: string) => Promise<SaveRequirementsResult>;
   refine_wizard_questions: (initialAnswers: Record<string, string>, model?: string) => Promise<WizardQuestionsResult>;
   synthesize_requirements: (questions: WizardQuestion[], answers: Record<string, string>, projectName?: string, model?: string) => Promise<SynthesizeResult>;
+  // Context Lifecycle API
+  start_context_lifecycle: () => Promise<ContextLifecycleState>;
+  get_context_lifecycle_state: () => Promise<ContextLifecycleState>;
+  submit_context_answer: (answer: string) => Promise<ContextLifecycleState>;
   // Schematic API
   inject_schematic_test_note: (projectPath: string) => Promise<InjectTestNoteResult>;
   is_schematic_api_available: () => Promise<boolean>;

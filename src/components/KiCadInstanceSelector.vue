@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import type { KiCadInstance, RecentProject } from '../types/pywebview';
-import RequirementsWizard from './RequirementsWizard.vue';
+
+const emit = defineEmits<{
+  (e: 'context-questions-ready', questions: Array<{ question: string; suggestions: string[] }>): void;
+}>();
 
 // Configuration
 const MAX_VISIBLE_RECENT = 5;
@@ -16,11 +19,17 @@ const switcherOpen = ref(false);
 const showAllRecent = ref(false);
 let refreshTimer: number | null = null;
 
-// Requirements wizard state
-const showRequirementsWizard = ref(false);
+// Requirements status (updated by context lifecycle polling)
 const requirementsExists = ref(false);
 const todoExists = ref(false);
 let refreshInFlight = false;
+
+// Context lifecycle state
+const contextState = ref<string>('idle');
+const contextLoading = ref(false);
+const contextError = ref('');
+const contextQuestionsEmitted = ref(false);
+let contextPollTimer: ReturnType<typeof setInterval> | null = null;
 
 // Refs for click-outside detection
 const switcherRef = ref<HTMLElement | null>(null);
@@ -239,10 +248,6 @@ const selectedProjectDir = computed(() => {
   return lastSep > 0 ? path.substring(0, lastSep) : path;
 });
 
-const selectedProjectName = computed(() => {
-  return selectedProjectInfo.value?.name || 'Project';
-});
-
 const switcherLabel = computed(() => {
   if (!selectedProjectInfo.value) return 'Select Project';
   return selectedProjectInfo.value.name;
@@ -291,20 +296,86 @@ async function checkRequirementsFile() {
   }
 }
 
-function openRequirementsWizard() {
-  showRequirementsWizard.value = true;
+// ── Context Lifecycle ──────────────────────────────────────────────────
+
+const contextStateLabel = computed(() => {
+  switch (contextState.value) {
+    case 'extracting': return 'Extracting context...';
+    case 'refining': return 'Refining questions...';
+    case 'questioning': return 'Answering questions in chat';
+    case 'generating': return 'Generating requirements...';
+    case 'done': return 'Context built';
+    default: return '';
+  }
+});
+
+const contextIsWorking = computed(() =>
+  ['extracting', 'refining', 'generating'].includes(contextState.value)
+);
+
+async function startBuildContext() {
+  contextLoading.value = true;
+  contextError.value = '';
+  contextQuestionsEmitted.value = false;
+  try {
+    const api = (window as any).pywebview?.api;
+    if (!api) { contextError.value = 'Backend not available'; return; }
+    const result = await api.start_context_lifecycle();
+    if (result.success) {
+      contextState.value = result.state ?? 'idle';
+      startContextPolling();
+      checkAndEmitContextQuestions(result);
+    } else {
+      contextError.value = result.error || 'Failed to start context lifecycle';
+    }
+  } catch (e: any) {
+    contextError.value = e.message || 'Unknown error';
+  } finally {
+    contextLoading.value = false;
+  }
 }
 
-function closeRequirementsWizard() {
-  showRequirementsWizard.value = false;
+function checkAndEmitContextQuestions(data: any) {
+  if (contextQuestionsEmitted.value) return;
+  const qs = data.questions ?? [];
+  console.log('[KiCadSelector] checkAndEmitContextQuestions: state=', data.state, 'questions=', qs.length);
+  if (qs.length > 0 && data.state === 'questioning') {
+    contextQuestionsEmitted.value = true;
+    console.log('[KiCadSelector] Emitting context-questions-ready, count:', qs.length);
+    emit('context-questions-ready', qs);
+  }
 }
 
-function onRequirementsSaved(files: string[]) {
-  console.log('Requirements saved:', files);
-  showRequirementsWizard.value = false;
-  checkRequirementsFile();
+function startContextPolling() {
+  stopContextPolling();
+  contextPollTimer = setInterval(async () => {
+    try {
+      const api = (window as any).pywebview?.api;
+      if (!api) return;
+      const result = await api.get_context_lifecycle_state();
+      if (result.success) {
+        contextState.value = result.state ?? 'idle';
+        checkAndEmitContextQuestions(result);
+        if (result.state === 'done' || result.state === 'idle') {
+          stopContextPolling();
+          // Refresh requirements status since the lifecycle may have written requirements.md
+          checkRequirementsFile();
+        }
+      }
+    } catch (e) {
+      console.error('[KiCadSelector] Context poll error:', e);
+    }
+  }, 1000);
 }
 
+function stopContextPolling() {
+  if (contextPollTimer) {
+    clearInterval(contextPollTimer);
+    contextPollTimer = null;
+  }
+}
+
+// ── Watch for project changes ──────────────────────────────────────────
 // Watch for project changes to update requirements status and notify backend
 watch(selectedProject, async (newProject) => {
   checkRequirementsFile();
@@ -333,6 +404,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopRefreshTimer();
+  stopContextPolling();
   document.removeEventListener('click', handleClickOutside);
 });
 </script>
@@ -444,30 +516,26 @@ onUnmounted(() => {
       <p class="hint">Open KiCAD or browse for a project</p>
     </div>
 
-    <!-- Requirements Status -->
-    <div v-if="selectedProjectInfo" class="requirements-section">
-      <div class="requirements-status" :class="{ exists: requirementsExists }">
-        <span class="material-icons req-icon">{{ requirementsExists ? 'check_circle' : 'error_outline' }}</span>
-        <span class="status-text">{{ requirementsExists ? 'requirements.md' : 'No requirements.md' }}</span>
-      </div>
-      <button 
-        @click="openRequirementsWizard" 
-        class="requirements-btn"
-        :title="requirementsExists ? 'Update requirements' : 'Create requirements'"
+    <!-- Build Context -->
+    <div v-if="selectedProjectInfo" class="context-section">
+      <button
+        class="build-context-btn"
+        :disabled="contextLoading || contextIsWorking"
+        @click="startBuildContext"
       >
-        <span class="material-icons">{{ requirementsExists ? 'edit' : 'add' }}</span>
-        {{ requirementsExists ? 'Edit' : 'Create' }}
+        <span v-if="contextLoading || contextIsWorking" class="material-icons spin-icon">sync</span>
+        <span v-else class="material-icons">auto_awesome</span>
+        {{ contextLoading || contextIsWorking ? contextStateLabel : (contextState === 'done' ? 'Rebuild Context' : 'Build Context') }}
       </button>
+      <div v-if="contextError" class="context-error">
+        <span class="material-icons">warning</span>
+        {{ contextError }}
+      </div>
+      <div v-if="contextState === 'done'" class="context-done-badge">
+        <span class="material-icons">check_circle</span>
+        Context ready
+      </div>
     </div>
-
-    <!-- Requirements Wizard Modal -->
-    <RequirementsWizard
-      :project-dir="selectedProjectDir"
-      :project-name="selectedProjectName"
-      :visible="showRequirementsWizard"
-      @close="closeRequirementsWizard"
-      @saved="onRequirementsSaved"
-    />
   </div>
 </template>
 
@@ -758,57 +826,78 @@ onUnmounted(() => {
   opacity: 0.7;
 }
 
-/* ── Requirements Section ── */
-.requirements-section {
+/* ── Build Context Section ── */
+.context-section {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.375rem 0;
-}
-
-.requirements-status {
-  display: flex;
-  align-items: center;
+  flex-direction: column;
   gap: 0.375rem;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
+  padding-top: 0.25rem;
+  border-top: 1px solid var(--border-color);
 }
 
-.requirements-status .req-icon {
-  font-size: 0.875rem;
-  color: #f59e0b;
-}
-
-.requirements-status.exists .req-icon {
-  color: #22c55e;
-}
-
-.requirements-status .status-text {
-  font-weight: 500;
-}
-
-.requirements-btn {
+.build-context-btn {
   display: flex;
   align-items: center;
-  gap: 0.25rem;
-  padding: 0.25rem 0.5rem;
+  justify-content: center;
+  gap: 0.375rem;
+  width: 100%;
+  padding: 0.5rem 0.625rem;
   background: linear-gradient(135deg, var(--accent-color) 0%, var(--accent-hover) 100%);
   color: white;
   border: none;
-  border-radius: var(--radius-sm);
-  font-size: 0.6875rem;
-  font-weight: 500;
+  border-radius: var(--radius-md);
+  font-size: 0.8125rem;
+  font-weight: 600;
   cursor: pointer;
   transition: all 0.15s ease;
 }
 
-.requirements-btn:hover {
+.build-context-btn:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--shadow-md);
 }
 
-.requirements-btn .material-icons {
-  font-size: 0.8125rem;
+.build-context-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.build-context-btn .material-icons {
+  font-size: 1rem;
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.context-error {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.6875rem;
+  color: #ef4444;
+}
+
+.context-error .material-icons {
+  font-size: 0.875rem;
+}
+
+.context-done-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.6875rem;
+  color: #22c55e;
+  font-weight: 500;
+}
+
+.context-done-badge .material-icons {
+  font-size: 0.875rem;
 }
 
 

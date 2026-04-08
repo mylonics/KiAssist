@@ -29,6 +29,8 @@ _FIELD_ALIASES: Dict[str, str] = {
     "part number": "MPN",
     "manufacturer_part_number": "MPN",
     "manufacturer part number": "MPN",
+    "manufacturer part": "MPN",
+    "bom_manufacturer part": "MPN",
     "mfr#": "MPN",
     # Manufacturer variants
     "mf": "MF",
@@ -37,6 +39,7 @@ _FIELD_ALIASES: Dict[str, str] = {
     "mfg": "MF",
     "mfgr": "MF",
     "brand": "MF",
+    "bom_manufacturer": "MF",
     # Digi-Key variants
     "dkpn": "DKPN",
     "dk_pn": "DKPN",
@@ -56,6 +59,8 @@ _FIELD_ALIASES: Dict[str, str] = {
     "lcsc_pn": "LCSC",
     "lcsc part number": "LCSC",
     "lcsc#": "LCSC",
+    "supplier part": "LCSC",
+    "bom_supplier part": "LCSC",
     # Standard KiCad fields
     "reference": "Reference",
     "ref": "Reference",
@@ -68,6 +73,11 @@ _FIELD_ALIASES: Dict[str, str] = {
     "pkg": "Package",
     "case": "Package",
 }
+
+# Supplier field is metadata about where it came from, not useful as a KiCad field.
+_SUPPLIER_FIELDS: frozenset = frozenset(
+    {"supplier", "bom_supplier"}
+)
 
 # Fields that are clearly redundant/junk and should be dropped.
 _JUNK_FIELDS: frozenset = frozenset(
@@ -91,6 +101,24 @@ _JUNK_FIELDS: frozenset = frozenset(
 def _normalize_field_name(raw: str) -> str:
     """Return the canonical field name for *raw*, or *raw* unchanged."""
     return _FIELD_ALIASES.get(raw.strip().lower(), raw.strip())
+
+
+# Regex to strip Chinese/CJK parenthetical suffixes, e.g. "TI(德州仪器)" → "TI"
+_CJK_PAREN_RE = re.compile(
+    r"\s*[\(（]"          # opening paren (ASCII or fullwidth)
+    r"[^\x00-\x7F]+"     # one or more non-ASCII chars (Chinese, etc.)
+    r"[\)）]"             # closing paren
+    r"\s*$"               # end of string
+)
+
+
+def _clean_manufacturer(name: str) -> str:
+    """Strip Chinese parenthetical from manufacturer names.
+
+    EasyEDA often appends the Chinese localisation, e.g. ``TI(德州仪器)``.
+    We keep only the English portion.
+    """
+    return _CJK_PAREN_RE.sub("", name).strip()
 
 
 def normalize_fields(raw_fields: Dict[str, str]) -> FieldSet:
@@ -119,8 +147,10 @@ def normalize_fields(raw_fields: Dict[str, str]) -> FieldSet:
         if not value or not value.strip():
             continue
         norm_name = _normalize_field_name(name)
-        # Skip junk fields
+        # Skip junk / supplier metadata fields
         if norm_name.lower() in _JUNK_FIELDS or norm_name.lower() == "~":
+            continue
+        if name.strip().lower() in _SUPPLIER_FIELDS:
             continue
         # Keep the last non-empty value if we see the same canonical name twice
         canonical[norm_name] = value.strip()
@@ -134,7 +164,7 @@ def normalize_fields(raw_fields: Dict[str, str]) -> FieldSet:
     fs.package = canonical.pop("Package", "")
 
     fs.mpn = canonical.pop("MPN", "")
-    fs.manufacturer = canonical.pop("MF", "")
+    fs.manufacturer = _clean_manufacturer(canonical.pop("MF", ""))
     fs.digikey_pn = canonical.pop("DKPN", "")
     fs.mouser_pn = canonical.pop("MSPN", "")
     fs.lcsc_pn = canonical.pop("LCSC", "")

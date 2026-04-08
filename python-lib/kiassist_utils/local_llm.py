@@ -89,6 +89,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
         "description": "Smallest variant (5B params) — fast, low memory. Good for quick prototyping.",
         "context_window": 32_768,
         "n_layers": 34,
+        "n_vocab": 262_144,
     },
     {
         "id": "gemma4-e4b-q4_k_m",
@@ -100,6 +101,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
         "description": "Balanced quality and speed (8B params) — recommended for most use cases.",
         "context_window": 32_768,
         "n_layers": 34,
+        "n_vocab": 262_144,
     },
     {
         "id": "gemma4-26b-a4b-q4_k_m",
@@ -111,6 +113,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
         "description": "MoE variant (25B params, 4B active) — strong quality, efficient inference.",
         "context_window": 32_768,
         "n_layers": 30,
+        "n_vocab": 262_144,
     },
     {
         "id": "gemma4-31b-q4_k_m",
@@ -122,6 +125,7 @@ _KNOWN_MODEL_VARIANTS: List[Dict[str, Any]] = [
         "description": "Largest variant (31B params) — best quality, requires 24+ GB RAM.",
         "context_window": 32_768,
         "n_layers": 46,
+        "n_vocab": 262_144,
     },
 ]
 
@@ -598,7 +602,10 @@ class LocalModelManager:
         model_size_mb = variant.get("size_bytes", 0) / (1024 * 1024)
 
         if free_vram_mb is None and free_ram_mb is None:
-            return min(requested_n_ctx, 8192)
+            # No memory info: use a conservative default.
+            # For large-vocab models the scores array alone at 8192
+            # context would need several GiB, so pick 4096 as safe.
+            return min(requested_n_ctx, 4096)
 
         # Total available memory (RAM + VRAM)
         total_free_mb = (free_ram_mb or 0) + (free_vram_mb or 0)
@@ -613,19 +620,30 @@ class LocalModelManager:
         n_layers = variant.get("n_layers", 30)
         kv_per_1k_tokens_mb = n_layers * 0.5
 
-        # Use at most 70% of remaining memory for KV cache, keep 30% headroom
-        available_for_kv_mb = memory_after_model * 0.70
+        # Scores array sizing: llama-cpp-python allocates a numpy float32
+        # array of shape (n_ctx, n_vocab) when logits_all=True (server
+        # default).  For large-vocab models (e.g. Gemma 4 with 262K vocab)
+        # this can easily exceed available RAM and must be accounted for.
+        n_vocab = variant.get("n_vocab", 32_000)
+        scores_per_1k_tokens_mb = (1024 * n_vocab * 4) / (1024 * 1024)  # float32
 
-        if kv_per_1k_tokens_mb > 0:
-            max_ctx_by_memory = int((available_for_kv_mb / kv_per_1k_tokens_mb) * 1024)
+        # Total per-1K-token cost = KV cache + scores array
+        total_per_1k_tokens_mb = kv_per_1k_tokens_mb + scores_per_1k_tokens_mb
+
+        # Use at most 70% of remaining memory for KV cache + scores,
+        # keep 30% headroom for other allocations
+        available_mb = memory_after_model * 0.70
+
+        if total_per_1k_tokens_mb > 0:
+            max_ctx_by_memory = int((available_mb / total_per_1k_tokens_mb) * 1024)
         else:
             max_ctx_by_memory = requested_n_ctx
 
-        # Clamp to a minimum of 8192 (models need a reasonable context)
-        # and the model's max context window
+        # Clamp to a minimum of 2048 (below this the model is barely
+        # usable) and the model's max context window
         max_context_window = variant.get("context_window", 32_768)
         result = min(requested_n_ctx, max_ctx_by_memory, max_context_window)
-        result = max(result, 8192)  # never go below 8192
+        result = max(result, 2048)  # never go below 2048
 
         if result < requested_n_ctx:
             logger.info(
@@ -740,6 +758,7 @@ class LocalModelManager:
                     "--port", str(self._server_port),
                     "--n_ctx", str(n_ctx),
                     "--n_gpu_layers", str(n_gpu_layers),
+                    "--n_batch", "512",
                 ]
 
                 logger.info("Starting local LLM server: %s", " ".join(cmd))

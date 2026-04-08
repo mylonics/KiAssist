@@ -7,15 +7,36 @@ import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
 import ComponentSearch from './components/ComponentSearch.vue';
 import SymbolImporter from './components/SymbolImporter.vue';
+import ImporterDetails from './components/ImporterDetails.vue';
+import type { ImportedComponent } from './types/importer';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
-const rightPanelCollapsed = ref(false);
+const rightPanelCollapsed = ref(true);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
 const leftPanelTab = ref<'kicad' | 'search' | 'importer'>('kicad');
 
+// Importer details overlay state
+const importedComponent = ref<ImportedComponent | null>(null);
+const importWarnings = ref<string[]>([]);
+
+function handleComponentImported(component: ImportedComponent, warnings: string[]) {
+  importedComponent.value = component;
+  importWarnings.value = warnings;
+}
+
+function handleImporterClose() {
+  importedComponent.value = null;
+  importWarnings.value = [];
+}
+
 function handleInsertInChat(text: string) {
   chatBox.value?.insertText(text);
+}
+
+function handleContextQuestionsReady(questions: Array<{ question: string; suggestions: string[] }>) {
+  console.log('[App] handleContextQuestionsReady, questions:', questions.length, 'chatBox ref:', !!chatBox.value);
+  chatBox.value?.startContextQA(questions);
 }
 </script>
 
@@ -49,16 +70,28 @@ function handleInsertInChat(text: string) {
         </button>
       </div>
       <div class="left-panel-content">
-        <KiCadInstanceSelector v-show="leftPanelTab === 'kicad'" />
+        <KiCadInstanceSelector
+          v-show="leftPanelTab === 'kicad'"
+          @context-questions-ready="handleContextQuestionsReady"
+        />
         <ComponentSearch
           v-show="leftPanelTab === 'search'"
           @insert-in-chat="handleInsertInChat"
         />
-        <SymbolImporter v-show="leftPanelTab === 'importer'" />
+        <SymbolImporter
+          v-show="leftPanelTab === 'importer'"
+          @component-imported="handleComponentImported"
+        />
       </div>
     </aside>
     <main class="chat-panel">
-      <ChatBox ref="chatBox" :activityPanel="activityPanel" />
+      <ImporterDetails
+        v-if="importedComponent"
+        :component="importedComponent"
+        :warnings="importWarnings"
+        @close="handleImporterClose"
+      />
+      <ChatBox v-else ref="chatBox" :activityPanel="activityPanel" />
     </main>
     <button
       class="panel-toggle-btn"
