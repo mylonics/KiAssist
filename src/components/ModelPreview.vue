@@ -456,6 +456,11 @@ function initScene() {
 
   // Orbit controls
   controls = new OrbitControls(camera, renderer.domElement);
+  controls.mouseButtons = {
+    LEFT: THREE.MOUSE.PAN,
+    MIDDLE: THREE.MOUSE.DOLLY,
+    RIGHT: THREE.MOUSE.ROTATE,
+  };
   controls.enableDamping = true;
   controls.dampingFactor = 0.1;
   controls.minDistance = 1;

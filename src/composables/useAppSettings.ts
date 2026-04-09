@@ -11,7 +11,17 @@ import { ref, watch } from 'vue';
 export interface FieldDefault {
   key: string;
   enabled: boolean;
+  /** Non-editable description identifying the purpose of this field */
+  description?: string;
 }
+
+/** Descriptions for the built-in configurable fields */
+export const FIELD_DESCRIPTIONS: Record<string, string> = {
+  MF: 'Manufacturer',
+  MPN: 'Manufacturer Part Number',
+  DKPN: 'Digi-Key Part Number',
+  LCSC: 'LCSC Part Number',
+};
 
 export interface AppSettings {
   /** Symbol field defaults (ordered list of field key + enabled) */
@@ -30,6 +40,8 @@ export interface AppSettings {
   lastFpLib: string;
   /** Last-used 3D models directory */
   lastModelsDir: string;
+  /** Default symbols for variant import per component type */
+  variantDefaultSymbols: Record<string, { library: string; symbol: string }>;
 }
 
 // -----------------------------------------------------------------------
@@ -40,15 +52,10 @@ const STORAGE_KEY = 'kiassist_settings';
 
 const defaults: AppSettings = {
   fieldDefaults: [
-    { key: 'Reference', enabled: true },
-    { key: 'Value', enabled: true },
-    { key: 'Footprint', enabled: true },
-    { key: 'Datasheet', enabled: true },
-    { key: 'Description', enabled: true },
-    { key: 'MF', enabled: true },
-    { key: 'MPN', enabled: true },
-    { key: 'DKPN', enabled: true },
-    { key: 'LCSC', enabled: true },
+    { key: 'MF', enabled: true, description: 'Manufacturer' },
+    { key: 'MPN', enabled: true, description: 'Manufacturer Part Number' },
+    { key: 'DKPN', enabled: true, description: 'Digi-Key Part Number' },
+    { key: 'LCSC', enabled: true, description: 'LCSC Part Number' },
   ],
   defaultSymLib: '',
   defaultFpLib: '',
@@ -57,6 +64,12 @@ const defaults: AppSettings = {
   lastSymLib: '',
   lastFpLib: '',
   lastModelsDir: '',
+  variantDefaultSymbols: {
+    resistor:  { library: 'Device', symbol: 'R_Small_US' },
+    capacitor: { library: 'Device', symbol: 'C_Small' },
+    inductor:  { library: 'Device', symbol: 'L_Small' },
+    diode:     { library: 'Device', symbol: 'D_Small' },
+  },
 };
 
 function loadFromStorage(): AppSettings {
@@ -96,6 +109,7 @@ export function useAppSettings() {
         settings.value.fieldDefaults = r.fields.map((f: any) => ({
           key: f.key || '',
           enabled: f.enabled === 'true' || f.enabled === true,
+          description: f.description || FIELD_DESCRIPTIONS[f.key] || undefined,
         }));
       }
     } catch { /* ignore */ }

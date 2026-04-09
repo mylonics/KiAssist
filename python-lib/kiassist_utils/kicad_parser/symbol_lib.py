@@ -121,6 +121,14 @@ class SymbolUnit:
 
     def to_tree(self, parent_name: str = "") -> List[SExpr]:
         if self.raw_tree is not None:
+            # If the parent was renamed we must patch the unit name in the
+            # preserved raw tree so KiCad sees the correct prefix.
+            if parent_name and len(self.raw_tree) > 1:
+                old_name = str(self.raw_tree[1])
+                expected_suffix = f"_{self.unit_number}_{self.style}"
+                new_name = f"{parent_name}{expected_suffix}"
+                if old_name != new_name:
+                    self.raw_tree[1] = QStr(new_name)
             return self.raw_tree
         unit_name = f"{parent_name}_{self.unit_number}_{self.style}" if parent_name else f"unit_{self.unit_number}_{self.style}"
         tree: List[SExpr] = ["symbol", QStr(unit_name)]
@@ -196,6 +204,9 @@ class SymbolDef:
 
     def to_tree(self) -> List[SExpr]:
         if self.raw_tree is not None:
+            # Patch the symbol name in case it was changed after parsing.
+            if len(self.raw_tree) > 1 and str(self.raw_tree[1]) != self.name:
+                self.raw_tree[1] = QStr(self.name)
             return self.raw_tree
         tree: List[SExpr] = ["symbol", QStr(self.name)]
         if self.extends:
@@ -254,8 +265,13 @@ class SymbolLibrary:
     def load(cls, path: str | os.PathLike) -> "SymbolLibrary":
         """Load a symbol library from *path*.
 
+        Supports both single ``.kicad_sym`` files and KiCad 10+
+        ``.kicad_symdir`` directories (which contain one ``.kicad_sym``
+        file per symbol).
+
         Args:
-            path: Path to a ``.kicad_sym`` file.
+            path: Path to a ``.kicad_sym`` file or ``.kicad_symdir``
+                  directory.
 
         Returns:
             Parsed :class:`SymbolLibrary`.
@@ -264,9 +280,38 @@ class SymbolLibrary:
             FileNotFoundError: If *path* does not exist.
             ValueError: If the file is not a valid KiCad symbol library.
         """
-        text = Path(path).read_text(encoding="utf-8")
+        p = Path(path)
+        if p.is_dir():
+            return cls._load_symdir(p)
+        text = p.read_text(encoding="utf-8")
         tree = parse(text)
         return cls._from_tree(tree)
+
+    @classmethod
+    def _load_symdir(cls, dirpath: Path) -> "SymbolLibrary":
+        """Load a KiCad 10+ directory-based symbol library.
+
+        Each ``.kicad_sym`` file in *dirpath* contains one symbol.
+        All are merged into a single :class:`SymbolLibrary`.
+        """
+        lib = cls()
+        for sym_file in sorted(dirpath.glob("*.kicad_sym")):
+            try:
+                text = sym_file.read_text(encoding="utf-8")
+                tree = parse(text)
+                sub = cls._from_tree(tree)
+                lib.symbols.extend(sub.symbols)
+                if not lib.version and sub.version:
+                    lib.version = sub.version
+                    lib.generator = sub.generator
+                    lib.generator_version = sub.generator_version
+            except Exception:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "Failed to parse symbol file %s", sym_file, exc_info=True,
+                )
+                continue
+        return lib
 
     def save(self, path: str | os.PathLike) -> None:
         """Write the symbol library to *path*.

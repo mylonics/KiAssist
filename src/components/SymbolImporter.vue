@@ -71,11 +71,39 @@ const searchResults = ref<SearchResult[]>([]);
 const selectedResult = ref<SearchResult | null>(null);
 const searching = ref(false);
 
+// Library index status
+interface IndexStatus {
+  ready: boolean;
+  building: boolean;
+  symbol_count: number;
+  footprint_count: number;
+  build_time: number;
+  from_cache: boolean;
+}
+const indexStatus = ref<IndexStatus | null>(null);
+let _indexPollTimer: ReturnType<typeof setInterval> | null = null;
+
 // -----------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------
 
+/** Wait for pywebview API bridge to be available. */
+function waitForApi(): Promise<boolean> {
+  if ((window as any).pywebview?.api) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const onReady = () => resolve(!!(window as any).pywebview?.api);
+    window.addEventListener('pywebviewready', onReady, { once: true });
+    // Timeout after 5s so we don't hang forever in dev/test
+    setTimeout(() => {
+      window.removeEventListener('pywebviewready', onReady);
+      resolve(!!(window as any).pywebview?.api);
+    }, 5000);
+  });
+}
+
 onMounted(async () => {
+  const ready = await waitForApi();
+  if (!ready) return;
   const api = (window as any).pywebview?.api;
   if (!api) return;
   try {
@@ -86,10 +114,14 @@ onMounted(async () => {
   }
   // Load libraries on startup
   await loadLibraries();
+  // Start polling library index status
+  await pollIndexStatus();
+  _indexPollTimer = setInterval(pollIndexStatus, 2000);
 });
 
 onBeforeUnmount(() => {
   if (_progressTimer) clearInterval(_progressTimer);
+  if (_indexPollTimer) { clearInterval(_indexPollTimer); _indexPollTimer = null; }
 });
 
 async function loadLibraries() {
@@ -136,6 +168,26 @@ function getApi() {
 function clearError() {
   error.value = '';
 }
+
+/** Reset all importer form state (called when user closes a part). */
+function resetImporter() {
+  partMpn.value = '';
+  partSpn.value = '';
+  partLcsc.value = '';
+  cadSources.value = [];
+  octopartUrl.value = '';
+  partLookupFailed.value = false;
+  partLookupFields.value = null;
+  zipPaths.value = [];
+  searchQuery.value = '';
+  searchLibrary.value = '';
+  searchResults.value = [];
+  selectedResult.value = null;
+  error.value = '';
+  lookupStatus.value = '';
+}
+
+defineExpose({ resetImporter });
 
 // -----------------------------------------------------------------------
 // Part lookup import (MPN / SPN / LCSC → Octopart + EasyEDA)
@@ -301,6 +353,42 @@ async function importZips() {
     zipsLoading.value = false;
     loading.value = false;
   }
+}
+
+// -----------------------------------------------------------------------
+// Library index status polling
+// -----------------------------------------------------------------------
+
+async function pollIndexStatus() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const s = await api.importer_library_index_status();
+    if (s) {
+      indexStatus.value = s as IndexStatus;
+      // Stop polling once index is ready and not currently building
+      if (s.ready && !s.building && _indexPollTimer) {
+        clearInterval(_indexPollTimer);
+        _indexPollTimer = null;
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+async function rescanLibraries() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_reload_libraries();
+    // Immediately reflect building state from the response
+    if (r?.status) {
+      indexStatus.value = r.status as IndexStatus;
+    }
+    // Resume polling to track the background scan
+    if (!_indexPollTimer) {
+      _indexPollTimer = setInterval(pollIndexStatus, 2000);
+    }
+  } catch { /* ignore */ }
 }
 
 // -----------------------------------------------------------------------
@@ -554,6 +642,25 @@ function handleResult(r: any) {
         <div class="method-label">
           <span class="material-icons method-icon">library_books</span>
           KiCad Library
+          <!-- Symbol count badge when ready -->
+          <span
+            v-if="indexStatus && indexStatus.ready && !indexStatus.building"
+            class="index-badge ready"
+            :title="`${indexStatus.symbol_count} symbols, ${indexStatus.footprint_count} footprints`"
+          >
+            <span class="material-icons">check_circle</span>
+            <span class="index-badge-text">{{ indexStatus.symbol_count }}</span>
+          </span>
+          <!-- Single sync icon: spinning when building, clickable when idle -->
+          <button
+            class="index-sync-btn"
+            :class="{ building: indexStatus?.building }"
+            :title="indexStatus?.building ? 'Scanning KiCad libraries…' : 'Rescan KiCad libraries'"
+            :disabled="!!indexStatus?.building"
+            @click="rescanLibraries"
+          >
+            <span class="material-icons" :class="{ spin: indexStatus?.building }">sync</span>
+          </button>
         </div>
         <div class="input-row">
           <input
@@ -1093,5 +1200,73 @@ code {
   font-size: 0.58rem;
   opacity: 0.55;
   font-weight: 400;
+}
+
+/* ===== Library index status indicator ===== */
+
+.index-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.62rem;
+  font-weight: 600;
+  padding: 0.05rem 0.35rem 0.05rem 0.15rem;
+  border-radius: 9999px;
+  line-height: 1;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.index-badge .material-icons {
+  font-size: 0.78rem;
+}
+
+.index-badge.ready {
+  color: #3ba55d;
+  background: color-mix(in srgb, #3ba55d 10%, transparent);
+}
+
+.index-badge-text {
+  font-size: 0.62rem;
+}
+
+/* Single sync/rescan button — always visible */
+.index-sync-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+  color: var(--text-secondary, #999);
+  padding: 0.12rem;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  margin-left: 0.15rem;
+}
+
+.index-sync-btn:not(.building):hover {
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent-color) 25%, transparent);
+}
+
+.index-sync-btn.building {
+  color: var(--accent-color);
+  cursor: default;
+}
+
+.index-sync-btn .material-icons {
+  font-size: 0.92rem;
+}
+
+/* Spinning animation for sync icon */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.spin {
+  animation: spin 1.2s linear infinite;
 }
 </style>

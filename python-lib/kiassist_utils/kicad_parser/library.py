@@ -272,7 +272,11 @@ def _parse_lib_table(path: Path, _depth: int = 0) -> List[LibraryEntry]:
             continue
         # KiCad 10+: follow nested table references
         if entry.plugin_type == "Table":
-            sub_path = Path(entry.uri)
+            # Expand ${VAR} substitutions before resolving the path
+            resolved_uri = entry.uri
+            for var, val in _default_env().items():
+                resolved_uri = resolved_uri.replace(f"${{{var}}}", val)
+            sub_path = Path(resolved_uri)
             if sub_path.is_file():
                 entries.extend(_parse_lib_table(sub_path, _depth + 1))
         else:

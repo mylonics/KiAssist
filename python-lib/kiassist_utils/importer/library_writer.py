@@ -55,10 +55,19 @@ def _update_or_append(sym: SymbolDef, name: str, value: str, *, hidden: bool = F
 
 
 def _apply_fields_to_symbol(sym: SymbolDef, component: ImportedComponent) -> None:
-    """Overwrite / insert all normalised fields onto *sym*."""
+    """Overwrite / insert all normalised fields onto *sym*.
+
+    All pre-existing properties are removed first so that the saved symbol
+    contains *only* the fields visible in the GUI — no stale or aliased
+    properties (e.g. ``Manufacturer`` with Chinese text from EasyEDA) leak
+    through.
+    """
     sym.raw_tree = None  # Force re-serialisation from dataclass fields
 
     fs = component.fields
+
+    # Wipe all existing properties so only GUI-visible fields survive.
+    sym.properties = []
 
     # KiCad built-in fields (always present)
     _update_or_append(sym, "Reference", fs.reference or "U", hidden=False)
@@ -163,7 +172,7 @@ def write_symbol_to_library(
 
 def _safe_sym_name(raw: str) -> str:
     """Sanitise a symbol name for KiCad: no spaces or special chars."""
-    name = re.sub(r"[^A-Za-z0-9_\-.]", "_", raw.strip())
+    name = re.sub(r"[^A-Za-z0-9_\-.%]", "_", raw.strip())
     return name or "Component"
 
 
@@ -249,18 +258,20 @@ def write_footprint_to_library(
         m_dir = Path(models_dir)
 
     # Copy 3-D models (unless skip_models is set)
+    # Use the resolved fp_name as the base stem so model filenames track
+    # the (possibly incremented) footprint name.
     eff_overwrite_models = overwrite_models if overwrite_models is not None else overwrite
     copied_models: List[Path] = []
     if not skip_models:
         for src in component.model_paths:
             m_dir.mkdir(parents=True, exist_ok=True)
-            dst = m_dir / src.name
+            model_suffix = src.suffix  # .step, .wrl, etc.
+            dst = m_dir / f"{fp_name}{model_suffix}"
             if dst.exists() and not eff_overwrite_models:
                 i = 2
-                stem, suffix = src.stem, src.suffix
-                while (m_dir / f"{stem}_{i}{suffix}").exists():
+                while (m_dir / f"{fp_name}_{i}{model_suffix}").exists():
                     i += 1
-                dst = m_dir / f"{stem}_{i}{suffix}"
+                dst = m_dir / f"{fp_name}_{i}{model_suffix}"
             shutil.copy2(src, dst)
             copied_models.append(dst)
 
@@ -271,6 +282,10 @@ def write_footprint_to_library(
         # Patch 3-D model references into the footprint text if we copied models
         if copied_models:
             fp_text = _inject_3d_models(fp_text, copied_models, fp_lib_dir=lib_dir)
+
+        # Update the internal footprint name to match the (possibly
+        # incremented) filename so the .kicad_mod is self-consistent.
+        fp_text = _rename_footprint_in_sexpr(fp_text, fp_name)
     else:
         # Create a minimal empty footprint
         fp_text = (
@@ -289,8 +304,48 @@ def write_footprint_to_library(
 
 
 def _safe_fp_name(raw: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_\-.]", "_", raw.strip())
+    name = re.sub(r"[^A-Za-z0-9_\-.%]", "_", raw.strip())
     return name or "Footprint"
+
+
+def _rename_footprint_in_sexpr(fp_text: str, new_name: str) -> str:
+    """Update the footprint name inside the S-expression to *new_name*.
+
+    Handles both ``(footprint "Name" ...)`` and ``(module "Name" ...)``
+    (legacy format).  Also updates the ``Value`` property if it matches the
+    old name so the visible label stays consistent.
+    """
+    try:
+        tree = parse(fp_text.strip())
+    except ValueError:
+        # Fallback: regex replacement on the opening tag
+        fp_text = re.sub(
+            r'(\((?:footprint|module)\s+)"([^"]*)"',
+            rf'\1"{new_name}"',
+            fp_text,
+            count=1,
+        )
+        return fp_text
+
+    if not tree or tree[0] not in ("footprint", "module"):
+        return fp_text
+
+    old_name = str(tree[1]) if len(tree) > 1 else ""
+    tree[1] = QStr(new_name)
+
+    # Also update the Value property when it matches the old name
+    for node in tree:
+        if (
+            isinstance(node, list)
+            and len(node) >= 3
+            and node[0] == "property"
+            and str(node[1]) == "Value"
+            and str(node[2]) == old_name
+        ):
+            node[2] = QStr(new_name)
+            break
+
+    return serialize(tree, number_precision=6) + "\n"
 
 
 def _inject_3d_models(fp_text: str, model_paths: List[Path], fp_lib_dir: Optional[Path] = None) -> str:

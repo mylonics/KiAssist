@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
-import { useAppSettings, type FieldDefault } from '../composables/useAppSettings';
+import { useAppSettings, type FieldDefault, FIELD_DESCRIPTIONS } from '../composables/useAppSettings';
 
 // -----------------------------------------------------------------------
 // Props & Emits
@@ -23,7 +23,7 @@ const {
 // Tabs
 // -----------------------------------------------------------------------
 
-const activeTab = ref<'fields' | 'libraries'>('fields');
+const activeTab = ref<'fields' | 'libraries' | 'variants'>('fields');
 
 // -----------------------------------------------------------------------
 // Field defaults (local working copy)
@@ -81,7 +81,7 @@ function addField() {
     fieldsError.value = `Field "${key}" already exists`;
     return;
   }
-  fieldsCopy.value.push({ key, enabled: true });
+  fieldsCopy.value.push({ key, enabled: true, description: FIELD_DESCRIPTIONS[key] || undefined });
   newFieldKey.value = '';
   fieldsDirty.value = true;
   fieldsError.value = '';
@@ -207,12 +207,149 @@ function removeModelDirFromHistory(idx: number) {
 }
 
 // -----------------------------------------------------------------------
+// Variant default symbols
+// -----------------------------------------------------------------------
+
+interface VariantSymbolEntry {
+  type: string;
+  label: string;
+  library: string;
+  symbol: string;
+}
+
+interface SymSearchResult {
+  library: string;
+  name: string;
+  description?: string;
+}
+
+const variantSymbols = ref<VariantSymbolEntry[]>([]);
+const variantsDirty = ref(false);
+const variantsSuccess = ref('');
+
+// Symbol search state per component type
+const variantSearchQuery = ref<Record<string, string>>({});
+const variantSearchResults = ref<Record<string, SymSearchResult[]>>({});
+const variantSearchLoading = ref<Record<string, boolean>>({});
+const variantSearchOpen = ref<Record<string, boolean>>({});
+let variantSearchTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+
+function loadVariantsCopy() {
+  const defs = settings.value.variantDefaultSymbols || {};
+  const types = [
+    { type: 'resistor',  label: 'Resistor' },
+    { type: 'capacitor', label: 'Capacitor' },
+    { type: 'inductor',  label: 'Inductor' },
+    { type: 'diode',     label: 'Diode' },
+  ];
+  variantSymbols.value = types.map(t => ({
+    type: t.type,
+    label: t.label,
+    library: defs[t.type]?.library || '',
+    symbol: defs[t.type]?.symbol || '',
+  }));
+  // Initialise per-type search state so Vue can track the keys
+  const q: Record<string, string> = {};
+  const r: Record<string, SymSearchResult[]> = {};
+  const l: Record<string, boolean> = {};
+  const o: Record<string, boolean> = {};
+  for (const t of types) {
+    q[t.type] = '';
+    r[t.type] = [];
+    l[t.type] = false;
+    o[t.type] = false;
+  }
+  variantSearchQuery.value = q;
+  variantSearchResults.value = r;
+  variantSearchLoading.value = l;
+  variantSearchOpen.value = o;
+  variantsDirty.value = false;
+}
+
+function variantDisplayValue(vs: VariantSymbolEntry): string {
+  if (vs.library && vs.symbol) return `${vs.library}:${vs.symbol}`;
+  return '';
+}
+
+function onVariantSearchInput(type: string) {
+  const query = (variantSearchQuery.value[type] ?? '').trim();
+  if (variantSearchTimers[type]) clearTimeout(variantSearchTimers[type]);
+  if (!query) {
+    variantSearchResults.value = { ...variantSearchResults.value, [type]: [] };
+    return;
+  }
+  variantSearchLoading.value = { ...variantSearchLoading.value, [type]: true };
+  variantSearchOpen.value = { ...variantSearchOpen.value, [type]: true };
+  variantSearchTimers[type] = setTimeout(() => doVariantSymSearch(type, query), 300);
+}
+
+async function doVariantSymSearch(type: string, query: string) {
+  const api = (window as any).pywebview?.api;
+  if (!api) {
+    variantSearchLoading.value = { ...variantSearchLoading.value, [type]: false };
+    return;
+  }
+  try {
+    const r = await api.importer_search_symbols(query);
+    variantSearchResults.value = {
+      ...variantSearchResults.value,
+      [type]: r?.success ? (r.results ?? []) : [],
+    };
+  } catch {
+    variantSearchResults.value = { ...variantSearchResults.value, [type]: [] };
+  } finally {
+    variantSearchLoading.value = { ...variantSearchLoading.value, [type]: false };
+  }
+}
+
+function selectVariantSymbol(type: string, result: SymSearchResult) {
+  const entry = variantSymbols.value.find(v => v.type === type);
+  if (entry) {
+    entry.library = result.library;
+    entry.symbol = result.name;
+  }
+  variantSearchOpen.value = { ...variantSearchOpen.value, [type]: false };
+  variantSearchQuery.value = { ...variantSearchQuery.value, [type]: '' };
+  variantSearchResults.value = { ...variantSearchResults.value, [type]: [] };
+  variantsDirty.value = true;
+}
+
+function clearVariantSymbol(type: string) {
+  const entry = variantSymbols.value.find(v => v.type === type);
+  if (entry) {
+    entry.library = '';
+    entry.symbol = '';
+  }
+  variantsDirty.value = true;
+}
+
+function closeVariantSearch(type: string) {
+  variantSearchOpen.value = { ...variantSearchOpen.value, [type]: false };
+  variantSearchResults.value = { ...variantSearchResults.value, [type]: [] };
+  variantSearchQuery.value = { ...variantSearchQuery.value, [type]: '' };
+}
+
+function saveVariantDefaults() {
+  const result: Record<string, { library: string; symbol: string }> = {};
+  for (const v of variantSymbols.value) {
+    if (v.library.trim() && v.symbol.trim()) {
+      result[v.type] = { library: v.library.trim(), symbol: v.symbol.trim() };
+    }
+  }
+  settings.value.variantDefaultSymbols = result;
+  variantsDirty.value = false;
+  variantsSuccess.value = 'Variant symbol defaults saved';
+  setTimeout(() => { variantsSuccess.value = ''; }, 2000);
+}
+
+// -----------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------
 
 onMounted(async () => {
   loadFieldsCopy();
   loadLibsCopy();
+  loadVariantsCopy();
   await loadLibraries();
 });
 </script>
@@ -245,6 +382,13 @@ onMounted(async () => {
           <span class="material-icons tab-icon">folder</span>
           Default Libraries
         </button>
+        <button
+          :class="['dialog-tab', { active: activeTab === 'variants' }]"
+          @click="activeTab = 'variants'"
+        >
+          <span class="material-icons tab-icon">library_add</span>
+          Variant Symbols
+        </button>
       </div>
 
       <!-- Content -->
@@ -252,8 +396,8 @@ onMounted(async () => {
         <!-- ===== Symbol Field Defaults Tab ===== -->
         <div v-if="activeTab === 'fields'" class="tab-content">
           <p class="settings-hint">
-            Configure which fields appear by default on imported symbols and their display names.
-            Double-click a field name to rename it. Fields can be reordered, enabled/disabled, or removed.
+            Configure which extra fields appear by default on imported symbols.
+            Double-click a field name to rename it. The description shows the original purpose of the field.
           </p>
 
           <!-- Field rows -->
@@ -287,6 +431,11 @@ onMounted(async () => {
                 @dblclick="startEditKey(idx)"
                 title="Double-click to rename"
               >{{ f.key }}</span>
+
+              <!-- Non-editable description -->
+              <span v-if="f.description" class="field-description" :title="f.description">
+                {{ f.description }}
+              </span>
 
               <!-- Reorder buttons -->
               <button class="field-action-btn" @click="moveField(idx, -1)" :disabled="idx === 0" title="Move up">
@@ -438,6 +587,104 @@ onMounted(async () => {
               {{ libsError }}
             </div>
           </template>
+        </div>
+
+        <!-- ===== Variant Symbols Tab ===== -->
+        <div v-if="activeTab === 'variants'" class="tab-content">
+          <p class="settings-hint">
+            Set the default KiCad symbol used for each component type when importing variants.
+            The symbol graphics/pins are reused — only field values are updated per variant.
+          </p>
+
+          <div class="variant-symbol-list">
+            <div
+              v-for="vs in variantSymbols"
+              :key="vs.type"
+              class="variant-symbol-row"
+            >
+              <span class="variant-type-label">{{ vs.label }}</span>
+
+              <!-- Current selection display -->
+              <div v-if="variantDisplayValue(vs) && !variantSearchOpen[vs.type]" class="variant-selected">
+                <span class="variant-selected-text" :title="variantDisplayValue(vs)">
+                  {{ variantDisplayValue(vs) }}
+                </span>
+                <button
+                  class="field-action-btn"
+                  @click="variantSearchOpen = { ...variantSearchOpen, [vs.type]: true }; variantSearchQuery = { ...variantSearchQuery, [vs.type]: '' }"
+                  title="Change symbol"
+                >
+                  <span class="material-icons">edit</span>
+                </button>
+                <button
+                  class="field-action-btn remove-btn"
+                  @click="clearVariantSymbol(vs.type)"
+                  title="Clear"
+                >
+                  <span class="material-icons">close</span>
+                </button>
+              </div>
+
+              <!-- Search input -->
+              <div v-else class="variant-search-wrapper">
+                <div class="variant-search-input-row">
+                  <span class="material-icons variant-search-icon">search</span>
+                  <input
+                    v-model="variantSearchQuery[vs.type]"
+                    class="text-input variant-search-input"
+                    :placeholder="`Search symbols (e.g. ${vs.type === 'resistor' ? 'R_Small' : vs.type === 'capacitor' ? 'C_Small' : vs.type === 'inductor' ? 'L_Small' : 'D_Small'})…`"
+                    @input="onVariantSearchInput(vs.type)"
+                    @keydown.escape="closeVariantSearch(vs.type)"
+                  />
+                  <span
+                    v-if="variantSearchLoading[vs.type]"
+                    class="material-icons spinning variant-search-spinner"
+                  >autorenew</span>
+                  <button
+                    v-if="variantDisplayValue(vs)"
+                    class="field-action-btn"
+                    @click="closeVariantSearch(vs.type)"
+                    title="Cancel"
+                  >
+                    <span class="material-icons">close</span>
+                  </button>
+                </div>
+
+                <!-- Search results dropdown -->
+                <div
+                  v-if="variantSearchResults[vs.type]?.length"
+                  class="variant-search-results"
+                >
+                  <div
+                    v-for="result in variantSearchResults[vs.type]"
+                    :key="`${result.library}:${result.name}`"
+                    class="variant-search-result"
+                    @click="selectVariantSymbol(vs.type, result)"
+                  >
+                    <span class="variant-result-name">{{ result.name }}</span>
+                    <span class="variant-result-lib">{{ result.library }}</span>
+                    <span v-if="result.description" class="variant-result-desc">{{ result.description }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Save -->
+          <button
+            class="action-btn primary full-width"
+            @click="saveVariantDefaults"
+            :disabled="!variantsDirty"
+          >
+            <span class="material-icons">save</span>
+            {{ variantsDirty ? 'Save Variant Defaults' : 'Saved' }}
+          </button>
+
+          <!-- Messages -->
+          <div v-if="variantsSuccess" class="notice success">
+            <span class="material-icons">check_circle</span>
+            {{ variantsSuccess }}
+          </div>
         </div>
       </div>
     </div>
@@ -630,6 +877,19 @@ onMounted(async () => {
 
 .field-key:hover {
   background-color: var(--bg-tertiary);
+}
+
+.field-description {
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  font-style: italic;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-left: 0.15rem;
+  flex-shrink: 1;
+  min-width: 0;
 }
 
 .field-key-input {
@@ -880,5 +1140,132 @@ onMounted(async () => {
 .spinning {
   animation: spin 1s linear infinite;
   font-size: 0.95rem;
+}
+
+/* ===== Variant Symbols ===== */
+.variant-symbol-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+}
+
+.variant-symbol-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.variant-type-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.variant-selected {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.5rem;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--accent-color);
+}
+
+.variant-selected-text {
+  flex: 1;
+  font-size: 0.75rem;
+  font-family: monospace;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.variant-search-wrapper {
+  position: relative;
+}
+
+.variant-search-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  padding: 0 0.35rem;
+}
+
+.variant-search-input-row:focus-within {
+  border-color: var(--accent-color);
+}
+
+.variant-search-icon {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.variant-search-input {
+  border: none !important;
+  background: transparent !important;
+  padding: 0.3rem 0.25rem !important;
+  flex: 1;
+  min-width: 0;
+}
+
+.variant-search-input:focus {
+  border: none !important;
+  outline: none;
+}
+
+.variant-search-spinner {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+.variant-search-results {
+  max-height: 180px;
+  overflow-y: auto;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-top: none;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.variant-search-result {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.5rem;
+  padding: 0.35rem 0.5rem;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+
+.variant-search-result:hover {
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+}
+
+.variant-result-name {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.variant-result-lib {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  font-family: monospace;
+}
+
+.variant-result-desc {
+  width: 100%;
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>

@@ -1139,8 +1139,8 @@ const isPanning = ref(false);
 const panStart = reactive({ x: 0, y: 0, ox: 0, oy: 0 });
 
 function onPointerDown(e: PointerEvent) {
-  // Middle button (1) or left button with Ctrl
-  if (e.button === 1 || (e.button === 0 && e.ctrlKey)) {
+  // Left button (0), middle button (1), or left button with Ctrl
+  if (e.button === 0 || e.button === 1 || (e.button === 0 && e.ctrlKey)) {
     e.preventDefault();
     isPanning.value = true;
     panStart.x = e.clientX;

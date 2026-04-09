@@ -506,6 +506,9 @@ class LibSymbol:
 
     def to_tree(self) -> List[SExpr]:
         if self.raw_tree is not None:
+            # Patch the symbol name in case it was changed after parsing.
+            if len(self.raw_tree) > 1 and str(self.raw_tree[1]) != self.name:
+                self.raw_tree[1] = QStr(self.name)
             return self.raw_tree
         return ["symbol", QStr(self.name)]
 

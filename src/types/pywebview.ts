@@ -291,6 +291,7 @@ export interface AnalyzerLibInfo {
   nickname: string;
   uri: string;
   resolved_path: string;
+  is_default: boolean;
 }
 
 export interface AnalyzerScanResult extends ApiResult {

@@ -16,7 +16,10 @@ Modules:
 from .sexpr import parse, serialize, SExpr
 from .models import Position, Stroke, Effects, Property, KiUUID, Pts
 from .schematic import TitleBlock
-from .analyzer import LibraryAnalyzer, AnalysisReport, Issue, Severity, IssueCategory
+from .analyzer import (
+    LibraryAnalyzer, AnalysisReport, Issue, Severity, IssueCategory,
+    StructuralValidationError, _RawTextAnalysis,
+)
 
 __all__ = [
     "parse",
@@ -34,4 +37,6 @@ __all__ = [
     "Issue",
     "Severity",
     "IssueCategory",
+    "StructuralValidationError",
+    "_RawTextAnalysis",
 ]

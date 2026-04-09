@@ -20,8 +20,10 @@ from kiassist_utils.kicad_parser.analyzer import (
     IssueCategory,
     LibraryAnalyzer,
     Severity,
+    StructuralValidationError,
     _FootprintChecks,
     _FootprintFixer,
+    _RawTextAnalysis,
     _SymbolChecks,
     _SymbolFixer,
     main,
@@ -1138,3 +1140,390 @@ class TestCLI:
         ret = main([str(tmp_path)])
         captured = capsys.readouterr()
         assert "Analysis report" in captured.out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Tests for _RawTextAnalysis — string-aware parsing, depth tracking
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestCountParensStringAware:
+    """Tests for string-aware parenthesis counting (tip #1)."""
+
+    def test_simple_balanced(self):
+        opens, closes = _RawTextAnalysis.count_parens_string_aware("(a (b c))")
+        assert opens == 2
+        assert closes == 2
+
+    def test_parens_inside_string(self):
+        """Parentheses inside quoted strings must not be counted."""
+        text = '(symbol "TLP188(TPL,E" (value "test)"))'
+        opens, closes = _RawTextAnalysis.count_parens_string_aware(text)
+        # structural: ( ( ) ) = 2 opens, 2 closes
+        # the ( inside the name and ) inside value are ignored
+        assert opens == 2
+        assert closes == 2
+
+    def test_escaped_quote_in_string(self):
+        """Escaped quotes (\\\") inside strings must not end the string."""
+        text = r'(name "foo\"bar")'
+        opens, closes = _RawTextAnalysis.count_parens_string_aware(text)
+        assert opens == 1
+        assert closes == 1
+
+    def test_empty_string(self):
+        opens, closes = _RawTextAnalysis.count_parens_string_aware("")
+        assert opens == 0
+        assert closes == 0
+
+    def test_no_parens(self):
+        opens, closes = _RawTextAnalysis.count_parens_string_aware("hello world")
+        assert opens == 0
+        assert closes == 0
+
+
+class TestDepthTracking:
+    """Tests for line-by-line depth tracking (tip #2)."""
+
+    def test_balanced_multiline(self):
+        text = "(kicad_symbol_lib\n  (symbol \"R\")\n)"
+        r = _RawTextAnalysis.analyze_depth_per_line(text)
+        assert r.is_balanced
+        assert r.is_structurally_sound
+        assert r.imbalance == 0
+        assert r.min_depth >= 0
+
+    def test_globally_balanced_but_negative_depth(self):
+        """Total ( == total ) but depth goes negative mid-file."""
+        text = ")\n("
+        r = _RawTextAnalysis.analyze_depth_per_line(text)
+        assert r.is_balanced  # opens == closes
+        assert not r.is_structurally_sound  # depth went negative
+        assert 1 in r.negative_depth_lines
+
+    def test_extra_close_paren(self):
+        text = "(a))"
+        r = _RawTextAnalysis.analyze_depth_per_line(text)
+        assert not r.is_balanced
+        assert r.imbalance == -1
+
+    def test_unclosed_paren(self):
+        text = "((a)"
+        r = _RawTextAnalysis.analyze_depth_per_line(text)
+        assert not r.is_balanced
+        assert r.imbalance == 1
+
+    def test_parens_in_string_depth_tracking(self):
+        """Strings with parens must not affect depth."""
+        text = '(symbol "TLP188(TPL,E")\n'
+        r = _RawTextAnalysis.analyze_depth_per_line(text)
+        assert r.is_balanced
+        assert r.is_structurally_sound
+
+    def test_line_depth_info_populated(self):
+        text = "(a\n  (b)\n)"
+        r = _RawTextAnalysis.analyze_depth_per_line(text)
+        assert len(r.line_depths) == 3
+        # Line 1: opens=1, depth_before=0, depth_after=1
+        assert r.line_depths[0].opens == 1
+        assert r.line_depths[0].depth_before == 0
+        assert r.line_depths[0].depth_after == 1
+        # Line 2: opens=1, closes=1
+        assert r.line_depths[1].opens == 1
+        assert r.line_depths[1].closes == 1
+        # Line 3: closes=1, depth_after=0
+        assert r.line_depths[2].closes == 1
+        assert r.line_depths[2].depth_after == 0
+
+
+class TestValidateStructure:
+    """Tests for quick structural validation."""
+
+    def test_valid(self):
+        ok, msg = _RawTextAnalysis.validate_structure("(a (b c))")
+        assert ok
+
+    def test_invalid_imbalance(self):
+        ok, msg = _RawTextAnalysis.validate_structure("(a (b c)")
+        assert not ok
+        assert "unclosed" in msg
+
+    def test_negative_depth(self):
+        ok, msg = _RawTextAnalysis.validate_structure(")(")
+        assert not ok
+        assert "extra closing" in msg or "Negative depth" in msg
+
+
+class TestFindStrayCandidates:
+    """Tests for stray close paren candidate detection (tip #3)."""
+
+    def test_no_candidates_clean_file(self):
+        text = "(a (b c))"
+        candidates = _RawTextAnalysis.find_stray_close_candidates(text)
+        assert candidates == []
+
+    def test_finds_stray_close(self):
+        text = "(a (b)))"
+        candidates = _RawTextAnalysis.find_stray_close_candidates(text)
+        assert len(candidates) == 1
+        assert candidates[0][0] == 1  # line 1
+
+
+class TestIterativeFixStrayParens:
+    """Tests for iterative single-line stray paren removal (tips #4, #6)."""
+
+    def test_removes_extra_close(self):
+        text = "(a (b))\n)\n(c)"
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        assert count > 0
+        ok, _ = _RawTextAnalysis.validate_structure(fixed)
+        assert ok
+
+    def test_removes_extra_open(self):
+        text = "(\n(a (b))"
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        assert count > 0
+        ok, _ = _RawTextAnalysis.validate_structure(fixed)
+        assert ok
+
+    def test_no_change_for_clean_file(self):
+        text = "(a (b c))"
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        assert count == 0
+        assert fixed == text
+
+    def test_multiple_stray_closes(self):
+        text = "(a)\n)\n)\n(b)\n)"
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        ok, _ = _RawTextAnalysis.validate_structure(fixed)
+        assert ok
+        assert count >= 2
+
+    def test_string_aware_during_fix(self):
+        """Parens inside strings must not be touched by the fixer."""
+        text = '(symbol "TLP188(TPL,E")\n)\n'
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        # The extra ) after the symbol should be removed
+        assert count > 0
+        ok, _ = _RawTextAnalysis.validate_structure(fixed)
+        assert ok
+        # The string content must be preserved
+        assert "TLP188(TPL,E" in fixed
+
+    def test_nested_stray_close(self):
+        """Multiple stray ))) at same location."""
+        text = "(a (b))\n)))\n(c (d))"
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        ok, _ = _RawTextAnalysis.validate_structure(fixed)
+        assert ok
+
+
+class TestBakDiff:
+    """Tests for .bak file diffing (tip #8)."""
+
+    def test_no_bak_returns_none(self, tmp_path):
+        f = tmp_path / "test.kicad_sym"
+        f.write_text("(kicad_symbol_lib)")
+        result = _RawTextAnalysis.diff_against_bak(str(f))
+        assert result is None
+
+    def test_bak_identical_returns_none(self, tmp_path):
+        f = tmp_path / "test.kicad_sym"
+        bak = tmp_path / "test.kicad_sym.bak"
+        content = "(kicad_symbol_lib (version 20231120))"
+        f.write_text(content)
+        bak.write_text(content)
+        result = _RawTextAnalysis.diff_against_bak(str(f))
+        assert result is None
+
+    def test_bak_differs(self, tmp_path):
+        f = tmp_path / "test.kicad_sym"
+        bak = tmp_path / "test.kicad_sym.bak"
+        f.write_text("(kicad_symbol_lib (version 20231120)\n  (symbol \"New\")\n)")
+        bak.write_text("(kicad_symbol_lib (version 20231120)\n)")
+        result = _RawTextAnalysis.diff_against_bak(str(f))
+        assert result is not None
+        assert any("symbol" in line for line in result)
+
+
+class TestRawStructureCheck:
+    """Tests for check_raw_structure (structural analysis integration)."""
+
+    def test_balanced_file_no_issues(self):
+        text = _minimal_symbol_lib_text()
+        report = AnalysisReport(file_path="test", file_type="symbol_library")
+        _SymbolChecks.check_raw_structure(text, report)
+        struct = [i for i in report.issues if i.category == IssueCategory.STRUCTURE]
+        assert len(struct) == 0
+
+    def test_extra_close_detected(self):
+        text = _minimal_symbol_lib_text() + "\n)"
+        report = AnalysisReport(file_path="test", file_type="symbol_library")
+        _SymbolChecks.check_raw_structure(text, report)
+        struct = [i for i in report.issues if i.category == IssueCategory.STRUCTURE]
+        assert any("extra closing" in i.message for i in struct)
+
+    def test_unclosed_paren_detected(self):
+        text = "(\n" + _minimal_symbol_lib_text()
+        report = AnalysisReport(file_path="test", file_type="symbol_library")
+        _SymbolChecks.check_raw_structure(text, report)
+        struct = [i for i in report.issues if i.category == IssueCategory.STRUCTURE]
+        assert any("unclosed" in i.message for i in struct)
+
+
+class TestBakDiffCheck:
+    """Tests for check_bak_diff integration."""
+
+    def test_bak_diff_reported(self, tmp_path):
+        f = tmp_path / "test.kicad_sym"
+        bak = tmp_path / "test.kicad_sym.bak"
+        f.write_text(_minimal_symbol_lib_text())
+        bak.write_text(_minimal_symbol_lib_text(version=20211014))
+        report = AnalysisReport(file_path=str(f), file_type="symbol_library")
+        _SymbolChecks.check_bak_diff(str(f), report)
+        assert any("Backup file differs" in i.message for i in report.issues)
+
+
+class TestDryRun:
+    """Tests for dry-run mode (tip #10)."""
+
+    def test_fix_symbol_dry_run(self, tmp_path):
+        text = _minimal_symbol_lib_text(version=20211014)
+        src = tmp_path / "test.kicad_sym"
+        src.write_text(text, encoding="utf-8")
+        out = tmp_path / "out.kicad_sym"
+
+        analyzer = LibraryAnalyzer()
+        n = analyzer.fix_symbol_library(src, out, dry_run=True)
+        assert n > 0
+        # Output file must NOT be created in dry-run mode
+        assert not out.exists()
+
+    def test_fix_footprint_dry_run(self, tmp_path):
+        text = _minimal_footprint_text(pads="""
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")
+              (drill 0.5))
+        """)
+        src = tmp_path / "test.kicad_mod"
+        src.write_text(text, encoding="utf-8")
+        out = tmp_path / "out.kicad_mod"
+
+        analyzer = LibraryAnalyzer()
+        n = analyzer.fix_footprint(src, out, dry_run=True)
+        assert n > 0
+        assert not out.exists()
+
+    def test_cli_dry_run(self, tmp_path, capsys):
+        text = _minimal_symbol_lib_text(version=20211014)
+        src = tmp_path / "test.kicad_sym"
+        src.write_text(text, encoding="utf-8")
+
+        ret = main([str(src), "--dry-run"])
+        captured = capsys.readouterr()
+        assert "would be applied" in captured.out or "DRY RUN" in captured.out
+
+    def test_fix_directory_dry_run(self, tmp_path):
+        fp_text = _minimal_footprint_text(pads="""
+            (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")
+              (drill 0.5))
+        """)
+        (tmp_path / "a.kicad_mod").write_text(fp_text, encoding="utf-8")
+        out_dir = tmp_path / "output"
+
+        analyzer = LibraryAnalyzer()
+        results = analyzer.fix_footprint_directory(tmp_path, out_dir, dry_run=True)
+        assert results.get("a.kicad_mod", 0) > 0
+        # Output dir must NOT be created in dry-run mode
+        assert not out_dir.exists()
+
+
+class TestPostFixValidation:
+    """Tests for post-fix structural validation (tip #5)."""
+
+    def test_raw_fix_on_broken_symbol_lib(self, tmp_path):
+        """A symbol file with an extra ')' should be repaired by raw-text fix."""
+        text = _minimal_symbol_lib_text() + "\n)"
+        src = tmp_path / "test.kicad_sym"
+        src.write_text(text, encoding="utf-8")
+        out = tmp_path / "fixed.kicad_sym"
+
+        analyzer = LibraryAnalyzer()
+        n = analyzer.fix_symbol_library(src, out)
+        assert n >= 1
+        # Verify the output is structurally sound
+        output_text = out.read_text(encoding="utf-8")
+        ok, _ = _RawTextAnalysis.validate_structure(output_text)
+        assert ok
+
+
+class TestEdgeCases:
+    """Edge cases: empty files, tabs, mixed indent, parens in names (tip #9)."""
+
+    def test_empty_file_analysis(self, tmp_path):
+        f = tmp_path / "empty.kicad_sym"
+        f.write_text("", encoding="utf-8")
+        analyzer = LibraryAnalyzer()
+        report = analyzer.analyze_symbol_library(f)
+        assert any("empty" in i.message.lower() for i in report.issues)
+
+    def test_whitespace_only_file(self, tmp_path):
+        f = tmp_path / "ws.kicad_sym"
+        f.write_text("   \n\n  \t  \n", encoding="utf-8")
+        analyzer = LibraryAnalyzer()
+        report = analyzer.analyze_symbol_library(f)
+        assert any("empty" in i.message.lower() for i in report.issues)
+
+    def test_parens_in_symbol_name_analyze(self):
+        """Symbols with parens in names should analyze correctly (tip #9)."""
+        sym = _make_symbol_text(name='TLP188(TPL,E')
+        text = _minimal_symbol_lib_text(symbols=sym)
+        analyzer = LibraryAnalyzer()
+        report = analyzer.analyze_symbol_library_text(text, "test")
+        # Should not crash; may have naming warnings but no structural errors
+        struct_errors = [i for i in report.issues
+                         if i.category == IssueCategory.STRUCTURE and i.severity == Severity.ERROR]
+        # The raw structure should be sound since the parens are inside quotes
+        raw_struct = [i for i in struct_errors if "unclosed" in i.message or "extra" in i.message]
+        assert len(raw_struct) == 0
+
+    def test_tabs_in_file(self):
+        """Files with tab indentation should be handled."""
+        text = "(kicad_symbol_lib\t(version 20231120)\t(generator \"kicad_symbol_editor\")\n)"
+        analyzer = LibraryAnalyzer()
+        report = analyzer.analyze_symbol_library_text(text, "tabbed")
+        struct_errors = [i for i in report.issues
+                         if i.category == IssueCategory.STRUCTURE and "unclosed" in i.message]
+        assert len(struct_errors) == 0
+
+    def test_iterative_fix_respects_max_iterations(self):
+        """Ensure max_iterations prevents infinite loops."""
+        # A deeply broken file that won't be fixable in 2 iterations
+        text = "))))(a))))"
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text, max_iterations=2)
+        # Should stop after 2 removals
+        assert count <= 2
+
+
+class TestAnalyzerWithRawStructure:
+    """Integration tests: analyzer detects raw structure issues on file-based analysis."""
+
+    def test_file_analysis_detects_extra_close(self, tmp_path):
+        text = _minimal_symbol_lib_text() + "\n)"
+        f = tmp_path / "broken.kicad_sym"
+        f.write_text(text, encoding="utf-8")
+
+        analyzer = LibraryAnalyzer()
+        report = analyzer.analyze_symbol_library(f)
+        struct = [i for i in report.issues if i.category == IssueCategory.STRUCTURE]
+        assert any("extra closing" in i.message for i in struct)
+
+    def test_file_analysis_detects_unclosed(self, tmp_path):
+        text = "(\n" + _minimal_symbol_lib_text()
+        f = tmp_path / "broken.kicad_sym"
+        f.write_text(text, encoding="utf-8")
+
+        analyzer = LibraryAnalyzer()
+        report = analyzer.analyze_symbol_library(f)
+        struct = [i for i in report.issues if i.category == IssueCategory.STRUCTURE]
+        # Either "unclosed" from raw check or "Parse error" from the parser
+        assert len(struct) > 0

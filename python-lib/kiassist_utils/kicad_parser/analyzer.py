@@ -1934,13 +1934,13 @@ class LibraryAnalyzer:
 
         if not dry_run:
             # Serialize and validate output before writing
-            output_text = serialize(lib._to_tree())
+            output_text = serialize(lib._to_tree(), number_precision=4)
             valid, msg = _RawTextAnalysis.validate_structure(output_text)
             if not valid:
                 raise StructuralValidationError(
                     f"Post-fix validation failed — refusing to save: {msg}"
                 )
-            Path(output_path).write_text(output_text, encoding="utf-8")
+            Path(output_path).write_text(output_text + "\n", encoding="utf-8")
 
         return total_fixed
 
@@ -2103,12 +2103,18 @@ class LibraryAnalyzer:
         self,
         input_path: str | os.PathLike,
         output_path: Optional[str | os.PathLike] = None,
+        *,
+        dry_run: bool = False,
     ) -> int:
         """Analyze and auto-fix a footprint file.
+
+        Two-phase approach (raw-text stray-paren repair + semantic fixes)
+        with post-fix structural validation.
 
         Args:
             input_path:  Source ``.kicad_mod`` file.
             output_path: Destination path (defaults to overwriting input).
+            dry_run:     If True, compute fixes but do not write any files.
 
         Returns:
             Number of issues fixed.
@@ -2116,10 +2122,34 @@ class LibraryAnalyzer:
         if output_path is None:
             output_path = input_path
 
-        fp = Footprint.load(input_path)
-        fixed = self._apply_footprint_fixes(fp)
-        fp.save(output_path)
-        return fixed
+        # Phase 1: raw-text structural repair
+        raw_text = Path(input_path).read_text(encoding="utf-8", errors="replace")
+        raw_fixed, raw_fix_count = _RawTextAnalysis.iterative_fix_stray_parens(raw_text)
+
+        if raw_fix_count > 0:
+            valid, msg = _RawTextAnalysis.validate_structure(raw_fixed)
+            if not valid:
+                raise StructuralValidationError(
+                    f"Raw-text repair did not produce a valid structure: {msg}"
+                )
+            fp = Footprint._from_tree(parse(raw_fixed))
+        else:
+            fp = Footprint.load(input_path)
+
+        # Phase 2: semantic fixes
+        semantic_fixed = self._apply_footprint_fixes(fp)
+        total_fixed = raw_fix_count + semantic_fixed
+
+        if not dry_run:
+            output_text = serialize(fp._to_tree(), number_precision=6)
+            valid, msg = _RawTextAnalysis.validate_structure(output_text)
+            if not valid:
+                raise StructuralValidationError(
+                    f"Post-fix validation failed — refusing to save: {msg}"
+                )
+            Path(output_path).write_text(output_text + "\n", encoding="utf-8")
+
+        return total_fixed
 
     def fix_footprint_object(self, fp: Footprint) -> int:
         """Fix an in-memory Footprint object. Returns count of fixes applied."""
@@ -2129,24 +2159,28 @@ class LibraryAnalyzer:
         self,
         directory: str | os.PathLike,
         output_directory: Optional[str | os.PathLike] = None,
+        *,
+        dry_run: bool = False,
     ) -> Dict[str, int]:
         """Fix all footprints in a directory.
 
         Args:
             directory:        Source ``.pretty`` directory.
             output_directory: Destination directory (defaults to in-place).
+            dry_run:          If True, compute fixes but do not write any files.
 
         Returns:
             Dict mapping filename to number of fixes applied.
         """
         dirpath = Path(directory)
         outdir = Path(output_directory) if output_directory else dirpath
-        outdir.mkdir(parents=True, exist_ok=True)
+        if not dry_run:
+            outdir.mkdir(parents=True, exist_ok=True)
 
         results: Dict[str, int] = {}
         for fp_file in sorted(dirpath.glob("*.kicad_mod")):
             out_file = outdir / fp_file.name
-            results[fp_file.name] = self.fix_footprint(fp_file, out_file)
+            results[fp_file.name] = self.fix_footprint(fp_file, out_file, dry_run=dry_run)
         return results
 
     def _apply_footprint_fixes(self, fp: Footprint) -> int:
@@ -2201,21 +2235,24 @@ class LibraryAnalyzer:
         self,
         input_path: str | os.PathLike,
         output_path: Optional[str | os.PathLike] = None,
+        *,
+        dry_run: bool = False,
     ) -> int:
         """Auto-detect file type, fix, and save.
 
         Args:
             input_path:  Source file.
             output_path: Destination file (defaults to overwriting input).
+            dry_run:     If True, compute fixes but do not write any files.
 
         Returns:
             Number of issues fixed.
         """
         p = Path(input_path)
         if p.suffix == ".kicad_sym":
-            return self.fix_symbol_library(input_path, output_path)
+            return self.fix_symbol_library(input_path, output_path, dry_run=dry_run)
         elif p.suffix == ".kicad_mod":
-            return self.fix_footprint(input_path, output_path)
+            return self.fix_footprint(input_path, output_path, dry_run=dry_run)
         else:
             raise ValueError(f"Unsupported file type: {p.suffix}")
 
@@ -2230,7 +2267,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     Usage::
 
-        python -m kiassist_utils.kicad_parser.analyzer [--fix] [--output DIR] FILES...
+        python -m kiassist_utils.kicad_parser.analyzer [--fix] [--dry-run] [--output DIR] FILES...
 
     Returns:
         0 if no errors found, 1 otherwise.
@@ -2245,11 +2282,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("files", nargs="+", help="Paths to .kicad_sym or .kicad_mod files, or .pretty directories")
     parser.add_argument("--fix", action="store_true", help="Apply auto-fixes to all fixable issues")
+    parser.add_argument("--dry-run", action="store_true", help="Report what would be fixed without writing any files")
     parser.add_argument("--output", "-o", default=None, help="Output directory for fixed files (default: in-place)")
     parser.add_argument("--json", action="store_true", help="Output report as JSON")
     parser.add_argument("--quiet", "-q", action="store_true", help="Only show errors")
 
     args = parser.parse_args(argv)
+    dry_run = args.dry_run
+    do_fix = args.fix or args.dry_run  # --dry-run implies --fix logic
     analyzer = LibraryAnalyzer()
     all_reports: List[AnalysisReport] = []
     total_fixed = 0
@@ -2260,24 +2300,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if p.is_dir():
             # Treat as footprint directory
-            if args.fix:
-                results = analyzer.fix_footprint_directory(p, args.output)
+            if do_fix:
+                results = analyzer.fix_footprint_directory(p, args.output, dry_run=dry_run)
                 total_fixed += sum(results.values())
             reports = analyzer.analyze_footprint_directory(p)
             all_reports.extend(reports)
         elif p.suffix == ".kicad_sym":
-            if args.fix:
+            if do_fix:
                 out = Path(args.output) / p.name if args.output else None
-                if args.output:
+                if args.output and not dry_run:
                     Path(args.output).mkdir(parents=True, exist_ok=True)
-                total_fixed += analyzer.fix_symbol_library(p, out)
+                total_fixed += analyzer.fix_symbol_library(p, out, dry_run=dry_run)
             all_reports.append(analyzer.analyze_symbol_library(p))
         elif p.suffix == ".kicad_mod":
-            if args.fix:
+            if do_fix:
                 out = Path(args.output) / p.name if args.output else None
-                if args.output:
+                if args.output and not dry_run:
                     Path(args.output).mkdir(parents=True, exist_ok=True)
-                total_fixed += analyzer.fix_footprint(p, out)
+                total_fixed += analyzer.fix_footprint(p, out, dry_run=dry_run)
             all_reports.append(analyzer.analyze_footprint(p))
         else:
             r = AnalysisReport(file_path=str(p), file_type="unknown")
@@ -2285,10 +2325,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             all_reports.append(r)
 
     # Output
+    mode_label = "DRY RUN — " if dry_run else ""
     if args.json:
         data = [r.to_dict() for r in all_reports]
-        if args.fix:
-            print(json.dumps({"total_fixed": total_fixed, "reports": data}, indent=2))
+        if do_fix:
+            print(json.dumps({"dry_run": dry_run, "total_fixed": total_fixed, "reports": data}, indent=2))
         else:
             print(json.dumps(data, indent=2))
     else:
@@ -2300,8 +2341,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(report.summary())
                 print()
 
-        if args.fix:
-            print(f"Total fixes applied: {total_fixed}")
+        if do_fix:
+            print(f"{mode_label}Total fixes {'that would be applied' if dry_run else 'applied'}: {total_fixed}")
 
     for report in all_reports:
         if report.errors:

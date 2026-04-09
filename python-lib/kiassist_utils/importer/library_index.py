@@ -16,6 +16,8 @@ Usage::
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -26,6 +28,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Cache format version — bump when the serialised schema changes.
+_CACHE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +116,13 @@ class LibraryIndex:
         self._building = False
         self._build_lock = threading.Lock()
         self._build_time: float = 0.0
+        self._from_cache = False  # True when current data was loaded from disk cache
+        self._discovery: Any = None  # Cached LibraryDiscovery instance
+        self._rebuild_pending = False  # True when another build is queued
+
+        # Attempt to warm the index from disk cache immediately so
+        # searches can proceed while the live build runs in the background.
+        self._load_cache()
 
     # ------------------------------------------------------------------
     # Properties
@@ -139,25 +151,41 @@ class LibraryIndex:
     # ------------------------------------------------------------------
 
     def build(self) -> None:
-        """Build the index synchronously (blocks until complete)."""
-        with self._build_lock:
-            if self._building:
-                return
-            self._building = True
+        """Build the index synchronously (blocks until complete).
 
+        If another thread is already building, this marks a pending
+        rebuild so the current build is followed by a fresh one —
+        no build request is silently dropped.
+        """
+        if not self._build_lock.acquire(blocking=False):
+            # Another thread is building.  Mark that we need another
+            # round once it finishes (the project dir may have changed).
+            self._rebuild_pending = True
+            return
+
+        # We hold the lock.
+        self._building = True
         try:
-            t0 = time.monotonic()
-            self._do_build()
-            self._build_time = time.monotonic() - t0
-            logger.info(
-                "Library index built in %.2fs — %d symbols, %d footprints",
-                self._build_time,
-                len(self._symbols),
-                len(self._footprints),
-            )
+            while True:
+                self._rebuild_pending = False
+                t0 = time.monotonic()
+                self._do_build()
+                self._build_time = time.monotonic() - t0
+                logger.info(
+                    "Library index built in %.2fs — %d symbols, %d footprints",
+                    self._build_time,
+                    len(self._symbols),
+                    len(self._footprints),
+                )
+                # If someone requested another build while we were busy,
+                # loop and build again with the latest project_dir.
+                if not self._rebuild_pending:
+                    break
+                logger.info("Rebuild pending — running another pass")
         finally:
             self._building = False
             self._ready.set()
+            self._build_lock.release()
 
     def build_async(self, callback: Optional[Any] = None) -> threading.Thread:
         """Build the index in a background thread.
@@ -173,6 +201,10 @@ class LibraryIndex:
         threading.Thread
             The daemon thread performing the build.
         """
+        # Set building flag eagerly so that status() reports
+        # "building" immediately — before the thread acquires the lock.
+        self._building = True
+
         def _worker():
             self.build()
             if callback:
@@ -186,21 +218,21 @@ class LibraryIndex:
         return t
 
     def rebuild(self) -> None:
-        """Invalidate and rebuild the index synchronously."""
-        self._ready.clear()
-        self._footprints.clear()
-        self._symbols.clear()
-        self._lib_norms.clear()
-        self._lib_tokens.clear()
+        """Rebuild the index synchronously.
+
+        Existing data (from cache or a previous build) remains available
+        for searches while the rebuild runs — the new data is swapped in
+        atomically once complete.
+        """
         self.build()
 
     def rebuild_async(self, callback: Optional[Any] = None) -> threading.Thread:
-        """Invalidate and rebuild in a background thread."""
-        self._ready.clear()
-        self._footprints.clear()
-        self._symbols.clear()
-        self._lib_norms.clear()
-        self._lib_tokens.clear()
+        """Rebuild in a background thread.
+
+        Existing data (cached or previously built) stays available for
+        searches while the live build runs.  The new data is swapped
+        in atomically once complete.
+        """
         return self.build_async(callback=callback)
 
     def wait_ready(self, timeout: Optional[float] = None) -> bool:
@@ -208,11 +240,43 @@ class LibraryIndex:
         return self._ready.wait(timeout=timeout)
 
     def set_project_dir(self, project_dir: Optional[str | Path]) -> None:
-        """Update the project directory (triggers rebuild on next search)."""
+        """Update the project directory.
+
+        Loads any project-specific cache from disk so that data is
+        available immediately.  Call :meth:`rebuild_async` afterwards
+        to schedule a live refresh.
+        """
         new_dir = str(project_dir) if project_dir else None
         if new_dir != self._project_dir:
             self._project_dir = new_dir
-            self._ready.clear()
+            self._discovery = None  # Invalidate cached discovery
+            # Try to load a project-specific cache immediately
+            self._load_cache()
+
+    # ------------------------------------------------------------------
+    # Library discovery (shared / cached)
+    # ------------------------------------------------------------------
+
+    def get_discovery(self) -> Any:
+        """Return a cached :class:`LibraryDiscovery` for the current project.
+
+        Creates one lazily if needed.  The same instance is reused until
+        the project directory changes or the index is rebuilt.
+        """
+        if self._discovery is None:
+            from ..kicad_parser.library import LibraryDiscovery
+            self._discovery = LibraryDiscovery(project_dir=self._project_dir)
+        return self._discovery
+
+    def list_symbol_libraries(self) -> List[Dict[str, str]]:
+        """Return symbol library nicknames and URIs from the cached discovery."""
+        disc = self.get_discovery()
+        return [{"nickname": e.nickname, "uri": e.uri} for e in disc.list_symbol_libraries()]
+
+    def list_footprint_libraries(self) -> List[Dict[str, str]]:
+        """Return footprint library nicknames and URIs from the cached discovery."""
+        disc = self.get_discovery()
+        return [{"nickname": e.nickname, "uri": e.uri} for e in disc.list_footprint_libraries()]
 
     # ------------------------------------------------------------------
     # Search — footprints
@@ -229,11 +293,12 @@ class LibraryIndex:
         If the index isn't ready yet, blocks up to 30 s for it.  Returns
         the same dict format as :func:`kicad_lib_importer.search_footprints`.
         """
+        # If nothing loaded yet, kick off a background build but
+        # return immediately — the cache is the source of truth.
         if not self._ready.is_set():
-            # Trigger build if never started
             if not self._building:
                 self.build_async()
-            self._ready.wait(timeout=30)
+            return []
 
         query_norm = _normalize(query.strip())
         query_tokens = _tokenize(query.strip())
@@ -277,7 +342,7 @@ class LibraryIndex:
         if not self._ready.is_set():
             if not self._building:
                 self.build_async()
-            self._ready.wait(timeout=30)
+            return []
 
         query_lower = query.strip().lower()
         if not query_lower:
@@ -312,6 +377,7 @@ class LibraryIndex:
             "symbol_count": len(self._symbols),
             "footprint_count": len(self._footprints),
             "build_time": round(self._build_time, 2),
+            "from_cache": self._from_cache,
         }
 
     # ------------------------------------------------------------------
@@ -325,14 +391,18 @@ class LibraryIndex:
 
         disc = LibraryDiscovery(project_dir=self._project_dir)
 
+        # Build into local temporaries so that the existing data (from
+        # cache or a previous build) stays available for searches until
+        # we swap everything in atomically at the end.
+        lib_norms: Dict[str, str] = {}
+        lib_tokens: Dict[str, Tuple[str, ...]] = {}
+
         # --- Footprints (fast — filename scan only) ---
         fp_entries: List[FootprintEntry] = []
         for lib_entry in disc.list_footprint_libraries():
             lib = lib_entry.nickname
-            lib_norm = _normalize(lib)
-            lib_toks = _tokenize(lib)
-            self._lib_norms[lib] = lib_norm
-            self._lib_tokens[lib] = lib_toks
+            lib_norms[lib] = _normalize(lib)
+            lib_tokens[lib] = _tokenize(lib)
 
             path = disc.resolve_footprint_library(lib)
             if not path:
@@ -351,15 +421,12 @@ class LibraryIndex:
                 )
                 fp_entries.append(entry)
 
-        self._footprints = fp_entries
-
-        # --- Symbols (reads .kicad_sym files — heavier but cached) ---
+        # --- Symbols (reads .kicad_sym files / .kicad_symdir dirs) ---
         sym_entries: List[SymbolEntry] = []
         for lib_entry in disc.list_symbol_libraries():
             lib = lib_entry.nickname
-            lib_norm = _normalize(lib)
-            self._lib_norms.setdefault(lib, lib_norm)
-            self._lib_tokens.setdefault(lib, _tokenize(lib))
+            lib_norms.setdefault(lib, _normalize(lib))
+            lib_tokens.setdefault(lib, _tokenize(lib))
 
             path = disc.resolve_symbol_library(lib)
             if not path:
@@ -394,7 +461,16 @@ class LibraryIndex:
                 )
                 sym_entries.append(entry)
 
+        # --- Atomic swap: replace all data in one go ---
+        self._footprints = fp_entries
         self._symbols = sym_entries
+        self._lib_norms = lib_norms
+        self._lib_tokens = lib_tokens
+        self._discovery = disc
+        self._from_cache = False
+
+        # Persist the freshly built index to disk for next startup.
+        self._save_cache()
 
     # ------------------------------------------------------------------
     # Internal — footprint scoring
@@ -461,6 +537,119 @@ class LibraryIndex:
                 score += 2
 
         return score
+
+
+    # ------------------------------------------------------------------
+    # Internal — disk cache
+    # ------------------------------------------------------------------
+
+    def _cache_key(self) -> str:
+        """Return a short hash that distinguishes cache files per project."""
+        raw = self._project_dir or "__global__"
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _cache_dir() -> Path:
+        """Return the directory used for library-index cache files."""
+        from ..recent_projects import get_config_dir
+        d = get_config_dir() / "library_cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _cache_path(self) -> Path:
+        return self._cache_dir() / f"lib_index_{self._cache_key()}.json"
+
+    def _save_cache(self) -> None:
+        """Serialise the current index to a JSON file."""
+        try:
+            data = {
+                "version": _CACHE_VERSION,
+                "project_dir": self._project_dir,
+                "footprints": [
+                    {"library": fp.library, "name": fp.name, "path": fp.path}
+                    for fp in self._footprints
+                ],
+                "symbols": [
+                    {
+                        "library": s.library,
+                        "name": s.name,
+                        "description": s.description,
+                        "value": s.value,
+                        "footprint": s.footprint,
+                    }
+                    for s in self._symbols
+                ],
+            }
+            tmp = self._cache_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
+            tmp.replace(self._cache_path())  # atomic on most OSes
+            logger.info(
+                "Library index cache saved (%d symbols, %d footprints) -> %s",
+                len(self._symbols), len(self._footprints), self._cache_path(),
+            )
+        except Exception:
+            logger.debug("Failed to save library index cache", exc_info=True)
+
+    def _load_cache(self) -> None:
+        """Load a previously saved cache from disk.
+
+        If successful the index is immediately marked *ready* so that
+        searches can proceed while the live build runs in the background.
+        """
+        path = self._cache_path()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if raw.get("version") != _CACHE_VERSION:
+                logger.info("Stale library cache version — ignoring")
+                return
+
+            fp_entries: List[FootprintEntry] = []
+            for item in raw.get("footprints", []):
+                name = item["name"]
+                lib = item["library"]
+                entry = FootprintEntry(
+                    library=lib,
+                    name=name,
+                    path=item["path"],
+                    name_norm=_normalize(name),
+                    name_tokens=_tokenize(name),
+                )
+                fp_entries.append(entry)
+                self._lib_norms.setdefault(lib, _normalize(lib))
+                self._lib_tokens.setdefault(lib, _tokenize(lib))
+
+            sym_entries: List[SymbolEntry] = []
+            for item in raw.get("symbols", []):
+                desc = item.get("description", "")
+                value = item.get("value", "")
+                footprint = item.get("footprint", "")
+                searchable = " ".join(filter(None, [
+                    item["name"], desc, value, footprint,
+                ]))
+                entry = SymbolEntry(
+                    library=item["library"],
+                    name=item["name"],
+                    description=desc,
+                    value=value,
+                    footprint=footprint,
+                    name_norm=_normalize(item["name"]),
+                    name_tokens=_tokenize(item["name"]),
+                    searchable_norm=searchable.lower(),
+                )
+                sym_entries.append(entry)
+
+            self._footprints = fp_entries
+            self._symbols = sym_entries
+            self._from_cache = True
+            self._ready.set()
+            logger.info(
+                "Library index loaded from cache (%d symbols, %d footprints)",
+                len(self._symbols), len(self._footprints),
+            )
+        except Exception:
+            logger.debug("Failed to load library index cache", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

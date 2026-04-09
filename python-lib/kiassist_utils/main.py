@@ -2570,13 +2570,7 @@ class KiAssistAPI:
     def importer_get_sym_libraries(self) -> Dict[str, Any]:
         """List all available symbol library nicknames."""
         try:
-            from .kicad_parser.library import LibraryDiscovery
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
-            entries = disc.list_symbol_libraries()
-            libs = [{"nickname": e.nickname, "uri": e.uri} for e in entries]
+            libs = self._library_index.list_symbol_libraries()
             return {"success": True, "libraries": libs}
         except Exception as exc:
             return {"success": False, "error": str(exc), "libraries": []}
@@ -2584,13 +2578,7 @@ class KiAssistAPI:
     def importer_get_fp_libraries(self) -> Dict[str, Any]:
         """List all available footprint library nicknames."""
         try:
-            from .kicad_parser.library import LibraryDiscovery
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
-            entries = disc.list_footprint_libraries()
-            libs = [{"nickname": e.nickname, "uri": e.uri} for e in entries]
+            libs = self._library_index.list_footprint_libraries()
             return {"success": True, "libraries": libs}
         except Exception as exc:
             return {"success": False, "error": str(exc), "libraries": []}
@@ -2812,13 +2800,17 @@ class KiAssistAPI:
             return {"success": False, "error": str(exc), "results": []}
 
     def importer_reload_libraries(self) -> Dict[str, Any]:
-        """Rebuild the library index to pick up any changes.
+        """Trigger a background rescan of KiCad libraries.
+
+        The existing index (from cache or previous build) remains usable
+        while the scan runs.  Poll ``importer_library_index_status()``
+        to know when the new data is ready.
 
         Returns:
             Dict with ``success`` and index ``status``.
         """
         try:
-            self._library_index.rebuild()
+            self._library_index.rebuild_async()
             return {"success": True, "status": self._library_index.status()}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -2852,11 +2844,8 @@ class KiAssistAPI:
         """
         try:
             import re, base64
-            from .kicad_parser.library import LibraryDiscovery, _default_env
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            from .kicad_parser.library import _default_env
+            disc = self._library_index.get_discovery()
             lib_path = disc.resolve_footprint_library(library_name)
             if not lib_path:
                 return {"success": False, "error": f"Library '{library_name}' not found"}
@@ -2925,14 +2914,10 @@ class KiAssistAPI:
             Dict with ``success`` and ``sexpr`` (string).
         """
         try:
-            from .kicad_parser.library import LibraryDiscovery
             from .kicad_parser.symbol_lib import SymbolLibrary
             from .kicad_parser.sexpr import serialize
 
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             lib_path = disc.resolve_symbol_library(library_name)
             if not lib_path:
                 return {"success": False, "error": f"Library '{library_name}' not found"}
@@ -2971,14 +2956,10 @@ class KiAssistAPI:
             ``base_sexpr`` (the raw base symbol for preview).
         """
         try:
-            from .kicad_parser.library import LibraryDiscovery
             from .kicad_parser.symbol_lib import SymbolLibrary
             from .kicad_parser.sexpr import parse, serialize, QStr
 
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             lib_path = disc.resolve_symbol_library(library_name)
             if not lib_path:
                 return {"success": False, "error": f"Library '{library_name}' not found"}
@@ -3157,6 +3138,123 @@ class KiAssistAPI:
             )
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Quick variant import (side-panel passives workflow)
+    # ------------------------------------------------------------------
+
+    def importer_quick_variant(
+        self,
+        component_type: str,
+        mpn: str,
+        target_library: str,
+    ) -> Dict[str, Any]:
+        """Look up an MPN and create a library variant in one step.
+
+        Args:
+            component_type: ``"resistor"``, ``"capacitor"``, ``"inductor"``, or ``"diode"``.
+            mpn: Manufacturer part number.
+            target_library: Library nickname to add the new symbol to.
+
+        Returns:
+            Dict with ``success``, ``name``, ``library``, ``specs``,
+            ``variant_name``, ``footprint``, ``description``,
+            ``manufacturer``, ``mpn``, ``error``.
+        """
+        try:
+            from .importer.variant_importer import quick_variant_import
+
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+
+            def _push(msg: str) -> None:
+                self._import_progress = msg
+
+            return quick_variant_import(
+                component_type=component_type,
+                mpn=mpn,
+                target_library=target_library,
+                project_dir=project_dir,
+                on_progress=_push,
+            )
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            self._import_progress = ""
+
+    def importer_variant_preview(
+        self,
+        component_type: str,
+        mpn: str,
+    ) -> Dict[str, Any]:
+        """Preview what a quick variant import would produce without creating it.
+
+        Args:
+            component_type: ``"resistor"``, ``"capacitor"``, ``"inductor"``, or ``"diode"``.
+            mpn: Manufacturer part number.
+
+        Returns:
+            Dict with ``success``, ``mpn``, ``manufacturer``, ``description``,
+            ``specs``, ``footprint``, ``variant_name``, supplier PNs, ``error``.
+        """
+        try:
+            from .importer.variant_importer import lookup_variant_preview
+            return lookup_variant_preview(component_type, mpn)
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_variant_import(
+        self,
+        component_type: str,
+        mpn: str,
+        default_symbols: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Import a passive variant using the full scraping pipeline.
+
+        Returns the same dict structure as :meth:`importer_import_by_part`
+        so the frontend can render it in ImporterDetails for preview,
+        editing, and save-to-library.
+
+        Args:
+            component_type: ``"resistor"``, ``"capacitor"``, ``"inductor"``, or ``"diode"``.
+            mpn: Manufacturer part number.
+            default_symbols: Optional per-type symbol overrides, e.g.
+                ``{"resistor": {"library": "Device", "symbol": "R_Small_US"}}``.
+
+        Returns:
+            Dict with ``success``, ``component``, ``warnings``,
+            ``cad_sources``, ``octopart_url``, ``error``.
+        """
+        try:
+            from .importer.variant_importer import variant_import_by_part
+
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+
+            def _push(msg: str) -> None:
+                self._import_progress = msg
+
+            result = variant_import_by_part(
+                component_type=component_type,
+                mpn=mpn,
+                default_symbol_overrides=default_symbols,
+                project_dir=project_dir,
+                on_progress=_push,
+            )
+
+            result_dict = self._import_result_to_dict(result)
+            # Clear temp paths since files are in a temp dir
+            if result_dict.get("success") and "component" in result_dict:
+                result_dict["component"]["symbol_path"] = ""
+                result_dict["component"]["footprint_path"] = ""
+                result_dict["component"]["model_paths"] = []
+            return result_dict
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "warnings": []}
+        finally:
+            self._import_progress = ""
 
     def importer_open_in_kicad(self, footprint_path: str) -> Dict[str, Any]:
         """Open a footprint file in the KiCad footprint editor.
@@ -3503,13 +3601,9 @@ class KiAssistAPI:
                 suggest_symbol,
                 extract_pins_from_symbol,
             )
-            from .kicad_parser.library import LibraryDiscovery
 
             # Gather available library names for the prompt
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             try:
                 lib_names = [e.nickname for e in disc.list_symbol_libraries()]
             except Exception:
@@ -3591,15 +3685,11 @@ class KiAssistAPI:
                 extract_pins_from_symbol,
                 apply_pin_mapping,
             )
-            from .kicad_parser.library import LibraryDiscovery
             from .kicad_parser.symbol_lib import SymbolLibrary
             from .kicad_parser.sexpr import serialize
 
             # Load base symbol
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             base_lib_path = disc.resolve_symbol_library(base_library)
             if not base_lib_path:
                 return {
@@ -3912,17 +4002,14 @@ class KiAssistAPI:
             Dict with ``success``, ``path`` (absolute), ``uri`` (original with variables).
         """
         try:
-            from .kicad_parser.library import LibraryDiscovery
-            project_dir = None
-            if self._current_project_path:
-                project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             if lib_type == "fp":
                 entries = disc.list_footprint_libraries()
             else:
                 entries = disc.list_symbol_libraries()
             for entry in entries:
                 if entry.nickname == nickname:
+                    project_dir = str(Path(self._current_project_path).parent) if self._current_project_path else None
                     env = {"KIPRJMOD": project_dir} if project_dir else None
                     resolved = entry.resolved_path(env=env)
                     return {
@@ -3970,17 +4057,16 @@ class KiAssistAPI:
             ``model_name`` strings for display.
         """
         try:
-            import re
-            from .kicad_parser.library import LibraryDiscovery
             from .kicad_parser.symbol_lib import SymbolLibrary
+            from .importer.library_writer import _safe_sym_name
 
             project_dir = None
             if self._current_project_path:
                 project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             env = {"KIPRJMOD": project_dir} if project_dir else None
 
-            safe_name = re.sub(r"[^A-Za-z0-9_\-.]", "_", component_name.strip()) or "Component"
+            safe_name = _safe_sym_name(component_name)
 
             result: Dict[str, Any] = {
                 "success": True,
@@ -4096,7 +4182,6 @@ class KiAssistAPI:
                 write_footprint_to_library,
                 _apply_fields_to_symbol,
             )
-            from .kicad_parser.library import LibraryDiscovery
 
             warnings: list[str] = []
 
@@ -4105,7 +4190,7 @@ class KiAssistAPI:
             if self._current_project_path:
                 project_dir = str(Path(self._current_project_path).parent)
 
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             env = {"KIPRJMOD": project_dir} if project_dir else None
 
             # Symbol library path resolution
@@ -4193,6 +4278,12 @@ class KiAssistAPI:
 
             # Write footprint FIRST so we can build the correct footprint reference
             fp_ref = ""
+            # If the component already has a footprint reference (e.g. user
+            # selected a pre-existing library footprint), use it directly
+            # without writing/copying anything.
+            if comp.fields.footprint and not comp.footprint_sexpr:
+                fp_ref = comp.fields.footprint
+                result_data["footprint_ref"] = fp_ref
             eff_overwrite_fp = overwrite or overwrite_footprint
             eff_overwrite_model = overwrite or overwrite_model
             if resolved_fp_path and comp.footprint_sexpr and not skip_footprint:
@@ -4432,12 +4523,18 @@ class KiAssistAPI:
             ``uri``, and ``resolved_path``.
         """
         try:
-            from .kicad_parser.library import LibraryDiscovery
+            import re as _re
+
+            # URIs starting with a KiCad built-in directory variable are
+            # default (official) libraries — not user/custom ones.
+            _DEFAULT_URI_RE = _re.compile(
+                r"^\$\{KICAD\d*_(SYMBOL|FOOTPRINT|3DMODEL)_DIR\}"
+            )
 
             project_dir = None
             if self._current_project_path:
                 project_dir = str(Path(self._current_project_path).parent)
-            disc = LibraryDiscovery(project_dir=project_dir)
+            disc = self._library_index.get_discovery()
             env = {"KIPRJMOD": project_dir} if project_dir else None
 
             sym_libs: list = []
@@ -4450,6 +4547,7 @@ class KiAssistAPI:
                         "nickname": entry.nickname,
                         "uri": entry.uri,
                         "resolved_path": str(resolved) if resolved else "",
+                        "is_default": bool(_DEFAULT_URI_RE.match(entry.uri)),
                     })
 
             if lib_type in ("fp", "both"):
@@ -4459,6 +4557,7 @@ class KiAssistAPI:
                         "nickname": entry.nickname,
                         "uri": entry.uri,
                         "resolved_path": str(resolved) if resolved else "",
+                        "is_default": bool(_DEFAULT_URI_RE.match(entry.uri)),
                     })
 
             return {
@@ -4884,8 +4983,9 @@ def main():
     # Create the window
     create_window(api, dev_mode=args.dev)
     
-    # Start the webview
-    webview.start(debug=False)
+    # Start the webview — private_mode=False so localStorage persists between sessions
+    storage_dir = str(Path.home() / ".kiassist" / "webview_data")
+    webview.start(debug=False, private_mode=False, storage_path=storage_dir)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted, computed } from 'vue';
+import { ref, watch, onMounted, computed } from 'vue';
 import type { ImportedComponent } from '../types/importer';
 import KicadPreview from './KicadPreview.vue';
 import ModelPreview from './ModelPreview.vue';
-import { useAppSettings } from '../composables/useAppSettings';
+import { useAppSettings, FIELD_DESCRIPTIONS } from '../composables/useAppSettings';
 
 const {
   settings: appSettings,
@@ -27,32 +27,6 @@ const emit = defineEmits<{
   (e: 'close'): void;
 }>();
 
-// -----------------------------------------------------------------------
-// AI state
-// -----------------------------------------------------------------------
-
-interface AiSuggestion {
-  library: string;
-  name: string;
-  reason: string;
-  confidence: 'high' | 'medium' | 'low';
-}
-
-interface PinRow {
-  type?: string;
-  name: string;
-  number: string;
-}
-
-interface PinMappingResult {
-  mapping: Record<string, string | null>;
-  notes: string;
-  warnings: string[];
-  imported_pins: PinRow[];
-  base_pins: PinRow[];
-  merged_symbol_sexpr: string;
-}
-
 const error = ref('');
 
 // -----------------------------------------------------------------------
@@ -69,7 +43,8 @@ const fpSearchResults = ref<FpSearchResult[]>([]);
 const fpSearchLoading = ref(false);
 const fpSearchActive = ref(false);
 const fpSearchQuery = ref('');
-const fpSearchInputRef = ref<HTMLInputElement | null>(null);
+const fpSearchInputRef = ref<HTMLInputElement | null>(null); // used as template ref
+void fpSearchInputRef; // suppress TS6133
 const fpOriginalValue = ref('');
 const libReloading = ref(false);
 const selectedFpSexpr = ref('');
@@ -78,22 +53,6 @@ const selectedFpStepData = ref('');
 const selectedFpModelTransform = ref<{ offset: {x:number,y:number,z:number}, scale: {x:number,y:number,z:number}, rotate: {x:number,y:number,z:number} } | null>(null);
 const selectedFpLoading = ref(false);
 let fpSearchTimer: ReturnType<typeof setTimeout> | null = null;
-
-/** Toggle the search panel open/closed */
-function toggleFpSearch(row: FieldRow) {
-  if (fpSearchActive.value) {
-    closeFpSearch();
-    return;
-  }
-  // Store original value on first activation
-  if (!fpOriginalValue.value) {
-    fpOriginalValue.value = row.value;
-  }
-  fpSearchActive.value = true;
-  fpSearchQuery.value = '';
-  fpSearchResults.value = [];
-  nextTick(() => { fpSearchInputRef.value?.focus(); });
-}
 
 function closeFpSearch() {
   fpSearchActive.value = false;
@@ -132,8 +91,12 @@ async function searchFootprints(query: string) {
   }
 }
 
-function selectFootprint(row: FieldRow, result: FpSearchResult) {
-  row.value = `${result.library}:${result.name}`;
+function selectFootprint(result: FpSearchResult) {
+  const ref = `${result.library}:${result.name}`;
+  // Update the Footprint field row to reflect the new selection
+  const fpRow = fieldRows.value.find(r => r.key === 'Footprint');
+  if (fpRow) fpRow.value = ref;
+  selectedFpName.value = ref;
   closeFpSearch();
   // Fetch the selected footprint's sexpr for side-by-side preview
   fetchSelectedFpSexpr(result.library, result.name);
@@ -176,8 +139,10 @@ async function fetchSelectedFpSexpr(library: string, name: string) {
   }
 }
 
-function resetFootprint(row: FieldRow) {
-  row.value = fpOriginalValue.value;
+function resetFootprint() {
+  // Restore the Footprint field row to the original value
+  const fpRow = fieldRows.value.find(r => r.key === 'Footprint');
+  if (fpRow) fpRow.value = fpOriginalValue.value;
   selectedFpSexpr.value = '';
   selectedFpName.value = '';
   selectedFpStepData.value = '';
@@ -185,58 +150,39 @@ function resetFootprint(row: FieldRow) {
   closeFpSearch();
 }
 
-/** True when the footprint value differs from the original imported value */
-function isFpModified(row: FieldRow): boolean {
-  return fpOriginalValue.value !== '' && row.value !== fpOriginalValue.value;
+// -----------------------------------------------------------------------
+// Symbol search (replace graphical symbol from existing library)
+// -----------------------------------------------------------------------
+
+interface SymSearchResult {
+  library: string;
+  name: string;
+  description?: string;
 }
 
-// AI symbol suggestion
-const aiSuggestions = ref<AiSuggestion[]>([]);
-const aiSuggestLoading = ref(false);
-const aiSuggestError = ref('');
-const showAiSuggest = ref(false);
-
-// AI pin mapping
-const selectedBaseSuggestion = ref<AiSuggestion | null>(null);
-const pinMappingResult = ref<PinMappingResult | null>(null);
-const pinMapLoading = ref(false);
-const pinMapError = ref('');
-const pinMapApplied = ref(false);
-
-// AI symbol generation
-const aiGenerateLoading = ref(false);
-const aiGenerateError = ref('');
-const aiGeneratedSexpr = ref('');
+const symSearchResults = ref<SymSearchResult[]>([]);
+const symSearchLoading = ref(false);
+const symSearchActive = ref(false);
+const symSearchQuery = ref('');
+const symSearchInputRef = ref<HTMLInputElement | null>(null); // used as template ref
+void symSearchInputRef; // suppress TS6133
+const selectedSymSexpr = ref('');       // base symbol sexpr for preview
+const selectedSymMergedSexpr = ref(''); // merged result (imported fields + base graphics)
+const selectedSymName = ref('');
+const selectedSymLoading = ref(false);
+const symReplaceError = ref('');
+let symSearchTimer: ReturnType<typeof setTimeout> | null = null;
 
 // -----------------------------------------------------------------------
-// Add Variant (clone a template symbol with updated fields)
+// -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// Add Variant (moved to VariantImporter.vue side panel)
 // -----------------------------------------------------------------------
 
 interface LibraryInfo {
   nickname: string;
   uri: string;
 }
-
-interface SymbolSearchResult {
-  library: string;
-  name: string;
-  description: string;
-  value: string;
-  footprint: string;
-}
-
-const showAddVariant = ref(false);
-const variantLibraries = ref<LibraryInfo[]>([]);
-const variantSelectedLib = ref('');
-const variantTemplateQuery = ref('');
-const variantTemplateResults = ref<SymbolSearchResult[]>([]);
-const variantTemplateLoading = ref(false);
-const variantSelectedTemplate = ref<SymbolSearchResult | null>(null);
-const variantNewName = ref('');
-const variantLoading = ref(false);
-const variantError = ref('');
-const variantSuccess = ref('');
-let variantTemplateTimer: ReturnType<typeof setTimeout> | null = null;
 
 // -----------------------------------------------------------------------
 // Save to Library
@@ -274,6 +220,38 @@ const hasAnythingToSave = computed(() => {
 const hasSym = computed(() => !!props.component.symbol_sexpr);
 const hasFp = computed(() => !!props.component.footprint_sexpr);
 const hasModel = computed(() => !!props.component.step_data);
+
+/** True when this component came from the variant importer. */
+const isVariant = computed(() => (props.component.source_info || '').startsWith('Variant:'));
+
+/**
+ * For variants, footprint / 3D-model saving is opt-in.
+ * This flag becomes true only after the user explicitly confirms they want
+ * to save a copy of the footprint (and associated 3D model).
+ */
+const variantSaveFp = ref(false);
+
+/** Show the "Save footprint copy?" confirmation banner for variants. */
+const showVariantFpConfirm = ref(false);
+
+/** Whether the fp/3D selectors should be enabled (non-variant OR user opted-in). */
+const fpSaveEnabled = computed(() => hasFp.value && (!isVariant.value || variantSaveFp.value));
+const modelSaveEnabled = computed(() => hasModel.value && (!isVariant.value || variantSaveFp.value));
+
+/** Called when user clicks the greyed-out fp/3D area on a variant. */
+function onVariantFpClick() {
+  if (!isVariant.value || variantSaveFp.value) return;
+  showVariantFpConfirm.value = true;
+}
+
+function confirmVariantSaveFp() {
+  variantSaveFp.value = true;
+  showVariantFpConfirm.value = false;
+}
+
+function cancelVariantSaveFp() {
+  showVariantFpConfirm.value = false;
+}
 
 // Template ref for the 3D model preview (used to read current transform on save)
 const modelPreviewRef = ref<InstanceType<typeof ModelPreview> | null>(null);
@@ -321,12 +299,17 @@ function updateFootprintTransform(
 // -----------------------------------------------------------------------
 
 /** Default field keys loaded from user config (populated on mount). */
-const configuredFieldKeys = ref<{ key: string; enabled: boolean }[]>([]);
+const configuredFieldKeys = ref<{ key: string; enabled: boolean; description?: string }[]>([]);
 
-/** Fallback mandatory keys if config fails to load */
-const FALLBACK_KEYS = [
-  'Reference', 'Value', 'Footprint', 'Datasheet',
-  'Description', 'MF', 'MPN', 'DKPN', 'LCSC',
+/** KiCad mandatory fields – always included regardless of settings */
+const MANDATORY_KEYS = ['Reference', 'Value', 'Footprint', 'Datasheet', 'Description'];
+
+/** Fallback extra keys if config fails to load */
+const FALLBACK_EXTRA_KEYS = [
+  { key: 'MF', enabled: true, description: 'Manufacturer' },
+  { key: 'MPN', enabled: true, description: 'Manufacturer Part Number' },
+  { key: 'DKPN', enabled: true, description: 'Digi-Key Part Number' },
+  { key: 'LCSC', enabled: true, description: 'LCSC Part Number' },
 ];
 
 interface FieldRow {
@@ -335,6 +318,7 @@ interface FieldRow {
   mandatory: boolean;
   enabled: boolean;    // optional fields start disabled
   editingKey: boolean; // is the user editing the key name
+  description?: string; // non-editable description of the field's purpose
 }
 
 /** Map of known field keys to their source value from ImportedComponent */
@@ -361,24 +345,37 @@ function buildFieldRows(c: ImportedComponent): FieldRow[] {
   const sourceMap = fieldSourceMap(c);
   const addedKeys = new Set<string>();
 
-  // Use configured defaults if available, otherwise fallback
-  const defaults = configuredFieldKeys.value.length
-    ? configuredFieldKeys.value
-    : FALLBACK_KEYS.map(k => ({ key: k, enabled: true }));
-
-  // Add configured default fields
-  for (const { key, enabled } of defaults) {
+  // 1. Always add KiCad mandatory fields first
+  for (const key of MANDATORY_KEYS) {
     rows.push({
       key,
       value: sourceMap[key] ?? '',
-      mandatory: enabled,
-      enabled: enabled,
+      mandatory: true,
+      enabled: true,
       editingKey: false,
     });
     addedKeys.add(key);
   }
 
-  // Add any remaining known fields that have values but aren't in the defaults
+  // 2. Add user-configured extra fields (MF, MPN, DKPN, LCSC, or custom)
+  const extras = configuredFieldKeys.value.length
+    ? configuredFieldKeys.value
+    : FALLBACK_EXTRA_KEYS;
+
+  for (const { key, enabled, description } of extras) {
+    if (addedKeys.has(key)) continue;
+    rows.push({
+      key,
+      value: sourceMap[key] ?? '',
+      mandatory: false,
+      enabled: enabled,
+      editingKey: false,
+      description: description || FIELD_DESCRIPTIONS[key] || undefined,
+    });
+    addedKeys.add(key);
+  }
+
+  // 3. Add any remaining known fields that have values but aren't in the defaults
   for (const [key, val] of Object.entries(sourceMap)) {
     if (!addedKeys.has(key) && val) {
       rows.push({ key, value: val, mandatory: false, enabled: false, editingKey: false });
@@ -386,7 +383,7 @@ function buildFieldRows(c: ImportedComponent): FieldRow[] {
     }
   }
 
-  // Extra fields from the import
+  // 4. Extra fields from the import
   if (c.fields.extra) {
     for (const [k, v] of Object.entries(c.fields.extra)) {
       if (v && !addedKeys.has(k)) {
@@ -411,6 +408,7 @@ onMounted(async () => {
     configuredFieldKeys.value = appSettings.value.fieldDefaults.map(f => ({
       key: f.key,
       enabled: f.enabled,
+      description: f.description || FIELD_DESCRIPTIONS[f.key] || undefined,
     }));
     fieldRows.value = buildFieldRows(props.component);
   } else {
@@ -423,6 +421,7 @@ onMounted(async () => {
           configuredFieldKeys.value = r.fields.map((f: any) => ({
             key: f.key || '',
             enabled: f.enabled === 'true' || f.enabled === true,
+            description: f.description || FIELD_DESCRIPTIONS[f.key] || undefined,
           }));
           fieldRows.value = buildFieldRows(props.component);
         }
@@ -489,275 +488,87 @@ async function openInKicad() {
 }
 
 // -----------------------------------------------------------------------
-// AI: suggest a native KiCad symbol as base
+// Symbol search: replace graphical symbol from existing library
 // -----------------------------------------------------------------------
 
-async function aiSuggestSymbol() {
-  const api = getApi();
-  if (!api) return;
-  aiSuggestLoading.value = true;
-  aiSuggestError.value = '';
-  aiSuggestions.value = [];
-  showAiSuggest.value = true;
-  try {
-    const c = props.component;
-    const r = await api.importer_ai_suggest_symbol(
-      c.fields.mpn,
-      c.fields.manufacturer,
-      c.fields.description,
-      c.fields.package,
-      c.symbol_sexpr || '',
-    );
-    if (r?.success) {
-      aiSuggestions.value = r.suggestions ?? [];
-      if (!aiSuggestions.value.length) {
-        aiSuggestError.value = 'AI returned no suggestions. Try a different AI model or refine the component data.';
-      }
-    } else {
-      aiSuggestError.value = r?.error || 'AI suggestion failed';
-    }
-  } catch (e: any) {
-    aiSuggestError.value = e.message || 'AI suggestion failed';
-  } finally {
-    aiSuggestLoading.value = false;
-  }
+function closeSymSearch() {
+  symSearchActive.value = false;
+  symSearchResults.value = [];
+  symSearchQuery.value = '';
 }
 
-// -----------------------------------------------------------------------
-// AI: map imported pins onto selected base symbol
-// -----------------------------------------------------------------------
-
-async function aiMapPins(suggestion: AiSuggestion) {
-  const api = getApi();
-  if (!api) return;
-  selectedBaseSuggestion.value = suggestion;
-  pinMappingResult.value = null;
-  pinMapError.value = '';
-  pinMapApplied.value = false;
-  pinMapLoading.value = true;
-  try {
-    const r = await api.importer_ai_map_pins(
-      props.component.fields.mpn,
-      props.component.symbol_sexpr || '',
-      suggestion.library,
-      suggestion.name,
-    );
-    if (r?.success) {
-      pinMappingResult.value = r as PinMappingResult;
-    } else {
-      pinMapError.value = r?.error || 'Pin mapping failed';
-    }
-  } catch (e: any) {
-    pinMapError.value = e.message || 'Pin mapping failed';
-  } finally {
-    pinMapLoading.value = false;
-  }
-}
-
-async function applyPinMapping() {
-  if (!pinMappingResult.value?.merged_symbol_sexpr) return;
-  const api = getApi();
-  if (!api) return;
-  try {
-    const r = await api.importer_write_symbol_sexpr(
-      pinMappingResult.value.merged_symbol_sexpr,
-      props.component.name,
-      '',
-      false,
-    );
-    if (r?.success) {
-      pinMapApplied.value = true;
-    } else {
-      pinMapError.value = r?.error || 'Failed to apply mapping';
-    }
-  } catch (e: any) {
-    pinMapError.value = e.message || 'Failed to apply mapping';
-  }
-}
-
-// -----------------------------------------------------------------------
-// AI: generate symbol from scratch
-// -----------------------------------------------------------------------
-
-async function aiGenerateSymbol() {
-  const api = getApi();
-  if (!api) return;
-  aiGenerateLoading.value = true;
-  aiGenerateError.value = '';
-  aiGeneratedSexpr.value = '';
-  try {
-    const c = props.component;
-    const r = await api.importer_ai_generate_symbol(
-      c.fields.mpn,
-      c.fields.manufacturer,
-      c.fields.description,
-      c.fields.package,
-      c.fields.reference || 'U',
-      c.fields.datasheet || '',
-      [],
-    );
-    if (r?.success) {
-      aiGeneratedSexpr.value = r.symbol_sexpr;
-    } else {
-      aiGenerateError.value = r?.error || 'AI generation failed';
-    }
-  } catch (e: any) {
-    aiGenerateError.value = e.message || 'AI generation failed';
-  } finally {
-    aiGenerateLoading.value = false;
-  }
-}
-
-async function saveGeneratedSymbol() {
-  const api = getApi();
-  if (!api || !aiGeneratedSexpr.value) return;
-  try {
-    const r = await api.importer_save_generated_symbol(
-      aiGeneratedSexpr.value,
-      props.component.name,
-      '',
-      false,
-    );
-    if (r?.success) {
-      aiGeneratedSexpr.value = '';
-    } else {
-      aiGenerateError.value = r?.error || 'Save failed';
-    }
-  } catch (e: any) {
-    aiGenerateError.value = e.message || 'Save failed';
-  }
-}
-
-// -----------------------------------------------------------------------
-// Add Variant actions
-// -----------------------------------------------------------------------
-
-async function toggleAddVariant() {
-  showAddVariant.value = !showAddVariant.value;
-  if (showAddVariant.value && !variantLibraries.value.length) {
-    await loadVariantLibraries();
-  }
-}
-
-async function loadVariantLibraries() {
-  const api = getApi();
-  if (!api) return;
-  try {
-    const r = await api.importer_get_sym_libraries();
-    if (r?.success) {
-      variantLibraries.value = r.libraries ?? [];
-    }
-  } catch { /* ignore */ }
-}
-
-function onVariantTemplateInput() {
-  if (variantTemplateTimer) clearTimeout(variantTemplateTimer);
-  const query = variantTemplateQuery.value.trim();
-  if (!query || !variantSelectedLib.value) {
-    variantTemplateResults.value = [];
+function onSymSearchInput() {
+  if (symSearchTimer) clearTimeout(symSearchTimer);
+  const query = symSearchQuery.value.trim();
+  if (!query) {
+    symSearchResults.value = [];
     return;
   }
-  variantTemplateLoading.value = true;
-  variantTemplateTimer = setTimeout(() => searchVariantTemplates(query), 300);
+  symSearchLoading.value = true;
+  symSearchTimer = setTimeout(() => searchSymbols(query), 300);
 }
 
-async function searchVariantTemplates(query: string) {
+async function searchSymbols(query: string) {
   const api = getApi();
   if (!api) {
-    variantTemplateLoading.value = false;
+    symSearchLoading.value = false;
     return;
   }
   try {
-    const r = await api.importer_search_symbols(query, variantSelectedLib.value);
+    const r = await api.importer_search_symbols(query);
     if (r?.success) {
-      variantTemplateResults.value = r.results ?? [];
+      symSearchResults.value = r.results ?? [];
     } else {
-      variantTemplateResults.value = [];
+      symSearchResults.value = [];
     }
   } catch {
-    variantTemplateResults.value = [];
+    symSearchResults.value = [];
   } finally {
-    variantTemplateLoading.value = false;
+    symSearchLoading.value = false;
   }
 }
 
-function selectVariantTemplate(result: SymbolSearchResult) {
-  variantSelectedTemplate.value = result;
-  variantTemplateResults.value = [];
-  variantTemplateQuery.value = result.name;
-  // Auto-generate new name suggestion from current fields
-  autoGenerateVariantName();
-}
-
-function autoGenerateVariantName() {
-  // Build a name from fieldRows following the pcb-club pattern
-  const ref = getFieldValue('Reference');
-  const value = getFieldValue('Value');
-  const fp = getFieldValue('Footprint');
-
-  if (!ref || !value) {
-    variantNewName.value = '';
-    return;
-  }
-
-  // Extract package size from footprint (e.g. "Resistor_SMD:R_0603_..." → "0603")
-  let pkg = '';
-  const pkgMatch = fp.match(/_(\d{4})_/);
-  if (pkgMatch) pkg = pkgMatch[1];
-
-  // Try to build a descriptive name
-  let name = ref + '_' + value;
-  if (pkg) name += '_' + pkg;
-  variantNewName.value = name;
-}
-
-function getFieldValue(key: string): string {
-  const row = fieldRows.value.find(r => r.key === key);
-  return row?.value || '';
-}
-
-/** Collect current field values into a dict for the backend */
-function collectFieldsDict(): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const row of fieldRows.value) {
-    if (row.enabled && row.key && row.value) {
-      result[row.key] = row.value;
-    }
-  }
-  return result;
-}
-
-async function addVariant() {
+async function selectSymbol(result: SymSearchResult) {
   const api = getApi();
   if (!api) return;
-  if (!variantSelectedLib.value || !variantSelectedTemplate.value || !variantNewName.value.trim()) {
-    variantError.value = 'Please select a library, template symbol, and enter a name.';
-    return;
-  }
-  variantLoading.value = true;
-  variantError.value = '';
-  variantSuccess.value = '';
+  closeSymSearch();
+  selectedSymLoading.value = true;
+  selectedSymName.value = `${result.library}:${result.name}`;
+  selectedSymSexpr.value = '';
+  selectedSymMergedSexpr.value = '';
+  symReplaceError.value = '';
   try {
-    const fields = collectFieldsDict();
-    const r = await api.importer_add_variant(
-      variantSelectedLib.value,
-      variantSelectedTemplate.value.name,
-      variantNewName.value.trim(),
-      fields,
-      '',  // target_library (same as template)
+    const r = await api.importer_replace_symbol_graphics(
+      props.component.symbol_sexpr || '',
+      result.library,
+      result.name,
     );
     if (r?.success) {
-      variantSuccess.value = `Added "${r.name}" to ${r.library}`;
-      variantNewName.value = '';
+      selectedSymSexpr.value = r.base_sexpr ?? '';
+      selectedSymMergedSexpr.value = r.merged_sexpr ?? '';
     } else {
-      variantError.value = r?.error || 'Add variant failed';
+      symReplaceError.value = r?.error || 'Failed to load symbol';
+      selectedSymName.value = '';
     }
   } catch (e: any) {
-    variantError.value = e.message || 'Add variant failed';
+    symReplaceError.value = e.message || 'Failed to load symbol';
+    selectedSymName.value = '';
   } finally {
-    variantLoading.value = false;
+    selectedSymLoading.value = false;
   }
 }
+
+function resetSymbol() {
+  selectedSymSexpr.value = '';
+  selectedSymMergedSexpr.value = '';
+  selectedSymName.value = '';
+  symReplaceError.value = '';
+  closeSymSearch();
+}
+
+// -----------------------------------------------------------------------
+// Add Variant actions (moved to VariantImporter.vue side panel)
+// -----------------------------------------------------------------------
 
 // -----------------------------------------------------------------------
 // Save to Library
@@ -796,8 +607,6 @@ async function loadSaveLibraries() {
 async function loadSaveDefaults() {
   // Use settings composable for effective defaults
   const effectiveSym = getEffectiveSymLib();
-  const effectiveFp = getEffectiveFpLib();
-  const effectiveModels = getEffectiveModelsDir();
 
   if (effectiveSym) {
     const isNickname = saveSymLibraries.value.some(l => l.nickname === effectiveSym);
@@ -809,19 +618,25 @@ async function loadSaveDefaults() {
       saveSymLibCustom.value = effectiveSym;
     }
   }
-  if (effectiveFp) {
-    const isNickname = saveFpLibraries.value.some(l => l.nickname === effectiveFp);
-    if (isNickname) {
-      saveFpLib.value = effectiveFp;
-      saveFpLibCustom.value = '';
-    } else {
-      saveFpLib.value = 'custom';
-      saveFpLibCustom.value = effectiveFp;
+
+  // For variants, skip auto-populating fp/model defaults (user must opt-in first)
+  if (!isVariant.value) {
+    const effectiveFp = getEffectiveFpLib();
+    const effectiveModels = getEffectiveModelsDir();
+    if (effectiveFp) {
+      const isNickname = saveFpLibraries.value.some(l => l.nickname === effectiveFp);
+      if (isNickname) {
+        saveFpLib.value = effectiveFp;
+        saveFpLibCustom.value = '';
+      } else {
+        saveFpLib.value = 'custom';
+        saveFpLibCustom.value = effectiveFp;
+      }
     }
-  }
-  if (effectiveModels) {
-    saveModelsDir.value = effectiveModels;
-    saveModelsDirMode.value = 'custom';
+    if (effectiveModels) {
+      saveModelsDir.value = effectiveModels;
+      saveModelsDirMode.value = 'custom';
+    }
   }
 
   // Also try backend defaults as fallback
@@ -843,18 +658,21 @@ async function loadSaveDefaults() {
           saveSymLibCustom.value = savedSym;
         }
       }
-      if (savedFp && !saveFpLib.value) {
-        const isNickname = saveFpLibraries.value.some(l => l.nickname === savedFp);
-        if (isNickname) {
-          saveFpLib.value = savedFp;
-        } else {
-          saveFpLib.value = 'custom';
-          saveFpLibCustom.value = savedFp;
+      // Skip fp/model backend defaults for variants (user must opt-in)
+      if (!isVariant.value) {
+        if (savedFp && !saveFpLib.value) {
+          const isNickname = saveFpLibraries.value.some(l => l.nickname === savedFp);
+          if (isNickname) {
+            saveFpLib.value = savedFp;
+          } else {
+            saveFpLib.value = 'custom';
+            saveFpLibCustom.value = savedFp;
+          }
         }
-      }
-      if (savedModels && !saveModelsDir.value) {
-        saveModelsDir.value = savedModels;
-        saveModelsDirMode.value = 'custom';
+        if (savedModels && !saveModelsDir.value) {
+          saveModelsDir.value = savedModels;
+          saveModelsDirMode.value = 'custom';
+        }
       }
     }
   } catch { /* ignore */ }
@@ -964,8 +782,18 @@ function buildComponentData(): Record<string, any> {
     }
   }
 
-  // Apply current 3D model transform from the UI controls to the footprint
-  let fpSexpr = c.footprint_sexpr;
+  // If user selected a pre-existing KiCad footprint, reference it directly
+  // in the symbol without copying the footprint or 3D model files.
+  let fpSexpr: string;
+  let stepData: string;
+  if (selectedFpName.value) {
+    // Existing footprint selected — just use the library reference, don't copy
+    fpSexpr = '';
+    stepData = '';
+  } else {
+    fpSexpr = c.footprint_sexpr;
+    stepData = c.step_data;
+  }
   if (fpSexpr && modelPreviewRef.value) {
     const currentXform = modelPreviewRef.value.getTransform();
     if (currentXform) {
@@ -973,13 +801,16 @@ function buildComponentData(): Record<string, any> {
     }
   }
 
+  // If a replacement symbol was selected, use the merged sexpr
+  const symSexpr = selectedSymMergedSexpr.value || c.symbol_sexpr;
+
   return {
     name: c.name,
     import_method: c.import_method,
     source_info: c.source_info,
-    symbol_sexpr: c.symbol_sexpr,
+    symbol_sexpr: symSexpr,
     footprint_sexpr: fpSexpr,
-    step_data: c.step_data,
+    step_data: stepData,
     fields,
   };
 }
@@ -997,15 +828,17 @@ async function saveToLibrary() {
   if (!api) return;
 
   const _hasSym = !!props.component.symbol_sexpr;
-  const _hasFp = !!props.component.footprint_sexpr;
-  const _hasModel = !!props.component.step_data;
+  // When user selected a pre-existing footprint, no need to write footprint/model
+  const usingExistingFp = !!selectedFpName.value;
+  const _hasFp = !usingExistingFp && !!props.component.footprint_sexpr;
+  const _hasModel = !usingExistingFp && !!props.component.step_data;
   const { symNickname, symPath, fpNickname, fpPath } = _getSaveLibPaths();
 
   if (_hasSym && !symNickname && !symPath) {
     saveError.value = 'Please select a symbol library.';
     return;
   }
-  if (_hasFp && !fpNickname && !fpPath) {
+  if (_hasFp && !fpNickname && !fpPath && (!isVariant.value || variantSaveFp.value)) {
     saveError.value = 'Please select a footprint library.';
     return;
   }
@@ -1013,14 +846,22 @@ async function saveToLibrary() {
   saveError.value = '';
   saveSuccess.value = '';
 
+  // For variants where user didn't opt-in to saving fp, treat as no fp/model
+  const skipVariantFpCheck = isVariant.value && !variantSaveFp.value;
+  const checkHasFp = _hasFp && !skipVariantFpCheck;
+  const checkHasModel = _hasModel && !skipVariantFpCheck;
+  const checkFpNickname = skipVariantFpCheck ? '' : fpNickname;
+  const checkFpPath = skipVariantFpCheck ? '' : fpPath;
+  const checkModelsDir = skipVariantFpCheck ? '' : saveModelsDir.value;
+
   // Check for existing files first
   try {
     const checkResult = await api.importer_check_library_existing(
       props.component.name,
       symNickname, symPath,
-      fpNickname, fpPath,
-      saveModelsDir.value,
-      _hasSym, _hasFp, _hasModel,
+      checkFpNickname, checkFpPath,
+      checkModelsDir,
+      _hasSym, checkHasFp, checkHasModel,
     );
 
     if (checkResult?.success) {
@@ -1073,7 +914,12 @@ async function doSaveToLibrary(
   const api = getApi();
   if (!api) return;
 
+  // For variants where user didn't opt-in to saving footprint, clear fp/model paths
+  const skipVariantFp = isVariant.value && !variantSaveFp.value;
   const { symNickname, symPath, fpNickname, fpPath } = _getSaveLibPaths();
+  const effectiveFpNickname = skipVariantFp ? '' : fpNickname;
+  const effectiveFpPath = skipVariantFp ? '' : fpPath;
+  const effectiveModelsDir = skipVariantFp ? '' : saveModelsDir.value;
 
   saveLoading.value = true;
   saveError.value = '';
@@ -1085,9 +931,9 @@ async function doSaveToLibrary(
       componentData,
       symNickname,
       symPath,
-      fpNickname,
-      fpPath,
-      saveModelsDir.value,
+      effectiveFpNickname,
+      effectiveFpPath,
+      effectiveModelsDir,
       false,  // overwrite (legacy global flag)
       owSymbol,
       owFootprint,
@@ -1112,8 +958,8 @@ async function doSaveToLibrary(
 
       recordLastUsedLibraries(
         symNickname || symPath,
-        fpNickname || fpPath,
-        saveModelsDir.value,
+        effectiveFpNickname || effectiveFpPath,
+        effectiveModelsDir,
       );
     } else {
       saveError.value = r?.error || 'Save failed';
@@ -1144,9 +990,16 @@ async function doSaveToLibrary(
         <div v-if="component.symbol_sexpr" class="preview-card">
           <div class="preview-label">
             <span class="material-icons preview-label-icon">memory</span>
-            Symbol Preview
+            <template v-if="selectedSymSexpr">Symbol Comparison</template>
+            <template v-else>Symbol Preview</template>
           </div>
-          <KicadPreview :sexpr="component.symbol_sexpr" type="symbol" />
+          <KicadPreview
+            :sexpr="component.symbol_sexpr"
+            type="symbol"
+            :compareSexpr="selectedSymSexpr || undefined"
+            primaryLabel="Imported"
+            :compareLabel="selectedSymName || 'Selected'"
+          />
         </div>
 
         <!-- Footprint: single viewer with comparison when a different footprint is selected -->
@@ -1195,8 +1048,88 @@ async function doSaveToLibrary(
         </div>
       </div>
 
-      <div class="details-columns">
-        <!-- ===== LEFT COLUMN: Symbol Fields ===== -->
+      <!-- ===== Select Symbol / Footprint Row ===== -->
+      <div class="selector-row">
+        <!-- Select Symbol Graphics -->
+        <div class="selector-card">
+          <div class="selector-header">
+            <span class="material-icons selector-icon">memory</span>
+            <span class="selector-title">Select Symbol</span>
+          </div>
+          <div class="selector-body">
+            <div v-if="selectedSymName" class="selector-badge">
+              <span class="material-icons" style="font-size: 13px; color: var(--accent-color)">check_circle</span>
+              <span class="selector-badge-name">{{ selectedSymName }}</span>
+              <button class="fp-btn" title="Clear" @click="resetSymbol"><span class="material-icons">close</span></button>
+            </div>
+            <div class="fp-search-input-row selector-search-row">
+              <span class="material-icons fp-search-icon">search</span>
+              <input
+                ref="symSearchInputRef"
+                v-model="symSearchQuery"
+                class="field-input fp-search-input"
+                placeholder="Search symbols…"
+                @input="onSymSearchInput()"
+                @focus="symSearchActive = true"
+              />
+              <span v-if="symSearchLoading" class="material-icons fp-spin-icon">sync</span>
+              <button class="fp-btn" title="Reload libraries" :disabled="libReloading" @click="reloadLibraries()">
+                <span class="material-icons" :class="{ 'fp-spin-icon': libReloading }">refresh</span>
+              </button>
+            </div>
+            <div v-if="symSearchResults.length" class="fp-results selector-results">
+              <div v-for="sr in symSearchResults" :key="sr.library + ':' + sr.name" class="fp-drop-item" @click="selectSymbol(sr)">
+                <span class="fp-drop-lib">{{ sr.library }}</span>
+                <span class="fp-drop-name">{{ sr.name }}</span>
+              </div>
+            </div>
+            <div v-else-if="symSearchQuery.trim() && !symSearchLoading && symSearchActive" class="fp-drop-hint">No matches</div>
+            <div v-if="selectedSymLoading" class="selector-loading"><span class="material-icons fp-spin-icon">sync</span> Loading…</div>
+            <div v-if="symReplaceError" class="notice error selector-notice"><span class="material-icons">error_outline</span> {{ symReplaceError }}</div>
+          </div>
+        </div>
+
+        <!-- Select Footprint -->
+        <div class="selector-card">
+          <div class="selector-header">
+            <span class="material-icons selector-icon">crop_square</span>
+            <span class="selector-title">Select Footprint</span>
+          </div>
+          <div class="selector-body">
+            <div v-if="selectedFpName" class="selector-badge">
+              <span class="material-icons" style="font-size: 13px; color: var(--accent-color)">check_circle</span>
+              <span class="selector-badge-name">{{ selectedFpName }}</span>
+              <button class="fp-btn" title="Clear" @click="resetFootprint"><span class="material-icons">close</span></button>
+            </div>
+            <div class="fp-search-input-row selector-search-row">
+              <span class="material-icons fp-search-icon">search</span>
+              <input
+                ref="fpSearchInputRef"
+                v-model="fpSearchQuery"
+                class="field-input fp-search-input"
+                placeholder="Search footprints…"
+                @input="onFpSearchInput()"
+                @focus="fpSearchActive = true"
+              />
+              <span v-if="fpSearchLoading" class="material-icons fp-spin-icon">sync</span>
+              <button class="fp-btn" title="Reload libraries" :disabled="libReloading" @click="reloadLibraries()">
+                <span class="material-icons" :class="{ 'fp-spin-icon': libReloading }">refresh</span>
+              </button>
+            </div>
+            <div v-if="fpSearchResults.length" class="fp-results selector-results">
+              <div v-for="sr in fpSearchResults" :key="sr.library + ':' + sr.name" class="fp-drop-item" @click="selectFootprint(sr)">
+                <span class="fp-drop-lib">{{ sr.library }}</span>
+                <span class="fp-drop-name">{{ sr.name }}</span>
+              </div>
+            </div>
+            <div v-else-if="fpSearchQuery.trim() && !fpSearchLoading && fpSearchActive" class="fp-drop-hint">No matches</div>
+            <div v-if="selectedFpLoading" class="selector-loading"><span class="material-icons fp-spin-icon">sync</span> Loading…</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="details-columns details-columns-single">
+        <!-- ===== Symbol Fields ===== -->
         <div class="details-col">
           <div class="detail-section">
             <div class="section-label">
@@ -1232,19 +1165,22 @@ async function doSaveToLibrary(
                   </td>
                   <!-- Key -->
                   <td class="field-key">
-                    <input
-                      v-if="!row.mandatory && row.editingKey"
-                      v-model="row.key"
-                      class="field-input field-key-input"
-                      placeholder="Field name"
-                      @blur="row.editingKey = false"
-                      @keyup.enter="($event.target as HTMLInputElement).blur()"
-                    />
-                    <span
-                      v-else
-                      :class="['field-key-text', { 'editable-key': !row.mandatory && row.enabled }]"
-                      @dblclick="!row.mandatory && row.enabled ? row.editingKey = true : null"
-                    >{{ row.key }}</span>
+                    <div class="field-key-wrapper">
+                      <input
+                        v-if="!row.mandatory && row.editingKey"
+                        v-model="row.key"
+                        class="field-input field-key-input"
+                        placeholder="Field name"
+                        @blur="row.editingKey = false"
+                        @keyup.enter="($event.target as HTMLInputElement).blur()"
+                      />
+                      <span
+                        v-else
+                        :class="['field-key-text', { 'editable-key': !row.mandatory && row.enabled }]"
+                        @dblclick="!row.mandatory && row.enabled ? row.editingKey = true : null"
+                      >{{ row.key }}</span>
+                      <span v-if="row.description" class="field-desc-badge" :title="row.description">{{ row.description }}</span>
+                    </div>
                   </td>
                   <!-- Value -->
                   <td class="field-val">
@@ -1255,74 +1191,6 @@ async function doSaveToLibrary(
                         target="_blank"
                         class="ds-link"
                       >{{ row.value }}</a>
-                      <!-- Footprint: value + separate search -->
-                      <div v-else-if="row.key === 'Footprint'" class="fp-wrapper">
-                        <div class="fp-value-row">
-                          <input
-                            v-model="row.value"
-                            class="field-input fp-input"
-                            placeholder="Footprint name"
-                            readonly
-                          />
-                          <button
-                            v-if="isFpModified(row)"
-                            class="fp-btn fp-reset-btn"
-                            title="Reset to imported footprint"
-                            @click="resetFootprint(row)"
-                          >
-                            <span class="material-icons">undo</span>
-                          </button>
-                          <button
-                            class="fp-btn fp-search-btn"
-                            :class="{ active: fpSearchActive }"
-                            title="Search footprint libraries"
-                            @click="toggleFpSearch(row)"
-                          >
-                            <span class="material-icons">{{ fpSearchActive ? 'close' : 'search' }}</span>
-                          </button>
-                        </div>
-                        <!-- Separate search box -->
-                        <div v-if="fpSearchActive" class="fp-search-panel">
-                          <div class="fp-search-input-row">
-                            <span class="material-icons fp-search-icon">search</span>
-                            <input
-                              ref="fpSearchInputRef"
-                              v-model="fpSearchQuery"
-                              class="field-input fp-search-input"
-                              placeholder="Type to search footprints…"
-                              @input="onFpSearchInput()"
-                            />
-                            <span v-if="fpSearchLoading" class="material-icons fp-spin-icon">sync</span>
-                            <button
-                              class="fp-btn"
-                              title="Reload libraries"
-                              :disabled="libReloading"
-                              @click="reloadLibraries()"
-                            >
-                              <span class="material-icons" :class="{ 'fp-spin-icon': libReloading }">
-                                refresh
-                              </span>
-                            </button>
-                          </div>
-                          <div v-if="fpSearchResults.length" class="fp-results">
-                            <div
-                              v-for="sr in fpSearchResults"
-                              :key="sr.library + ':' + sr.name"
-                              class="fp-drop-item"
-                              @click="selectFootprint(row, sr)"
-                            >
-                              <span class="fp-drop-lib">{{ sr.library }}</span>
-                              <span class="fp-drop-name">{{ sr.name }}</span>
-                            </div>
-                          </div>
-                          <div v-else-if="fpSearchQuery.trim() && !fpSearchLoading" class="fp-drop-hint">
-                            No matches
-                          </div>
-                          <div v-else-if="!fpSearchQuery.trim() && !fpSearchLoading" class="fp-drop-hint">
-                            Start typing to search
-                          </div>
-                        </div>
-                      </div>
                       <input
                         v-else
                         v-model="row.value"
@@ -1351,88 +1219,6 @@ async function doSaveToLibrary(
               Add Field
             </button>
             <div v-if="!fieldRows.length" class="empty-hint">No field data available.</div>
-          </div>
-
-          <!-- ===== Add Variant Section ===== -->
-          <div class="detail-section">
-            <button class="add-variant-toggle" @click="toggleAddVariant">
-              <span class="material-icons section-icon">library_add</span>
-              <span class="section-label-text">Add Variant to Library</span>
-              <span class="material-icons toggle-chevron">{{ showAddVariant ? 'expand_less' : 'expand_more' }}</span>
-            </button>
-
-            <div v-if="showAddVariant" class="variant-panel">
-              <div class="variant-hint">
-                Clone a template passive symbol and apply the fields above.
-              </div>
-
-              <!-- Library selector -->
-              <label class="variant-label">Target Library</label>
-              <select v-model="variantSelectedLib" class="variant-select" @change="variantSelectedTemplate = null; variantTemplateQuery = ''; variantTemplateResults = []">
-                <option value="">— Select library —</option>
-                <option v-for="lib in variantLibraries" :key="lib.nickname" :value="lib.nickname">
-                  {{ lib.nickname }}
-                </option>
-              </select>
-
-              <!-- Template symbol search -->
-              <label class="variant-label">Template Symbol</label>
-              <div class="variant-search-row">
-                <input
-                  v-model="variantTemplateQuery"
-                  class="field-input variant-search-input"
-                  :placeholder="variantSelectedLib ? 'Search symbols in ' + variantSelectedLib + '…' : 'Select a library first'"
-                  :disabled="!variantSelectedLib"
-                  @input="onVariantTemplateInput()"
-                />
-                <span v-if="variantTemplateLoading" class="material-icons fp-spin-icon">sync</span>
-              </div>
-              <div v-if="variantSelectedTemplate" class="variant-template-badge">
-                <span class="material-icons" style="font-size: 14px">check_circle</span>
-                {{ variantSelectedTemplate.name }}
-                <span v-if="variantSelectedTemplate.value" class="variant-template-val">({{ variantSelectedTemplate.value }})</span>
-              </div>
-              <div v-if="variantTemplateResults.length" class="variant-results">
-                <div
-                  v-for="sr in variantTemplateResults"
-                  :key="sr.library + ':' + sr.name"
-                  class="fp-drop-item"
-                  @click="selectVariantTemplate(sr)"
-                >
-                  <span class="fp-drop-name">{{ sr.name }}</span>
-                  <span v-if="sr.value" class="fp-drop-lib">{{ sr.value }}</span>
-                </div>
-              </div>
-
-              <!-- New symbol name -->
-              <label class="variant-label">New Symbol Name</label>
-              <input
-                v-model="variantNewName"
-                class="field-input variant-name-input"
-                placeholder="e.g. R_4.7k_0603_0.1W_1%"
-              />
-
-              <!-- Action -->
-              <div class="variant-actions">
-                <button
-                  class="action-btn primary"
-                  @click="addVariant"
-                  :disabled="variantLoading || !variantSelectedLib || !variantSelectedTemplate || !variantNewName.trim()"
-                >
-                  <span class="material-icons">{{ variantLoading ? 'sync' : 'library_add' }}</span>
-                  {{ variantLoading ? 'Adding…' : 'Add Variant' }}
-                </button>
-              </div>
-
-              <div v-if="variantSuccess" class="notice success" style="margin-top: 0.5rem">
-                <span class="material-icons">check_circle</span>
-                {{ variantSuccess }}
-              </div>
-              <div v-if="variantError" class="notice error" style="margin-top: 0.5rem">
-                <span class="material-icons">error_outline</span>
-                {{ variantError }}
-              </div>
-            </div>
           </div>
 
           <!-- ===== Save to Library Section (always open) ===== -->
@@ -1480,13 +1266,18 @@ async function doSaveToLibrary(
                 {{ saveSymLibCustom }}
               </div>
 
-              <!-- Footprint library selector (always visible, greyed out when no footprint) -->
-              <label :class="['variant-label', { 'label-disabled': !hasFp }]">
+              <!-- Footprint library selector (greyed out for variants until user opts in) -->
+              <label :class="['variant-label', { 'label-disabled': !fpSaveEnabled }]">
                 Footprint Library
                 <span v-if="!hasFp" class="label-status">(no footprint loaded)</span>
+                <span v-else-if="isVariant && !variantSaveFp" class="label-status">(using KiCad library — click to save a copy)</span>
               </label>
-              <div :class="['save-lib-row', { 'row-disabled': !hasFp }]">
-                <select v-model="saveFpLib" class="variant-select save-lib-select" :disabled="!hasFp">
+              <div
+                :class="['save-lib-row', { 'row-disabled': !fpSaveEnabled }]"
+                @click="isVariant && !variantSaveFp && hasFp ? onVariantFpClick() : undefined"
+                :style="isVariant && !variantSaveFp && hasFp ? 'cursor: pointer' : ''"
+              >
+                <select v-model="saveFpLib" class="variant-select save-lib-select" :disabled="!fpSaveEnabled">
                   <option value="">— Select footprint library —</option>
                   <optgroup label="Custom Libraries">
                     <template v-for="lib in saveFpLibraries" :key="lib.nickname">
@@ -1504,25 +1295,35 @@ async function doSaveToLibrary(
                   </optgroup>
                   <option value="custom">Browse for directory…</option>
                 </select>
-                <button class="fp-btn save-browse-btn" @click="browseSaveFpLib" :disabled="!hasFp" title="Browse for .pretty directory">
+                <button class="fp-btn save-browse-btn" @click="browseSaveFpLib" :disabled="!fpSaveEnabled" title="Browse for .pretty directory">
                   <span class="material-icons">folder_open</span>
                 </button>
               </div>
-              <div v-if="hasFp && saveFpLib === 'custom' && saveFpLibCustom" class="save-custom-path">
+              <!-- Variant footprint save confirmation dialog -->
+              <div v-if="showVariantFpConfirm" class="variant-fp-confirm">
+                <span class="material-icons" style="font-size: 16px; color: var(--accent)">info</span>
+                <span>This variant uses a standard KiCad footprint. Would you like to save a copy to your own library?</span>
+                <div class="variant-fp-confirm-actions">
+                  <button class="action-btn primary small" @click="confirmVariantSaveFp">Yes, save a copy</button>
+                  <button class="action-btn secondary small" @click="cancelVariantSaveFp">No</button>
+                </div>
+              </div>
+              <div v-if="fpSaveEnabled && saveFpLib === 'custom' && saveFpLibCustom" class="save-custom-path">
                 <span class="material-icons" style="font-size: 14px">folder</span>
                 {{ saveFpLibCustom }}
               </div>
 
-              <!-- 3D Models directory (always visible, greyed out when no model) -->
-              <label :class="['variant-label', { 'label-disabled': !hasModel }]">
+              <!-- 3D Models directory (greyed out for variants until user opts in) -->
+              <label :class="['variant-label', { 'label-disabled': !modelSaveEnabled }]">
                 3D Models Directory
                 <span v-if="!hasModel" class="label-status">(no 3D model loaded)</span>
+                <span v-else-if="isVariant && !variantSaveFp" class="label-status">(using KiCad 3D model)</span>
                 <span v-else class="variant-hint-inline">(optional — defaults to footprint lib/3dmodels)</span>
               </label>
-              <div :class="['save-lib-row', { 'row-disabled': !hasModel }]">
+              <div :class="['save-lib-row', { 'row-disabled': !modelSaveEnabled }]">
                 <select
                   class="variant-select save-lib-select models-dir-select"
-                  :disabled="!hasModel"
+                  :disabled="!modelSaveEnabled"
                   :value="saveModelsDirMode === 'auto' ? 'auto' : (saveModelsDirMode === 'custom' ? 'custom' : saveModelsDir)"
                   @change="(e: Event) => onModelsDirModeChange((e.target as HTMLSelectElement).value)"
                 >
@@ -1532,16 +1333,16 @@ async function doSaveToLibrary(
                   </template>
                   <option value="custom">Custom path…</option>
                 </select>
-                <button class="fp-btn save-browse-btn" @click="browseSaveModelsDir" :disabled="!hasModel" title="Browse for 3D models directory">
+                <button class="fp-btn save-browse-btn" @click="browseSaveModelsDir" :disabled="!modelSaveEnabled" title="Browse for 3D models directory">
                   <span class="material-icons">folder_open</span>
                 </button>
               </div>
-              <div v-if="hasModel && saveModelsDirMode === 'custom'" class="save-models-custom-row">
+              <div v-if="modelSaveEnabled && saveModelsDirMode === 'custom'" class="save-models-custom-row">
                 <input
                   v-model="saveModelsDir"
                   class="field-input save-models-input"
                   placeholder="Enter custom 3D models directory path…"
-                  :disabled="!hasModel"
+                  :disabled="!modelSaveEnabled"
                 />
               </div>
 
@@ -1560,6 +1361,9 @@ async function doSaveToLibrary(
               <div v-if="saveSuccess" class="notice success" style="margin-top: 0.5rem">
                 <span class="material-icons">check_circle</span>
                 {{ saveSuccess }}
+                <button class="close-part-btn" @click="emit('close')" title="Close this part and reset the importer">
+                  <span class="material-icons">close</span> Close Part
+                </button>
               </div>
               <div v-if="saveError" class="notice error" style="margin-top: 0.5rem">
                 <span class="material-icons">error_outline</span>
@@ -1613,207 +1417,64 @@ async function doSaveToLibrary(
           </div>
         </div>
 
-        <!-- ===== RIGHT COLUMN: AI Tools ===== -->
-        <div class="details-col">
-          <div class="ai-section">
-            <div class="ai-section-header">
-              <span class="material-icons ai-icon">auto_awesome</span>
-              <span class="ai-section-title">AI Symbol Tools</span>
-            </div>
 
-            <div class="ai-action-row">
-              <button
-                class="action-btn primary ai-btn"
-                @click="aiSuggestSymbol"
-                :disabled="aiSuggestLoading || aiGenerateLoading"
-                title="Let AI suggest a native KiCad symbol to use as a visual base"
-              >
-                <span class="material-icons">search</span>
-                {{ aiSuggestLoading ? 'Searching…' : 'AI Suggest Base Symbol' }}
-              </button>
-              <button
-                class="action-btn secondary ai-btn"
-                @click="aiGenerateSymbol"
-                :disabled="aiGenerateLoading || aiSuggestLoading"
-                title="Ask AI to generate a new symbol from scratch"
-              >
-                <span class="material-icons">draw</span>
-                {{ aiGenerateLoading ? 'Generating…' : 'AI Generate Symbol' }}
-              </button>
-            </div>
-
-            <!-- AI suggest error -->
-            <div v-if="aiSuggestError" class="notice error" style="margin: 0 0.5rem">
-              <span class="material-icons">error_outline</span>
-              {{ aiSuggestError }}
-            </div>
-
-            <!-- Suggestions list -->
-            <div v-if="showAiSuggest && aiSuggestions.length" class="ai-suggestions">
-              <div class="ai-sub-label">Select a base symbol, then click "Map Pins":</div>
-              <div
-                v-for="sug in aiSuggestions"
-                :key="sug.library + ':' + sug.name"
-                :class="['ai-sug-row', { selected: selectedBaseSuggestion === sug }]"
-                @click="selectedBaseSuggestion = sug; pinMappingResult = null; pinMapApplied = false"
-              >
-                <div class="ai-sug-top">
-                  <span
-                    :class="['confidence-badge', sug.confidence]"
-                    :title="'Confidence: ' + sug.confidence"
-                  >{{ sug.confidence[0].toUpperCase() }}</span>
-                  <span class="sug-lib">{{ sug.library }}</span>
-                  <span class="sug-name">{{ sug.name }}</span>
-                  <button
-                    class="action-btn primary map-btn"
-                    @click.stop="aiMapPins(sug)"
-                    :disabled="pinMapLoading"
-                  >
-                    <span class="material-icons">device_hub</span>
-                    Map Pins
-                  </button>
-                </div>
-                <div class="sug-reason">{{ sug.reason }}</div>
-              </div>
-            </div>
-
-            <!-- Pin mapping error -->
-            <div v-if="pinMapError" class="notice error" style="margin: 0 0.5rem">
-              <span class="material-icons">error_outline</span>
-              {{ pinMapError }}
-            </div>
-
-            <!-- Pin mapping result -->
-            <div v-if="pinMappingResult" class="pin-map-card">
-              <div class="pin-map-header">
-                <span class="material-icons" style="color: var(--accent-color)">device_hub</span>
-                Pin Mapping — {{ selectedBaseSuggestion?.library }}:{{ selectedBaseSuggestion?.name }}
-              </div>
-              <div v-if="pinMappingResult.notes" class="pin-map-notes">{{ pinMappingResult.notes }}</div>
-              <div v-if="pinMappingResult.warnings?.length" class="notice warn" style="margin: 0.3rem 0.5rem">
-                <span class="material-icons">warning</span>
-                <ul><li v-for="w in pinMappingResult.warnings" :key="w">{{ w }}</li></ul>
-              </div>
-              <table class="fields-table">
-                <thead>
-                  <tr>
-                    <th class="field-key">Base Pin</th>
-                    <th class="field-key">Base Name</th>
-                    <th class="field-key">→ Import Pin</th>
-                    <th class="field-key">Import Name</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr
-                    v-for="bp in pinMappingResult.base_pins"
-                    :key="bp.number"
-                    :class="{ unmapped: !pinMappingResult.mapping[bp.number] }"
-                  >
-                    <td class="field-key">{{ bp.number }}</td>
-                    <td class="field-val">{{ bp.name }}</td>
-                    <td class="field-key" :style="{ color: pinMappingResult.mapping[bp.number] ? 'var(--accent-color)' : '#e74c3c' }">
-                      {{ pinMappingResult.mapping[bp.number] ?? '—' }}
-                    </td>
-                    <td class="field-val">
-                      {{ pinMappingResult.imported_pins.find(p => p.number === pinMappingResult!.mapping[bp.number])?.name ?? '' }}
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-              <div class="card-actions">
-                <button
-                  class="action-btn primary"
-                  @click="applyPinMapping"
-                  :disabled="pinMapApplied"
-                >
-                  <span class="material-icons">check_circle</span>
-                  {{ pinMapApplied ? 'Applied ✓' : 'Apply Mapping to Library' }}
-                </button>
-              </div>
-            </div>
-
-            <!-- AI generate error -->
-            <div v-if="aiGenerateError" class="notice error" style="margin: 0 0.5rem">
-              <span class="material-icons">error_outline</span>
-              {{ aiGenerateError }}
-            </div>
-
-            <!-- AI generated symbol preview -->
-            <div v-if="aiGeneratedSexpr" class="ai-gen-card">
-              <div class="pin-map-header">
-                <span class="material-icons" style="color: var(--accent-color)">draw</span>
-                AI-Generated Symbol S-expression
-              </div>
-              <pre class="sexpr-preview">{{ aiGeneratedSexpr.substring(0, 800) }}{{ aiGeneratedSexpr.length > 800 ? '\n…' : '' }}</pre>
-              <div class="card-actions">
-                <button class="action-btn primary" @click="saveGeneratedSymbol">
-                  <span class="material-icons">save</span>
-                  Save Generated Symbol
-                </button>
-              </div>
-            </div>
-
-          </div><!-- /ai-section -->
-        </div>
       </div>
     </div>
   </div>
 
-  <!-- Overwrite confirmation modal -->
-  <Teleport to="body">
-    <Transition name="modal-fade">
-      <div v-if="showOverwriteDialog" class="overwrite-overlay" @click.self="cancelOverwrite">
-        <div class="overwrite-modal">
-          <div class="overwrite-modal-header">
-            <span class="material-icons overwrite-modal-warn">warning</span>
-            <span>Files Already Exist</span>
-          </div>
-          <div class="overwrite-modal-body">
-            <p class="overwrite-hint">Choose an action for each existing file:</p>
+  <!-- Overwrite confirmation modal overlay -->
+  <Transition name="modal-fade">
+    <div v-if="showOverwriteDialog" class="overwrite-overlay" @click.self="cancelOverwrite">
+      <div class="overwrite-modal">
+        <div class="overwrite-modal-header">
+          <span class="material-icons overwrite-modal-warn">warning</span>
+          <span>Files Already Exist</span>
+        </div>
+        <div class="overwrite-modal-body">
+          <p class="overwrite-hint">Choose an action for each existing file:</p>
 
-            <!-- Symbol row -->
-            <div v-if="overwriteChecks.symbolExists" class="overwrite-item">
-              <span class="material-icons overwrite-item-icon">memory</span>
-              <span class="overwrite-item-name">Symbol: <strong>{{ overwriteChecks.symbolName }}</strong></span>
-              <div class="overwrite-radios">
-                <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="overwrite" /> Overwrite</label>
-                <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="append" /> Append</label>
-                <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="ignore" /> Ignore</label>
-              </div>
-            </div>
-
-            <!-- Footprint row -->
-            <div v-if="overwriteChecks.footprintExists" class="overwrite-item">
-              <span class="material-icons overwrite-item-icon">crop_square</span>
-              <span class="overwrite-item-name">Footprint: <strong>{{ overwriteChecks.footprintName }}</strong></span>
-              <div class="overwrite-radios">
-                <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="overwrite" /> Overwrite</label>
-                <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="append" /> Append</label>
-                <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="ignore" /> Ignore</label>
-              </div>
-            </div>
-
-            <!-- 3D Model row -->
-            <div v-if="overwriteChecks.modelExists" class="overwrite-item">
-              <span class="material-icons overwrite-item-icon">view_in_ar</span>
-              <span class="overwrite-item-name">3D Model: <strong>{{ overwriteChecks.modelName }}</strong></span>
-              <div class="overwrite-radios">
-                <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="overwrite" /> Overwrite</label>
-                <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="append" /> Append</label>
-                <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="ignore" /> Ignore</label>
-              </div>
+          <!-- Symbol row -->
+          <div v-if="overwriteChecks.symbolExists" class="overwrite-item">
+            <span class="material-icons overwrite-item-icon">memory</span>
+            <span class="overwrite-item-name">Symbol: <strong>{{ overwriteChecks.symbolName }}</strong></span>
+            <div class="overwrite-radios">
+              <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="overwrite" /> Overwrite</label>
+              <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="append" /> Append</label>
+              <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="ignore" /> Ignore</label>
             </div>
           </div>
-          <div class="overwrite-modal-actions">
-            <button class="action-btn secondary" @click="cancelOverwrite">Cancel</button>
-            <button class="action-btn primary" @click="confirmOverwrite">
-              <span class="material-icons">save</span> Confirm Save
-            </button>
+
+          <!-- Footprint row -->
+          <div v-if="overwriteChecks.footprintExists" class="overwrite-item">
+            <span class="material-icons overwrite-item-icon">crop_square</span>
+            <span class="overwrite-item-name">Footprint: <strong>{{ overwriteChecks.footprintName }}</strong></span>
+            <div class="overwrite-radios">
+              <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="overwrite" /> Overwrite</label>
+              <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="append" /> Append</label>
+              <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="ignore" /> Ignore</label>
+            </div>
+          </div>
+
+          <!-- 3D Model row -->
+          <div v-if="overwriteChecks.modelExists" class="overwrite-item">
+            <span class="material-icons overwrite-item-icon">view_in_ar</span>
+            <span class="overwrite-item-name">3D Model: <strong>{{ overwriteChecks.modelName }}</strong></span>
+            <div class="overwrite-radios">
+              <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="overwrite" /> Overwrite</label>
+              <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="append" /> Append</label>
+              <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="ignore" /> Ignore</label>
+            </div>
           </div>
         </div>
+        <div class="overwrite-modal-actions">
+          <button class="action-btn secondary" @click="cancelOverwrite">Cancel</button>
+          <button class="action-btn primary" @click="confirmOverwrite">
+            <span class="material-icons">save</span> Confirm Save
+          </button>
+        </div>
       </div>
-    </Transition>
-  </Teleport>
+    </div>
+  </Transition>
 </template>
 
 <style scoped>
@@ -1947,6 +1608,93 @@ async function doSaveToLibrary(
   max-width: 1200px;
 }
 
+.details-columns-single {
+  grid-template-columns: 1fr;
+}
+
+/* ===== Selector Row (Symbol / Footprint pickers) ===== */
+.selector-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+  max-width: 1200px;
+  margin-bottom: 0.75rem;
+}
+
+.selector-card {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background-color: var(--bg-secondary);
+}
+
+.selector-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--accent-color) 8%, var(--bg-tertiary));
+}
+
+.selector-icon {
+  font-size: 0.95rem;
+  color: var(--accent-color);
+}
+
+.selector-title {
+  font-weight: 700;
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+.selector-body {
+  padding: 0.4rem 0.5rem;
+}
+
+.selector-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.35rem;
+  padding: 0.2rem 0.4rem;
+  background: color-mix(in srgb, var(--accent-color) 12%, var(--bg-tertiary));
+  border-radius: var(--radius-sm);
+  font-size: 0.73rem;
+  color: var(--text-primary);
+}
+
+.selector-badge-name {
+  flex: 1;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selector-search-row {
+  margin: 0;
+}
+
+.selector-results {
+  max-height: 150px;
+}
+
+.selector-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.73rem;
+  color: var(--text-secondary);
+  padding: 0.25rem 0;
+}
+
+.selector-notice {
+  margin: 0.3rem 0 0 !important;
+  padding: 0.25rem 0.4rem !important;
+  font-size: 0.72rem !important;
+}
+
 .details-col {
   display: flex;
   flex-direction: column;
@@ -1998,7 +1746,7 @@ async function doSaveToLibrary(
 
 .field-th-toggle { width: 28px; }
 .field-th-key { width: 100px; }
-.field-th-val { }
+.field-th-val { flex: 1; }
 .field-th-action { width: 28px; }
 
 .fields-table tr:not(:last-child) td {
@@ -2037,7 +1785,12 @@ async function doSaveToLibrary(
   color: var(--text-secondary);
   font-weight: 600;
   white-space: nowrap;
-  width: 100px;
+  width: 140px;
+}
+.field-key-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
 }
 .field-key-text {
   cursor: default;
@@ -2049,6 +1802,17 @@ async function doSaveToLibrary(
 .field-key-input {
   width: 90px;
   font-weight: 600;
+}
+.field-desc-badge {
+  font-size: 0.65rem;
+  color: var(--text-secondary);
+  font-weight: 400;
+  font-style: italic;
+  opacity: 0.7;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Value column */
@@ -2439,141 +2203,6 @@ async function doSaveToLibrary(
   color: var(--text-primary);
 }
 
-.ai-action-row {
-  display: flex;
-  gap: 0.5rem;
-  padding: 0.6rem;
-  flex-wrap: wrap;
-}
-
-.ai-btn {
-  flex: 1;
-  justify-content: center;
-}
-
-.ai-sub-label {
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  padding: 0 0.6rem 0.35rem;
-  font-style: italic;
-}
-
-/* Suggestions list */
-.ai-suggestions {
-  padding: 0 0.6rem 0.6rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-}
-
-.ai-sug-row {
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  padding: 0.4rem 0.6rem;
-  cursor: pointer;
-  transition: background-color 0.12s;
-}
-
-.ai-sug-row:hover {
-  background-color: var(--bg-tertiary);
-}
-
-.ai-sug-row.selected {
-  border-color: var(--accent-color);
-  background-color: color-mix(in srgb, var(--accent-color) 10%, transparent);
-}
-
-.ai-sug-top {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-}
-
-.confidence-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.2rem;
-  height: 1.2rem;
-  border-radius: 50%;
-  font-size: 0.65rem;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-
-.confidence-badge.high { background-color: #27ae60; color: white; }
-.confidence-badge.medium { background-color: #f39c12; color: white; }
-.confidence-badge.low { background-color: #bdc3c7; color: white; }
-
-.sug-lib {
-  font-size: 0.72rem;
-  color: var(--text-secondary);
-}
-
-.sug-name {
-  font-weight: 600;
-  font-size: 0.8rem;
-  color: var(--text-primary);
-  flex: 1;
-}
-
-.sug-reason {
-  font-size: 0.72rem;
-  color: var(--text-secondary);
-  margin-top: 0.2rem;
-  line-height: 1.3;
-}
-
-.map-btn {
-  padding: 0.25rem 0.6rem !important;
-  font-size: 0.72rem !important;
-}
-
-.map-btn .material-icons {
-  font-size: 0.85rem !important;
-}
-
-/* Pin mapping card */
-.pin-map-card {
-  margin: 0.5rem 0.6rem;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-
-.pin-map-header {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.4rem 0.6rem;
-  background-color: var(--bg-tertiary);
-  border-bottom: 1px solid var(--border-color);
-  font-weight: 600;
-  font-size: 0.8rem;
-  color: var(--text-primary);
-}
-
-.pin-map-notes {
-  padding: 0.35rem 0.6rem;
-  font-size: 0.75rem;
-  color: var(--text-secondary);
-  font-style: italic;
-  border-bottom: 1px solid var(--border-color);
-}
-
-.fields-table th {
-  padding: 0.3rem 0.75rem;
-  text-align: left;
-  background-color: var(--bg-tertiary);
-  font-size: 0.72rem;
-  color: var(--text-secondary);
-  border-bottom: 1px solid var(--border-color);
-}
-
-tr.unmapped {
-  opacity: 0.6;
-}
-
 .card-actions {
   padding: 0.5rem 0.6rem;
   border-top: 1px solid var(--border-color);
@@ -2582,26 +2211,46 @@ tr.unmapped {
   flex-wrap: wrap;
 }
 
-/* AI generate card */
-.ai-gen-card {
-  margin: 0.5rem 0.6rem;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
+/* ===== Symbol Search Section ===== */
+.sym-search-body {
+  padding: 0.6rem;
 }
 
-.sexpr-preview {
-  padding: 0.5rem 0.6rem;
-  font-size: 0.72rem;
-  font-family: monospace;
+.sym-search-hint {
+  font-size: 0.75rem;
   color: var(--text-secondary);
-  background-color: var(--bg-input);
-  white-space: pre-wrap;
-  word-break: break-all;
+  margin-bottom: 0.5rem;
+  line-height: 1.4;
+}
+
+.sym-selected-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  background: color-mix(in srgb, var(--accent-color) 12%, var(--bg-tertiary));
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+.sym-selected-name {
+  flex: 1;
+  font-weight: 600;
+}
+
+.sym-results {
   max-height: 200px;
-  overflow-y: auto;
-  margin: 0;
-  border-bottom: 1px solid var(--border-color);
+}
+
+.sym-loading {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0;
+  font-size: 0.78rem;
+  color: var(--text-secondary);
 }
 
 /* ===== Add Variant Section ===== */
@@ -2711,12 +2360,38 @@ tr.unmapped {
 .notice.success {
   display: flex;
   align-items: flex-start;
+  flex-wrap: wrap;
   gap: 0.4rem;
   font-size: 0.78rem;
   padding: 0.4rem 0.6rem;
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, #27ae60 10%, var(--bg-tertiary));
   color: #27ae60;
+}
+
+.close-part-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  margin-left: auto;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--bg-secondary, #f0f2f5);
+  border: 1px solid var(--border-color, #e1e4e8);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.close-part-btn:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary, #e4e6e9);
+}
+
+.close-part-btn .material-icons {
+  font-size: 0.85rem;
 }
 
 /* ===== Save to Library Section ===== */
@@ -2757,6 +2432,33 @@ tr.unmapped {
   word-break: break-all;
 }
 
+/* Variant footprint save confirmation banner */
+.variant-fp-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+  padding: 0.5rem 0.65rem;
+  background: color-mix(in srgb, var(--accent-color) 10%, var(--bg-tertiary));
+  border: 1px solid color-mix(in srgb, var(--accent-color) 30%, var(--border-color));
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  color: var(--text-primary);
+}
+
+.variant-fp-confirm-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
+.variant-fp-confirm-actions .action-btn.small {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.72rem;
+  min-height: unset;
+}
+
 .save-models-input {
   flex: 1;
   border-top-right-radius: 0 !important;
@@ -2776,14 +2478,15 @@ tr.unmapped {
 }
 
 .overwrite-modal {
-  background: var(--bg-card, #1e1e2e);
+  background: #ffffff;
+  color: #1a1a1a;
   border: 1px solid #f39c12;
   border-radius: 10px;
   padding: 1.2rem 1.4rem;
   min-width: 380px;
   max-width: 520px;
   width: 90vw;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
   animation: modal-enter 0.2s ease-out;
 }
 
@@ -2798,7 +2501,7 @@ tr.unmapped {
   gap: 0.5rem;
   font-size: 1rem;
   font-weight: 600;
-  color: var(--text-primary);
+  color: #1a1a1a;
   margin-bottom: 0.75rem;
 }
 
@@ -2815,7 +2518,7 @@ tr.unmapped {
 
 .overwrite-hint {
   font-size: 0.78rem;
-  color: var(--text-secondary);
+  color: #555;
   margin: 0 0 0.2rem 0;
 }
 
@@ -2825,16 +2528,16 @@ tr.unmapped {
   align-items: center;
   gap: 0.5rem;
   font-size: 0.82rem;
-  color: var(--text-primary);
+  color: #1a1a1a;
   padding: 0.45rem 0.55rem;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: #f7f7f8;
+  border: 1px solid #e0e0e0;
 }
 
 .overwrite-item-icon {
   font-size: 1rem;
-  color: var(--text-secondary);
+  color: #666;
 }
 
 .overwrite-item-name {
@@ -2853,18 +2556,18 @@ tr.unmapped {
   align-items: center;
   gap: 0.25rem;
   font-size: 0.76rem;
-  color: var(--text-secondary);
+  color: #555;
   cursor: pointer;
   white-space: nowrap;
 }
 
 .overwrite-radio:hover {
-  color: var(--text-primary);
+  color: #1a1a1a;
 }
 
 .overwrite-radio input[type="radio"] {
   margin: 0;
-  accent-color: var(--accent, #4fc3f7);
+  accent-color: #2196f3;
 }
 
 .overwrite-modal-actions {
@@ -2873,7 +2576,7 @@ tr.unmapped {
   gap: 0.5rem;
   margin-top: 0.75rem;
   padding-top: 0.6rem;
-  border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  border-top: 1px solid #e0e0e0;
 }
 
 /* Modal transition */

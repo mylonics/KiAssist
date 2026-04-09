@@ -6,17 +6,22 @@ import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
 import SymbolImporter from './components/SymbolImporter.vue';
+import VariantImporter from './components/VariantImporter.vue';
 import LibraryScanner from './components/LibraryScanner.vue';
+import LibraryScanResults from './components/LibraryScanResults.vue';
 import AppSettingsDialog from './components/AppSettings.vue';
 import ImporterDetails from './components/ImporterDetails.vue';
 import { useAppSettings } from './composables/useAppSettings';
+import { useLibraryScanner } from './composables/useLibraryScanner';
 import type { ImportedComponent, ImportedFields } from './types/importer';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
+const symbolImporter = ref<InstanceType<typeof SymbolImporter> | null>(null);
 const rightPanelCollapsed = ref(true);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
 const showSettings = ref(false);
+const { hasResults: scannerHasResults } = useLibraryScanner();
 
 // Load settings from backend on startup
 const { loadFieldDefaultsFromBackend, loadLibraryDefaultsFromBackend } = useAppSettings();
@@ -83,6 +88,7 @@ function handleComponentImported(component: ImportedComponent, warnings: string[
 function handleImporterClose() {
   importedComponent.value = null;
   importWarnings.value = [];
+  symbolImporter.value?.resetImporter();
 }
 
 function handleContextQuestionsReady(questions: Array<{ question: string; suggestions: string[] }>) {
@@ -100,6 +106,11 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
         />
         <div class="left-panel-divider"></div>
         <SymbolImporter
+          ref="symbolImporter"
+          @component-imported="handleComponentImported"
+        />
+        <div class="left-panel-divider"></div>
+        <VariantImporter
           @component-imported="handleComponentImported"
         />
         <div class="left-panel-divider"></div>
@@ -118,6 +129,7 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
         :warnings="importWarnings"
         @close="handleImporterClose"
       />
+      <LibraryScanResults v-else-if="scannerHasResults" />
       <ChatBox v-else ref="chatBox" :activityPanel="activityPanel" />
     </main>
     <button
