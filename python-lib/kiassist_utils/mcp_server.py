@@ -2239,6 +2239,112 @@ def project_write_memory(project_path: str, content: str) -> Dict[str, Any]:
 
 
 # ===========================================================================
+# Component selection tools
+# ===========================================================================
+
+
+@mcp.tool()
+def component_search(
+    component_type: str,
+    library_paths: List[str],
+    description: str = "",
+    constraints: Optional[Dict[str, Any]] = None,
+    preferred_footprints: Optional[List[str]] = None,
+    max_candidates: int = 5,
+) -> Dict[str, Any]:
+    """Search KiCad symbol libraries for components matching a set of requirements.
+
+    This is the code-layer stage of the component selection pipeline.  It:
+
+    * Loads components from local ``.kicad_sym`` library files.
+    * Pre-filters by component type using keyword matching.
+    * Scores each candidate based on type match, description similarity,
+      constraint satisfaction, and footprint preference.
+    * Returns a token-efficient shortlist (top *max_candidates*) for the model
+      layer to reason about.
+
+    Args:
+        component_type:       Component category (e.g. ``'ADC'``, ``'LDO'``,
+                              ``'voltage_regulator'``).
+        library_paths:        Paths to ``.kicad_sym`` files or directories to
+                              search recursively.
+        description:          Optional free-text description to improve
+                              description-similarity scoring.
+        constraints:          Optional key/value constraint dict.  Numeric
+                              values are matched within a 10 % tolerance.
+                              Use ``{"min": x, "max": y}`` for range checks
+                              (e.g. ``{"voltage": {"min": 2.7, "max": 5.5}}``).
+        preferred_footprints: Footprint substrings that boost candidate scores
+                              (e.g. ``["0402", "SOT-23"]``).
+        max_candidates:       Maximum number of shortlisted results (default 5).
+
+    Returns:
+        ``{"ok": true, "candidates": [...], "total_found": N,
+        "filtered_count": M, "source_stats": {...}}`` on success.
+        Each candidate summary contains ``symbol``, ``description``,
+        ``footprint``, ``score``, and optionally ``datasheet`` and ``specs``.
+    """
+    from .component_selection import ComponentSelector, ComponentSpec
+
+    spec = ComponentSpec(
+        component_type=component_type,
+        description=description,
+        constraints=constraints or {},
+        preferred_footprints=preferred_footprints or [],
+        max_candidates=max_candidates,
+    )
+    try:
+        selector = ComponentSelector(library_paths=library_paths)
+        result = selector.select(spec)
+        return _ok(result.to_dict(summary=True))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("component_search failed")
+        return _err(str(exc))
+
+
+@mcp.tool()
+def component_get_candidates(
+    component_type: str,
+    library_path: str,
+    constraints: Optional[Dict[str, Any]] = None,
+    max_candidates: int = 10,
+) -> Dict[str, Any]:
+    """Retrieve full component details from a specific KiCad symbol library.
+
+    Returns detailed (non-summarised) candidate data for in-depth comparison
+    by the model layer.  Prefer :func:`component_search` for token-efficient
+    shortlisting across multiple libraries.
+
+    Args:
+        component_type:  Component category (e.g. ``'ADC'``, ``'LDO'``).
+        library_path:    Path to a single ``.kicad_sym`` library file.
+        constraints:     Optional key/value constraints for scoring.
+        max_candidates:  Maximum number of results to return (default 10).
+
+    Returns:
+        ``{"ok": true, "candidates": [...], "total_found": N,
+        "filtered_count": M, "source_stats": {...}}`` on success.
+        Each candidate includes ``symbol``, ``description``, ``component_type``,
+        ``footprint``, ``datasheet_url``, ``specifications``, ``properties``,
+        ``source``, and ``score``.
+    """
+    from .component_selection import ComponentSelector, ComponentSpec
+
+    spec = ComponentSpec(
+        component_type=component_type,
+        constraints=constraints or {},
+        max_candidates=max_candidates,
+    )
+    try:
+        selector = ComponentSelector(library_paths=[library_path])
+        result = selector.select(spec)
+        return _ok(result.to_dict(summary=False))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("component_get_candidates failed")
+        return _err(str(exc))
+
+
+# ===========================================================================
 # In-process call entry point
 # ===========================================================================
 
