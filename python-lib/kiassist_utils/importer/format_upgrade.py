@@ -143,13 +143,17 @@ def _upgrade_footprint_tree(tree: list) -> None:
         tag = node[0]
         if tag in ("fp_line", "fp_rect"):
             _upgrade_stroke_width(node)
+            _quote_layer(node)
         elif tag == "fp_circle":
             _upgrade_stroke_width(node)
+            _quote_layer(node)
         elif tag == "fp_arc":
             _upgrade_fp_arc(node)
             _upgrade_stroke_width(node)
+            _quote_layer(node)
         elif tag == "fp_poly":
             _upgrade_stroke_width(node)
+            _quote_layer(node)
         elif tag == "fp_text":
             _upgrade_fp_text(node)
         elif tag == "pad":
@@ -157,19 +161,33 @@ def _upgrade_footprint_tree(tree: list) -> None:
 
 
 def _upgrade_stroke_width(node: list) -> None:
-    """Replace ``(width N)`` with ``(stroke (width N) (type default))``."""
+    """Replace ``(width N)`` with ``(stroke (width N) (type default))``.
+
+    KiCad 8+ expects ``(stroke ...)`` to appear **before** ``(layer ...)``
+    in graphic items (fp_line, fp_circle, fp_arc, fp_poly, fp_rect).
+    """
+    # Replace (width N) → (stroke ...) in-place first
+    stroke_idx = None
     for i, child in enumerate(node):
         if isinstance(child, list) and len(child) == 2 and child[0] == "width":
             w = child[1]
             node[i] = ["stroke", ["width", w], ["type", "default"]]
-            return
-    # If there's a (layer ...) but no stroke yet, add a default one
-    if not _find(node, "stroke"):
-        # Insert before layer if it exists
-        for i, child in enumerate(node):
-            if isinstance(child, list) and len(child) >= 2 and child[0] == "layer":
-                node.insert(i, ["stroke", ["width", 0], ["type", "default"]])
-                return
+            stroke_idx = i
+            break
+
+    # If no existing (width N) was found, check if there's already a (stroke)
+    if stroke_idx is None:
+        stroke_idx = _find_index(node, "stroke")
+
+    # Ensure stroke appears before layer
+    layer_idx = _find_index(node, "layer")
+    if stroke_idx is not None and layer_idx is not None and stroke_idx > layer_idx:
+        # Move stroke before layer
+        stroke_node = node.pop(stroke_idx)
+        # After pop, layer_idx may have shifted
+        layer_idx = _find_index(node, "layer")
+        if layer_idx is not None:
+            node.insert(layer_idx, stroke_node)
 
 
 def _upgrade_fp_arc(node: list) -> None:
@@ -223,8 +241,12 @@ def _upgrade_fp_arc(node: list) -> None:
 
 
 def _upgrade_fp_text(node: list) -> None:
-    """Upgrade fp_text layer quoting and stroke."""
-    _upgrade_stroke_width(node)
+    """Upgrade fp_text layer quoting.
+
+    Note: ``fp_text`` does NOT have a ``(stroke ...)`` attribute — only
+    ``(effects (font ...))`` for text rendering.  Do NOT call
+    ``_upgrade_stroke_width`` here.
+    """
     # Ensure layer value is quoted
     layer_node = _find(node, "layer")
     if layer_node and len(layer_node) >= 2:
@@ -288,11 +310,27 @@ def _upgrade_symbol_properties(sym: list) -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _quote_layer(node: list) -> None:
+    """Ensure ``(layer name)`` inside *node* uses a quoted string."""
+    layer_node = _find(node, "layer")
+    if layer_node and len(layer_node) >= 2:
+        if isinstance(layer_node[1], str) and not isinstance(layer_node[1], QStr):
+            layer_node[1] = QStr(str(layer_node[1]))
+
+
 def _find(tree: list, tag: str) -> Optional[list]:
     """Find the first child list with the given tag."""
     for child in tree:
         if isinstance(child, list) and len(child) >= 1 and child[0] == tag:
             return child
+    return None
+
+
+def _find_index(tree: list, tag: str) -> Optional[int]:
+    """Return the index of the first child list with the given tag, or None."""
+    for i, child in enumerate(tree):
+        if isinstance(child, list) and len(child) >= 1 and child[0] == tag:
+            return i
     return None
 
 

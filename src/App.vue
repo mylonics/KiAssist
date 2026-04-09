@@ -1,26 +1,82 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, onMounted } from 'vue';
 import ChatBox from './components/ChatBox.vue';
 import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
 import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
 import SymbolImporter from './components/SymbolImporter.vue';
+import LibraryScanner from './components/LibraryScanner.vue';
+import AppSettingsDialog from './components/AppSettings.vue';
 import ImporterDetails from './components/ImporterDetails.vue';
-import type { ImportedComponent } from './types/importer';
+import { useAppSettings } from './composables/useAppSettings';
+import type { ImportedComponent, ImportedFields } from './types/importer';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
 const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const rightPanelCollapsed = ref(true);
 const rightPanelTab = ref<'context' | 'llm' | 'api'>('context');
-const leftPanelTab = ref<'kicad' | 'importer'>('kicad');
+const showSettings = ref(false);
+
+// Load settings from backend on startup
+const { loadFieldDefaultsFromBackend, loadLibraryDefaultsFromBackend } = useAppSettings();
+onMounted(async () => {
+  await loadFieldDefaultsFromBackend();
+  await loadLibraryDefaultsFromBackend();
+});
 
 // Importer details overlay state
 const importedComponent = ref<ImportedComponent | null>(null);
 const importWarnings = ref<string[]>([]);
 
 function handleComponentImported(component: ImportedComponent, warnings: string[]) {
-  importedComponent.value = component;
+  const existing = importedComponent.value;
+  if (existing) {
+    // Merge: new non-empty values override existing (last-wins),
+    // but empty values from the new import don't wipe existing data.
+    const merged: ImportedComponent = { ...existing };
+
+    // Scalar string fields — keep existing when new value is empty
+    const keys: (keyof ImportedComponent)[] = [
+      'name', 'import_method', 'source_info',
+      'symbol_path', 'footprint_path',
+      'symbol_sexpr', 'footprint_sexpr', 'step_data',
+    ];
+    for (const k of keys) {
+      if (component[k]) {
+        (merged as any)[k] = component[k];
+      }
+    }
+
+    // model_paths — non-empty array wins
+    if (component.model_paths?.length) {
+      merged.model_paths = [...component.model_paths];
+    }
+
+    // Fields — merge individually, non-empty wins
+    const fieldKeys: (keyof ImportedFields)[] = [
+      'mpn', 'manufacturer', 'digikey_pn', 'mouser_pn',
+      'lcsc_pn', 'value', 'reference', 'footprint',
+      'datasheet', 'description', 'package',
+    ];
+    merged.fields = { ...existing.fields };
+    for (const fk of fieldKeys) {
+      if (component.fields[fk]) {
+        (merged.fields as any)[fk] = component.fields[fk];
+      }
+    }
+    // Merge extra fields
+    merged.fields.extra = { ...existing.fields.extra };
+    if (component.fields.extra) {
+      for (const [ek, ev] of Object.entries(component.fields.extra)) {
+        if (ev) merged.fields.extra[ek] = ev;
+      }
+    }
+
+    importedComponent.value = merged;
+  } else {
+    importedComponent.value = component;
+  }
   importWarnings.value = warnings;
 }
 
@@ -38,33 +94,21 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
 <template>
   <div class="app-container">
     <aside class="left-panel">
-      <div class="left-panel-tabs">
-        <button
-          :class="['left-tab-btn', { active: leftPanelTab === 'kicad' }]"
-          @click="leftPanelTab = 'kicad'"
-          title="KiCad instance selector"
-        >
-          <span class="material-icons tab-icon">developer_board</span>
-          KiCad
-        </button>
-        <button
-          :class="['left-tab-btn', { active: leftPanelTab === 'importer' }]"
-          @click="leftPanelTab = 'importer'"
-          title="Symbol / Footprint Importer"
-        >
-          <span class="material-icons tab-icon">download</span>
-          Import
-        </button>
-      </div>
       <div class="left-panel-content">
         <KiCadInstanceSelector
-          v-show="leftPanelTab === 'kicad'"
           @context-questions-ready="handleContextQuestionsReady"
         />
+        <div class="left-panel-divider"></div>
         <SymbolImporter
-          v-show="leftPanelTab === 'importer'"
           @component-imported="handleComponentImported"
         />
+        <div class="left-panel-divider"></div>
+        <LibraryScanner />
+        <div class="left-panel-divider"></div>
+        <button class="settings-btn" @click="showSettings = true">
+          <span class="material-icons settings-btn-icon">settings</span>
+          <span class="settings-btn-text">Settings</span>
+        </button>
       </div>
     </aside>
     <main class="chat-panel">
@@ -116,6 +160,9 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
         <ApiActivityPanel v-show="rightPanelTab === 'api'" ref="activityPanel" />
       </div>
     </aside>
+
+    <!-- Settings dialog -->
+    <AppSettingsDialog v-if="showSettings" @close="showSettings = false" />
   </div>
 </template>
 
@@ -202,44 +249,47 @@ body {
   box-shadow: var(--shadow-sm);
 }
 
-.left-panel-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--border-color);
-  flex-shrink: 0;
-}
-
-.left-tab-btn {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  padding: 0.45rem 0.3rem;
-  border: none;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 0.7rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  border-bottom: 2px solid transparent;
-}
-
-.left-tab-btn:hover {
-  background-color: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
-.left-tab-btn.active {
-  color: var(--accent-color);
-  border-bottom-color: var(--accent-color);
-  background-color: var(--bg-secondary);
-}
-
 .left-panel-content {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
   min-height: 0;
+}
+
+.left-panel-divider {
+  height: 0;
+  border-top: 1px solid var(--border-color);
+  margin: 0;
+}
+
+.settings-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  width: 100%;
+  padding: 0.5rem 0.6rem;
+  border: none;
+  background-color: var(--bg-secondary);
+  border-top: 1px solid var(--border-color);
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 600;
+  transition: all 0.12s;
+}
+
+.settings-btn:hover {
+  background-color: var(--bg-tertiary);
+  color: var(--accent-color);
+}
+
+.settings-btn-icon {
+  font-size: 1rem;
+  color: var(--accent-color);
+}
+
+.settings-btn-text {
+  flex: 1;
+  text-align: left;
 }
 
 .chat-panel {

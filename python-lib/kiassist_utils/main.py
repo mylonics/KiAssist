@@ -127,6 +127,10 @@ class KiAssistAPI:
     _CFG_MODEL = "last_model"
     _CFG_SECONDARY_PROVIDER = "last_secondary_provider"
     _CFG_SECONDARY_MODEL = "last_secondary_model"
+    # Config keys for persisted library paths
+    _CFG_LAST_SYM_LIB = "last_sym_lib"
+    _CFG_LAST_FP_LIB = "last_fp_lib"
+    _CFG_LAST_MODELS_DIR = "last_models_dir"
 
     def __init__(self):
         """Initialize the backend API."""
@@ -280,6 +284,55 @@ class KiAssistAPI:
                 json.dump(config, f, indent=2)
         except Exception:
             logger.warning("Failed to persist model selections")
+
+    # ------------------------------------------------------------------
+    # Symbol field defaults
+    # ------------------------------------------------------------------
+
+    _CFG_SYMBOL_FIELD_DEFAULTS = "symbol_field_defaults"
+
+    # The factory defaults if nothing is saved yet.
+    _BUILTIN_FIELD_DEFAULTS: List[Dict[str, str]] = [
+        {"key": "Reference", "enabled": "true"},
+        {"key": "Value",     "enabled": "true"},
+        {"key": "Footprint", "enabled": "true"},
+        {"key": "Datasheet", "enabled": "true"},
+        {"key": "Description", "enabled": "true"},
+        {"key": "MF",        "enabled": "true"},
+        {"key": "MPN",       "enabled": "true"},
+        {"key": "DKPN",      "enabled": "true"},
+        {"key": "LCSC",      "enabled": "true"},
+    ]
+
+    def get_symbol_field_defaults(self) -> Dict[str, Any]:
+        """Return the user's configured default symbol fields.
+
+        Each entry is ``{"key": "<field name>", "enabled": "true"|"false"}``.
+        """
+        config = self._get_config()
+        fields = config.get(self._CFG_SYMBOL_FIELD_DEFAULTS)
+        if not fields or not isinstance(fields, list):
+            fields = self._BUILTIN_FIELD_DEFAULTS
+        return {"success": True, "fields": fields}
+
+    def set_symbol_field_defaults(self, fields: list) -> Dict[str, Any]:
+        """Persist the user's configured default symbol fields.
+
+        *fields* is a list of ``{"key": str, "enabled": str}`` dicts.
+        """
+        try:
+            # Validate input
+            cleaned: List[Dict[str, str]] = []
+            for entry in fields:
+                key = str(entry.get("key", "")).strip()
+                enabled = str(entry.get("enabled", "true")).lower()
+                if key:
+                    cleaned.append({"key": key, "enabled": enabled})
+            self._save_config_field(self._CFG_SYMBOL_FIELD_DEFAULTS, cleaned)
+            return {"success": True}
+        except Exception as exc:
+            logger.warning("Failed to save symbol field defaults: %s", exc)
+            return {"success": False, "error": str(exc)}
 
     def _auto_start_last_server(self) -> None:
         """Auto-start the last-used Gemma server model in a background thread.
@@ -2857,6 +2910,169 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    def importer_get_symbol_sexpr(
+        self,
+        library_name: str,
+        symbol_name: str,
+    ) -> Dict[str, Any]:
+        """Read a symbol's S-expression from an existing KiCad library.
+
+        Args:
+            library_name: Library nickname (e.g. ``"Device"``).
+            symbol_name: Symbol name (e.g. ``"R"``).
+
+        Returns:
+            Dict with ``success`` and ``sexpr`` (string).
+        """
+        try:
+            from .kicad_parser.library import LibraryDiscovery
+            from .kicad_parser.symbol_lib import SymbolLibrary
+            from .kicad_parser.sexpr import serialize
+
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            lib_path = disc.resolve_symbol_library(library_name)
+            if not lib_path:
+                return {"success": False, "error": f"Library '{library_name}' not found"}
+            path = Path(lib_path)
+            if not path.exists():
+                return {"success": False, "error": f"Library file not found: {path}"}
+            sym_lib = SymbolLibrary.load(path)
+            sym = sym_lib.find_by_name(symbol_name)
+            if sym is None:
+                return {"success": False, "error": f"Symbol '{symbol_name}' not found in '{library_name}'"}
+            sexpr = serialize(sym.to_tree())
+            return {"success": True, "sexpr": sexpr}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_replace_symbol_graphics(
+        self,
+        imported_symbol_sexpr: str,
+        library_name: str,
+        symbol_name: str,
+    ) -> Dict[str, Any]:
+        """Replace graphical elements (not fields) in the imported symbol with
+        those from an existing library symbol.
+
+        Keeps all properties/fields from the imported symbol but replaces
+        sub-symbol graphics (pins, arcs, polylines, rectangles, circles, text)
+        with those from the library symbol.
+
+        Args:
+            imported_symbol_sexpr: Raw S-expression of the imported symbol.
+            library_name: Library nickname containing the base symbol.
+            symbol_name: Symbol name within *library_name*.
+
+        Returns:
+            Dict with ``success``, ``merged_sexpr`` (the result), and
+            ``base_sexpr`` (the raw base symbol for preview).
+        """
+        try:
+            from .kicad_parser.library import LibraryDiscovery
+            from .kicad_parser.symbol_lib import SymbolLibrary
+            from .kicad_parser.sexpr import parse, serialize, QStr
+
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            lib_path = disc.resolve_symbol_library(library_name)
+            if not lib_path:
+                return {"success": False, "error": f"Library '{library_name}' not found"}
+            path = Path(lib_path)
+            if not path.exists():
+                return {"success": False, "error": f"Library file not found: {path}"}
+            sym_lib = SymbolLibrary.load(path)
+            base_sym = sym_lib.find_by_name(symbol_name)
+            if base_sym is None:
+                return {"success": False, "error": f"Symbol '{symbol_name}' not found in '{library_name}'"}
+            base_sexpr = serialize(base_sym.to_tree())
+
+            # Parse both symbols
+            imported_tree = parse(imported_symbol_sexpr.strip())
+            base_tree = parse(base_sexpr.strip())
+
+            # Handle case where imported_tree is a full library
+            if imported_tree and imported_tree[0] == "kicad_symbol_lib":
+                sub_syms = [t for t in imported_tree[1:]
+                            if isinstance(t, list) and t and t[0] == "symbol"]
+                if sub_syms:
+                    imported_tree = sub_syms[0]
+
+            if not imported_tree or imported_tree[0] != "symbol":
+                return {"success": False, "error": "Invalid imported symbol S-expression"}
+            if not base_tree or base_tree[0] != "symbol":
+                return {"success": False, "error": "Invalid base symbol S-expression"}
+
+            # Extract the imported symbol's name
+            imported_name = str(imported_tree[1]) if len(imported_tree) > 1 else "Component"
+
+            # Collect property nodes from the imported symbol (these we keep)
+            imported_props = [
+                node for node in imported_tree
+                if isinstance(node, list) and node and node[0] == "property"
+            ]
+
+            # Collect top-level non-property, non-subsymbol metadata from imported
+            # (e.g. pin_names, pin_numbers, in_bom, on_board, etc.)
+            _METADATA_TAGS = {
+                "pin_names", "pin_numbers", "in_bom", "on_board",
+                "exclude_from_sim", "power",
+            }
+            imported_metadata = [
+                node for node in imported_tree
+                if isinstance(node, list) and node and node[0] in _METADATA_TAGS
+            ]
+
+            # Collect sub-symbols (graphical units) from the BASE symbol
+            base_subsyms = [
+                node for node in base_tree
+                if isinstance(node, list) and node and node[0] == "symbol"
+            ]
+
+            # Collect top-level metadata from the BASE symbol as fallback
+            base_metadata = [
+                node for node in base_tree
+                if isinstance(node, list) and node and node[0] in _METADATA_TAGS
+            ]
+
+            # Rename base sub-symbols to use the imported symbol's name
+            base_name = str(base_tree[1]) if len(base_tree) > 1 else ""
+            for subsym in base_subsyms:
+                if isinstance(subsym[1], (str, QStr)):
+                    old_sub_name = str(subsym[1])
+                    # Replace the base name prefix with the imported name
+                    if old_sub_name.startswith(base_name):
+                        new_sub_name = imported_name + old_sub_name[len(base_name):]
+                        subsym[1] = QStr(new_sub_name)
+
+            # Build the merged symbol tree
+            merged = ["symbol", QStr(imported_name)]
+
+            # Add metadata (prefer imported, fallback to base)
+            metadata = imported_metadata if imported_metadata else base_metadata
+            merged.extend(metadata)
+
+            # Add properties from imported
+            merged.extend(imported_props)
+
+            # Add graphical sub-symbols from base
+            merged.extend(base_subsyms)
+
+            merged_sexpr = serialize(merged) + "\n"
+            return {
+                "success": True,
+                "merged_sexpr": merged_sexpr,
+                "base_sexpr": base_sexpr,
+            }
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": str(exc)}
+
     def importer_import_from_kicad(
         self,
         symbol_name: str,
@@ -2977,8 +3193,20 @@ class KiAssistAPI:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    _IMPORT_FILE_TYPES = (
+        "Supported files (*.zip;*.kicad_sym;*.lib;*.kicad_mod;*.mod;*.step;*.stp;*.wrl)",
+        "ZIP archives (*.zip)",
+        "KiCad symbols (*.kicad_sym;*.lib)",
+        "KiCad footprints (*.kicad_mod;*.mod)",
+        "3D models (*.step;*.stp;*.wrl)",
+        "All files (*.*)",
+    )
+
     def importer_browse_zip(self) -> Dict[str, Any]:
-        """Open a file-chooser dialog for ZIP file selection.
+        """Open a file-chooser dialog for file selection.
+
+        Accepts ZIP archives as well as raw ``.kicad_sym``, ``.kicad_mod``,
+        ``.step``, ``.stp``, ``.wrl`` files.
 
         Returns:
             Dict with ``success`` and ``path`` (empty string if cancelled).
@@ -2991,7 +3219,7 @@ class KiAssistAPI:
             result = windows[0].create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=False,
-                file_types=("ZIP files (*.zip)", "All files (*.*)"),
+                file_types=self._IMPORT_FILE_TYPES,
             )
             if result:
                 return {"success": True, "path": result[0]}
@@ -3000,7 +3228,10 @@ class KiAssistAPI:
             return {"success": False, "error": str(exc), "path": ""}
 
     def importer_browse_zips(self) -> Dict[str, Any]:
-        """Open a file-chooser dialog for selecting multiple ZIP files.
+        """Open a file-chooser dialog for selecting multiple files.
+
+        Accepts ZIP archives as well as raw ``.kicad_sym``, ``.kicad_mod``,
+        ``.step``, ``.stp``, ``.wrl`` files.
 
         Returns:
             Dict with ``success`` and ``paths`` (list of selected file paths,
@@ -3014,7 +3245,7 @@ class KiAssistAPI:
             result = windows[0].create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=True,
-                file_types=("ZIP files (*.zip)", "All files (*.*)"),
+                file_types=self._IMPORT_FILE_TYPES,
             )
             if result:
                 return {"success": True, "paths": list(result)}
@@ -3029,30 +3260,44 @@ class KiAssistAPI:
         target_fp_lib_dir: str = "",
         models_dir: str = "",
         overwrite: bool = False,
+        override_fields: dict = None,
     ) -> Dict[str, Any]:
-        """Import and merge components from multiple ZIP files.
+        """Import and merge components from multiple files.
 
-        Each ZIP may contribute a symbol, footprint, 3-D model, or metadata.
-        Results are merged into a single :class:`ImportedComponent`: the first
-        symbol found is used, the first footprint found is used, all 3-D
-        models are collected, and fields are merged (earlier ZIPs win on
-        conflicts).
+        Accepts ZIP archives as well as individual raw files:
+        ``.kicad_sym``, ``.lib``, ``.kicad_mod``, ``.mod``,
+        ``.step``, ``.stp``, ``.wrl``.
+
+        Each file may contribute a symbol, footprint, 3-D model, or metadata.
+        Results are merged into a single :class:`ImportedComponent`: later
+        files override earlier ones (last-wins).
+
+        When *override_fields* is provided (e.g. from a prior Octopart/part
+        lookup), those field values are overlaid **on top** of the file-derived
+        fields — so part-lookup metadata (MPN, manufacturer, DKPN, datasheet,
+        etc.) takes priority over whatever the file metadata contained.
 
         Args:
-            zip_paths: List of absolute paths to ``.zip`` files.
+            zip_paths: List of absolute paths to ``.zip`` or raw KiCad/STEP files.
             target_sym_lib: Destination ``.kicad_sym`` file.
             target_fp_lib_dir: Destination ``.pretty`` directory.
             models_dir: Directory for 3-D model files.
             overwrite: Replace existing entries if True.
+            override_fields: Dict of field values from a prior part lookup
+                to overlay onto the imported component.  Keys match
+                :class:`FieldSet` attributes (``mpn``, ``manufacturer``,
+                ``digikey_pn``, ``mouser_pn``, ``lcsc_pn``, ``value``,
+                ``reference``, ``footprint``, ``datasheet``, ``description``,
+                ``package``).  An ``extra`` sub-dict is also supported.
 
         Returns:
             Dict with ``success``, ``component`` summary, ``warnings``, ``error``.
         """
         if not zip_paths:
-            return {"success": False, "error": "No ZIP files specified", "warnings": []}
+            return {"success": False, "error": "No files specified", "warnings": []}
 
         try:
-            from .importer import import_zip, commit_import
+            from .importer import import_zip, import_raw_file, RAW_FILE_EXTS, commit_import
             from .importer.models import ImportedComponent, FieldSet, ImportMethod
 
             all_warnings: list[str] = []
@@ -3060,13 +3305,23 @@ class KiAssistAPI:
 
             with tempfile.TemporaryDirectory(prefix="kiassist_multzip_") as tmp_dir:
                 for i, zp in enumerate(zip_paths):
-                    sub_dir = os.path.join(tmp_dir, f"zip_{i}")
+                    sub_dir = os.path.join(tmp_dir, f"file_{i}")
                     os.makedirs(sub_dir, exist_ok=True)
-                    result = import_zip(zp, output_dir=sub_dir)
+
+                    ext = os.path.splitext(zp)[1].lower()
+                    if ext == ".zip":
+                        result = import_zip(zp, output_dir=sub_dir)
+                    elif ext in RAW_FILE_EXTS:
+                        result = import_raw_file(zp, output_dir=sub_dir)
+                    else:
+                        all_warnings.append(
+                            f"Skipped unsupported file type '{ext}': {os.path.basename(zp)}"
+                        )
+                        continue
                     all_warnings.extend(result.warnings)
 
                     if not result.success:
-                        all_warnings.append(f"ZIP {os.path.basename(zp)}: {result.error}")
+                        all_warnings.append(f"{os.path.basename(zp)}: {result.error}")
                         continue
 
                     comp = result.component
@@ -3077,16 +3332,19 @@ class KiAssistAPI:
                             os.path.basename(p) for p in zip_paths
                         )
                     else:
-                        # Merge: fill in missing pieces from subsequent ZIPs
-                        if not merged_component.symbol_sexpr and comp.symbol_sexpr:
+                        # Merge: later ZIPs override earlier ones.
+                        # If the new ZIP has a symbol/footprint/3D, it
+                        # replaces what was loaded before.
+                        if comp.symbol_sexpr:
                             merged_component.symbol_sexpr = comp.symbol_sexpr
                             merged_component.symbol_path = comp.symbol_path
-                        if not merged_component.footprint_sexpr and comp.footprint_sexpr:
+                        if comp.footprint_sexpr:
                             merged_component.footprint_sexpr = comp.footprint_sexpr
                             merged_component.footprint_path = comp.footprint_path
-                        # Always collect additional 3-D models
-                        merged_component.model_paths.extend(comp.model_paths)
-                        # Merge fields: keep existing non-empty, fill blanks
+                        # Later 3-D models replace earlier ones
+                        if comp.model_paths:
+                            merged_component.model_paths = list(comp.model_paths)
+                        # Merge fields: later non-empty values override earlier
                         mf = merged_component.fields
                         cf = comp.fields
                         for attr in (
@@ -3094,18 +3352,43 @@ class KiAssistAPI:
                             "lcsc_pn", "value", "reference", "footprint",
                             "datasheet", "description", "package",
                         ):
-                            if not getattr(mf, attr) and getattr(cf, attr):
+                            if getattr(cf, attr):
                                 setattr(mf, attr, getattr(cf, attr))
                         for k, v in cf.extra.items():
-                            if k not in mf.extra:
+                            if v:
                                 mf.extra[k] = v
 
                 if merged_component is None:
                     return {
                         "success": False,
-                        "error": "No valid components found in the provided ZIP files",
+                        "error": "No valid components found in the provided files",
                         "warnings": all_warnings,
                     }
+
+                # Overlay part-lookup fields onto the ZIP-imported component.
+                # Non-empty override values win over ZIP metadata so that
+                # Octopart-sourced MPN, manufacturer, DKPN, datasheet, etc.
+                # are preserved while the ZIP supplies symbol/footprint/3D.
+                if override_fields:
+                    mf = merged_component.fields
+                    _FIELD_ATTRS = (
+                        "mpn", "manufacturer", "digikey_pn", "mouser_pn",
+                        "lcsc_pn", "value", "reference", "footprint",
+                        "datasheet", "description", "package",
+                    )
+                    for attr in _FIELD_ATTRS:
+                        override_val = override_fields.get(attr, "")
+                        if override_val:
+                            setattr(mf, attr, override_val)
+                    # Merge extra fields
+                    extra_override = override_fields.get("extra")
+                    if isinstance(extra_override, dict):
+                        for k, v in extra_override.items():
+                            if v:
+                                mf.extra[k] = v
+                    # Update component name to match the overridden MPN
+                    if mf.mpn:
+                        merged_component.name = mf.mpn
 
                 # Build the ImportResult wrapper
                 from .importer.models import ImportResult
@@ -3133,6 +3416,44 @@ class KiAssistAPI:
                     return result_dict
         except Exception as exc:
             return {"success": False, "error": str(exc), "warnings": []}
+
+    def importer_save_dropped_zips(self, files: list) -> Dict[str, Any]:
+        """Save base64-encoded files dropped via drag-and-drop.
+
+        Accepts ZIP archives as well as raw ``.kicad_sym``, ``.kicad_mod``,
+        ``.step``, ``.stp``, ``.wrl`` files.
+
+        Each entry in *files* should be a dict with ``name`` (filename)
+        and ``data`` (base64-encoded bytes).
+
+        Returns:
+            Dict with ``success`` and ``paths`` — absolute temp file paths
+            that the frontend can feed into ``importer_import_zips``.
+        """
+        import base64
+
+        if not files:
+            return {"success": False, "error": "No files provided"}
+
+        saved_paths: list[str] = []
+        try:
+            drop_dir = tempfile.mkdtemp(prefix="kiassist_drop_")
+            for entry in files:
+                name = entry.get("name", "dropped_file")
+                data_b64 = entry.get("data", "")
+                if not data_b64:
+                    continue
+                raw = base64.b64decode(data_b64)
+                out = os.path.join(drop_dir, name)
+                with open(out, "wb") as f:
+                    f.write(raw)
+                saved_paths.append(out)
+            return {"success": True, "paths": saved_paths}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "paths": []}
+
+    # Alias so the frontend can call either name
+    importer_save_dropped_files = importer_save_dropped_zips
 
     def importer_browse_output_dir(self) -> Dict[str, Any]:
         """Open a folder-chooser dialog for the output library directory.
@@ -3476,6 +3797,468 @@ class KiAssistAPI:
             overwrite=overwrite,
         )
 
+    # ------------------------------------------------------------------
+    # Library save defaults (persisted)
+    # ------------------------------------------------------------------
+
+    def importer_get_library_defaults(self) -> Dict[str, Any]:
+        """Return the user's last-used library paths.
+
+        Returns:
+            Dict with ``success``, ``sym_lib``, ``fp_lib``, ``models_dir``.
+        """
+        config = self._get_config()
+        return {
+            "success": True,
+            "sym_lib": config.get(self._CFG_LAST_SYM_LIB, ""),
+            "fp_lib": config.get(self._CFG_LAST_FP_LIB, ""),
+            "models_dir": config.get(self._CFG_LAST_MODELS_DIR, ""),
+        }
+
+    def importer_set_library_defaults(
+        self,
+        sym_lib: str = "",
+        fp_lib: str = "",
+        models_dir: str = "",
+    ) -> Dict[str, Any]:
+        """Persist the user's last-used library paths.
+
+        Args:
+            sym_lib: Symbol library nickname or path.
+            fp_lib: Footprint library nickname or path.
+            models_dir: 3D models directory path.
+
+        Returns:
+            Dict with ``success``.
+        """
+        try:
+            if sym_lib:
+                self._save_config_field(self._CFG_LAST_SYM_LIB, sym_lib)
+            if fp_lib:
+                self._save_config_field(self._CFG_LAST_FP_LIB, fp_lib)
+            if models_dir:
+                self._save_config_field(self._CFG_LAST_MODELS_DIR, models_dir)
+            return {"success": True}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_browse_sym_library(self) -> Dict[str, Any]:
+        """Open a file-chooser dialog for selecting a symbol library file.
+
+        Returns:
+            Dict with ``success`` and ``path``.
+        """
+        try:
+            import webview
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No webview window available"}
+            result = windows[0].create_file_dialog(
+                webview.OPEN_DIALOG,
+                file_types=("KiCad Symbol Library (*.kicad_sym)",),
+            )
+            if result:
+                return {"success": True, "path": result[0]}
+            return {"success": True, "path": ""}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "path": ""}
+
+    def importer_browse_fp_library(self) -> Dict[str, Any]:
+        """Open a folder-chooser dialog for selecting a footprint library directory.
+
+        Returns:
+            Dict with ``success`` and ``path``.
+        """
+        try:
+            import webview
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No webview window available"}
+            result = windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+            if result:
+                return {"success": True, "path": result[0]}
+            return {"success": True, "path": ""}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "path": ""}
+
+    def importer_browse_models_dir(self) -> Dict[str, Any]:
+        """Open a folder-chooser dialog for selecting a 3D models directory.
+
+        Returns:
+            Dict with ``success`` and ``path``.
+        """
+        try:
+            import webview
+            windows = webview.windows
+            if not windows:
+                return {"success": False, "error": "No webview window available"}
+            result = windows[0].create_file_dialog(webview.FOLDER_DIALOG)
+            if result:
+                return {"success": True, "path": result[0]}
+            return {"success": True, "path": ""}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "path": ""}
+
+    def importer_resolve_library_path(
+        self, nickname: str, lib_type: str = "sym"
+    ) -> Dict[str, Any]:
+        """Resolve a library nickname to an absolute path.
+
+        Args:
+            nickname: Library nickname (e.g. ``"Device"``).
+            lib_type: ``"sym"`` for symbol libraries, ``"fp"`` for footprint.
+
+        Returns:
+            Dict with ``success``, ``path`` (absolute), ``uri`` (original with variables).
+        """
+        try:
+            from .kicad_parser.library import LibraryDiscovery
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            if lib_type == "fp":
+                entries = disc.list_footprint_libraries()
+            else:
+                entries = disc.list_symbol_libraries()
+            for entry in entries:
+                if entry.nickname == nickname:
+                    env = {"KIPRJMOD": project_dir} if project_dir else None
+                    resolved = entry.resolved_path(env=env)
+                    return {
+                        "success": True,
+                        "path": str(resolved) if resolved else "",
+                        "uri": entry.uri,
+                        "nickname": nickname,
+                    }
+            return {"success": False, "error": f"Library '{nickname}' not found"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_check_library_existing(
+        self,
+        component_name: str,
+        sym_lib_nickname: str = "",
+        sym_lib_path: str = "",
+        fp_lib_nickname: str = "",
+        fp_lib_path: str = "",
+        models_dir: str = "",
+        has_symbol: bool = False,
+        has_footprint: bool = False,
+        has_model: bool = False,
+    ) -> Dict[str, Any]:
+        """Check whether a symbol, footprint, or 3D model already exists in the
+        target libraries.
+
+        Called before save to determine if an overwrite confirmation dialog
+        is needed.
+
+        Args:
+            component_name: The component name to check.
+            sym_lib_nickname: Symbol library nickname.
+            sym_lib_path: Direct path to .kicad_sym file.
+            fp_lib_nickname: Footprint library nickname.
+            fp_lib_path: Direct path to .pretty directory.
+            models_dir: Directory for 3D models.
+            has_symbol: Whether the component has a symbol to save.
+            has_footprint: Whether the component has a footprint to save.
+            has_model: Whether the component has a 3D model to save.
+
+        Returns:
+            Dict with ``success``, ``symbol_exists``, ``footprint_exists``,
+            ``model_exists`` booleans, and ``symbol_name``, ``footprint_name``,
+            ``model_name`` strings for display.
+        """
+        try:
+            import re
+            from .kicad_parser.library import LibraryDiscovery
+            from .kicad_parser.symbol_lib import SymbolLibrary
+
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            env = {"KIPRJMOD": project_dir} if project_dir else None
+
+            safe_name = re.sub(r"[^A-Za-z0-9_\-.]", "_", component_name.strip()) or "Component"
+
+            result: Dict[str, Any] = {
+                "success": True,
+                "symbol_exists": False,
+                "footprint_exists": False,
+                "model_exists": False,
+                "symbol_name": safe_name,
+                "footprint_name": safe_name,
+                "model_name": safe_name.replace(" ", "_") + ".step",
+            }
+
+            # Resolve symbol library path
+            resolved_sym_path = sym_lib_path
+            if not resolved_sym_path and sym_lib_nickname:
+                for entry in disc.list_symbol_libraries():
+                    if entry.nickname == sym_lib_nickname:
+                        p = entry.resolved_path(env=env)
+                        if p:
+                            resolved_sym_path = str(p)
+                        break
+
+            # Check symbol existence
+            if has_symbol and resolved_sym_path:
+                sym_path = Path(resolved_sym_path)
+                if sym_path.exists():
+                    try:
+                        lib = SymbolLibrary.load(sym_path)
+                        if lib.find_by_name(safe_name) is not None:
+                            result["symbol_exists"] = True
+                    except Exception:
+                        pass
+
+            # Resolve footprint library path
+            resolved_fp_path = fp_lib_path
+            if not resolved_fp_path and fp_lib_nickname:
+                for entry in disc.list_footprint_libraries():
+                    if entry.nickname == fp_lib_nickname:
+                        p = entry.resolved_path(env=env)
+                        if p:
+                            resolved_fp_path = str(p)
+                        break
+
+            # Check footprint existence
+            if has_footprint and resolved_fp_path:
+                fp_dir = Path(resolved_fp_path)
+                fp_file = fp_dir / f"{safe_name}.kicad_mod"
+                if fp_file.exists():
+                    result["footprint_exists"] = True
+
+            # Check 3D model existence
+            if has_model and resolved_fp_path:
+                if models_dir:
+                    m_dir = Path(models_dir)
+                else:
+                    m_dir = Path(resolved_fp_path) / "3dmodels"
+                model_file = m_dir / (safe_name.replace(" ", "_") + ".step")
+                if model_file.exists():
+                    result["model_exists"] = True
+
+            return result
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def importer_commit_to_library(
+        self,
+        component_data: dict,
+        sym_lib_nickname: str = "",
+        sym_lib_path: str = "",
+        fp_lib_nickname: str = "",
+        fp_lib_path: str = "",
+        models_dir: str = "",
+        overwrite: bool = False,
+        overwrite_symbol: bool = False,
+        overwrite_footprint: bool = False,
+        overwrite_model: bool = False,
+        skip_symbol: bool = False,
+        skip_footprint: bool = False,
+        skip_model: bool = False,
+        save_as_default: bool = True,
+    ) -> Dict[str, Any]:
+        """Save an imported component to symbol and footprint libraries.
+
+        Resolves library nicknames to paths, writes the symbol/footprint/3D
+        model files, links them together, and optionally persists the
+        library selections as defaults.
+
+        Args:
+            component_data: Dict representation of the ImportedComponent
+                (as returned by ``_import_result_to_dict``).
+            sym_lib_nickname: Symbol library nickname (resolved via lib-table).
+            sym_lib_path: Direct path to ``.kicad_sym`` file (overrides nickname).
+            fp_lib_nickname: Footprint library nickname (resolved via lib-table).
+            fp_lib_path: Direct path to ``.pretty`` directory (overrides nickname).
+            models_dir: Directory for 3D models (defaults to fp_lib/3dmodels).
+            overwrite: Replace all existing entries if True (legacy single flag).
+            overwrite_symbol: Replace existing symbol if True.
+            overwrite_footprint: Replace existing footprint if True.
+            overwrite_model: Replace existing 3D model if True.
+            skip_symbol: If True, do not write the symbol at all (ignore).
+            skip_footprint: If True, do not write the footprint at all (ignore).
+            skip_model: If True, do not copy the 3D model at all (ignore).
+            save_as_default: Persist these library selections for next time.
+
+        Returns:
+            Dict with ``success``, ``warnings``, ``symbol_name``,
+            ``symbol_path``, ``footprint_path``, ``model_paths``,
+            ``footprint_ref`` (lib:name for linking).
+        """
+        try:
+            from .importer.models import ImportedComponent, FieldSet, ImportMethod
+            from .importer.library_writer import (
+                write_symbol_to_library,
+                write_footprint_to_library,
+                _apply_fields_to_symbol,
+            )
+            from .kicad_parser.library import LibraryDiscovery
+
+            warnings: list[str] = []
+
+            # Resolve library paths from nicknames
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+
+            disc = LibraryDiscovery(project_dir=project_dir)
+            env = {"KIPRJMOD": project_dir} if project_dir else None
+
+            # Symbol library path resolution
+            resolved_sym_path = sym_lib_path
+            sym_nickname_used = sym_lib_nickname
+            if not resolved_sym_path and sym_lib_nickname:
+                for entry in disc.list_symbol_libraries():
+                    if entry.nickname == sym_lib_nickname:
+                        p = entry.resolved_path(env=env)
+                        if p:
+                            resolved_sym_path = str(p)
+                        else:
+                            # Use the URI as-is for unresolvable entries
+                            resolved_sym_path = entry.uri
+                        break
+                if not resolved_sym_path:
+                    return {"success": False, "error": f"Symbol library '{sym_lib_nickname}' not found"}
+
+            # Footprint library path resolution
+            resolved_fp_path = fp_lib_path
+            fp_nickname_used = fp_lib_nickname
+            if not resolved_fp_path and fp_lib_nickname:
+                for entry in disc.list_footprint_libraries():
+                    if entry.nickname == fp_lib_nickname:
+                        p = entry.resolved_path(env=env)
+                        if p:
+                            resolved_fp_path = str(p)
+                        else:
+                            resolved_fp_path = entry.uri
+                        break
+                if not resolved_fp_path:
+                    return {"success": False, "error": f"Footprint library '{fp_lib_nickname}' not found"}
+
+            # Reconstruct ImportedComponent from the dict
+            cd = component_data
+            fields = cd.get("fields", {})
+            fs = FieldSet(
+                mpn=fields.get("mpn", ""),
+                manufacturer=fields.get("manufacturer", ""),
+                digikey_pn=fields.get("digikey_pn", ""),
+                mouser_pn=fields.get("mouser_pn", ""),
+                lcsc_pn=fields.get("lcsc_pn", ""),
+                value=fields.get("value", ""),
+                reference=fields.get("reference", ""),
+                footprint=fields.get("footprint", ""),
+                datasheet=fields.get("datasheet", ""),
+                description=fields.get("description", ""),
+                package=fields.get("package", ""),
+                extra=fields.get("extra", {}),
+            )
+
+            import base64
+            step_data_b64 = cd.get("step_data", "")
+            step_data = base64.b64decode(step_data_b64) if step_data_b64 else None
+
+            comp = ImportedComponent(
+                name=cd.get("name", "Component"),
+                fields=fs,
+                symbol_sexpr=cd.get("symbol_sexpr", ""),
+                footprint_sexpr=cd.get("footprint_sexpr", ""),
+                step_data=step_data,
+                import_method=ImportMethod(cd.get("import_method", "zip")),
+                source_info=cd.get("source_info", ""),
+            )
+
+            # Handle 3D model files from step_data
+            import tempfile
+            model_tmp_dir = None
+            if comp.step_data:
+                model_tmp_dir = tempfile.mkdtemp(prefix="kiassist_models_")
+                model_name = comp.name.replace(" ", "_") + ".step"
+                model_path = Path(model_tmp_dir) / model_name
+                model_path.write_bytes(comp.step_data)
+                comp.model_paths = [model_path]
+
+            result_data: Dict[str, Any] = {
+                "success": True,
+                "warnings": warnings,
+                "symbol_name": "",
+                "symbol_path": "",
+                "footprint_path": "",
+                "model_paths": [],
+                "footprint_ref": "",
+            }
+
+            # Write footprint FIRST so we can build the correct footprint reference
+            fp_ref = ""
+            eff_overwrite_fp = overwrite or overwrite_footprint
+            eff_overwrite_model = overwrite or overwrite_model
+            if resolved_fp_path and comp.footprint_sexpr and not skip_footprint:
+                try:
+                    ok, fp_file_path, copied_models = write_footprint_to_library(
+                        comp,
+                        resolved_fp_path,
+                        models_dir=models_dir or None,
+                        overwrite=eff_overwrite_fp,
+                        overwrite_models=eff_overwrite_model,
+                        skip_models=skip_model,
+                    )
+                    if ok:
+                        result_data["footprint_path"] = fp_file_path
+                        result_data["model_paths"] = [str(p) for p in copied_models]
+                        # Build the KiCad footprint reference (libraryname:footprintname)
+                        fp_stem = Path(fp_file_path).stem
+                        if fp_nickname_used:
+                            fp_ref = f"{fp_nickname_used}:{fp_stem}"
+                        else:
+                            fp_ref = f"{Path(resolved_fp_path).stem}:{fp_stem}"
+                        result_data["footprint_ref"] = fp_ref
+                        # Update the component fields to link footprint
+                        comp.fields.footprint = fp_ref
+                    else:
+                        warnings.append(f"Footprint write failed: {fp_file_path}")
+                except Exception as exc:
+                    warnings.append(f"Footprint write error: {exc}")
+
+            # Write symbol (with updated footprint link)
+            eff_overwrite_sym = overwrite or overwrite_symbol
+            if resolved_sym_path and comp.symbol_sexpr and not skip_symbol:
+                try:
+                    ok, sym_name = write_symbol_to_library(
+                        comp, resolved_sym_path, overwrite=eff_overwrite_sym
+                    )
+                    if ok:
+                        result_data["symbol_name"] = sym_name
+                        result_data["symbol_path"] = resolved_sym_path
+                    else:
+                        warnings.append(f"Symbol write failed: {sym_name}")
+                except Exception as exc:
+                    warnings.append(f"Symbol write error: {exc}")
+
+            result_data["warnings"] = warnings
+
+            # Persist library selections as defaults
+            if save_as_default:
+                self._save_config_field(
+                    self._CFG_LAST_SYM_LIB,
+                    sym_lib_nickname or sym_lib_path,
+                )
+                self._save_config_field(
+                    self._CFG_LAST_FP_LIB,
+                    fp_lib_nickname or fp_lib_path,
+                )
+                if models_dir:
+                    self._save_config_field(self._CFG_LAST_MODELS_DIR, models_dir)
+
+            return result_data
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": str(exc), "warnings": []}
+
     @staticmethod
     def _import_result_to_dict(result) -> Dict[str, Any]:
         """Serialise an :class:`ImportResult` for JSON transport."""
@@ -3629,6 +4412,351 @@ class KiAssistAPI:
                 )
         if not self._async_loop.is_closed():
             self._async_loop.close()
+
+    # ------------------------------------------------------------------
+    # Library Analyzer / Scanner API
+    # ------------------------------------------------------------------
+
+    def analyzer_scan_libraries(
+        self, lib_type: str = "both"
+    ) -> Dict[str, Any]:
+        """Discover and list custom (non-built-in) libraries available for scanning.
+
+        Args:
+            lib_type: ``"sym"`` for symbol libraries only, ``"fp"`` for
+                      footprint only, or ``"both"`` (default).
+
+        Returns:
+            Dict with ``success``, ``symbol_libraries`` and
+            ``footprint_libraries`` lists.  Each entry has ``nickname``,
+            ``uri``, and ``resolved_path``.
+        """
+        try:
+            from .kicad_parser.library import LibraryDiscovery
+
+            project_dir = None
+            if self._current_project_path:
+                project_dir = str(Path(self._current_project_path).parent)
+            disc = LibraryDiscovery(project_dir=project_dir)
+            env = {"KIPRJMOD": project_dir} if project_dir else None
+
+            sym_libs: list = []
+            fp_libs: list = []
+
+            if lib_type in ("sym", "both"):
+                for entry in disc.list_symbol_libraries():
+                    resolved = entry.resolved_path(env=env)
+                    sym_libs.append({
+                        "nickname": entry.nickname,
+                        "uri": entry.uri,
+                        "resolved_path": str(resolved) if resolved else "",
+                    })
+
+            if lib_type in ("fp", "both"):
+                for entry in disc.list_footprint_libraries():
+                    resolved = entry.resolved_path(env=env)
+                    fp_libs.append({
+                        "nickname": entry.nickname,
+                        "uri": entry.uri,
+                        "resolved_path": str(resolved) if resolved else "",
+                    })
+
+            return {
+                "success": True,
+                "symbol_libraries": sym_libs,
+                "footprint_libraries": fp_libs,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "symbol_libraries": [],
+                "footprint_libraries": [],
+            }
+
+    def analyzer_analyze_symbol_library(self, path: str) -> Dict[str, Any]:
+        """Run the full analyzer on a single symbol library file.
+
+        Args:
+            path: Absolute path to a ``.kicad_sym`` file.
+
+        Returns:
+            Dict with the full analysis report (see ``AnalysisReport.to_dict``).
+        """
+        try:
+            from .kicad_parser.analyzer import LibraryAnalyzer
+
+            analyzer = LibraryAnalyzer()
+            report = analyzer.analyze_symbol_library(path)
+            return {"success": True, **report.to_dict()}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def analyzer_analyze_footprint_library(self, path: str) -> Dict[str, Any]:
+        """Run the analyzer on a footprint directory (``.pretty`` folder).
+
+        If *path* points to a single ``.kicad_mod`` file, only that file is
+        analysed.  If it points to a directory, all ``.kicad_mod`` files
+        inside are analysed and the results are aggregated.
+
+        Args:
+            path: Absolute path to a ``.kicad_mod`` file or ``.pretty``
+                  directory.
+
+        Returns:
+            Dict with ``success``, ``reports`` (list of report dicts), and
+            aggregate ``total_*`` counts.
+        """
+        try:
+            from .kicad_parser.analyzer import LibraryAnalyzer
+
+            analyzer = LibraryAnalyzer()
+            p = Path(path)
+
+            if p.is_dir():
+                reports = analyzer.analyze_footprint_directory(p)
+            elif p.is_file() and p.suffix == ".kicad_mod":
+                reports = [analyzer.analyze_footprint(p)]
+            else:
+                return {"success": False, "error": f"Not a recognised footprint path: {path}"}
+
+            report_dicts = [r.to_dict() for r in reports]
+            total_issues = sum(r["total"] for r in report_dicts)
+            total_errors = sum(r["errors"] for r in report_dicts)
+            total_warnings = sum(r["warnings"] for r in report_dicts)
+            total_fixable = sum(r["fixable"] for r in report_dicts)
+
+            return {
+                "success": True,
+                "reports": report_dicts,
+                "total_issues": total_issues,
+                "total_errors": total_errors,
+                "total_warnings": total_warnings,
+                "total_fixable": total_fixable,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def analyzer_fix_symbol_library(
+        self, input_path: str, output_path: str = ""
+    ) -> Dict[str, Any]:
+        """Auto-fix a symbol library and save the result.
+
+        Args:
+            input_path:  Source ``.kicad_sym`` file.
+            output_path: Destination path.  Empty string means overwrite
+                         the original file.
+
+        Returns:
+            Dict with ``success``, ``fixes_applied``, and a post-fix
+            analysis ``report``.
+        """
+        try:
+            from .kicad_parser.analyzer import LibraryAnalyzer
+
+            analyzer = LibraryAnalyzer()
+            out = output_path if output_path else None
+            fixes = analyzer.fix_symbol_library(input_path, out)
+
+            # Re-analyse after fix to give updated status
+            final_path = output_path if output_path else input_path
+            report = analyzer.analyze_symbol_library(final_path)
+            return {
+                "success": True,
+                "fixes_applied": fixes,
+                "report": report.to_dict(),
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "fixes_applied": 0}
+
+    def analyzer_fix_footprint_library(
+        self, input_path: str, output_path: str = ""
+    ) -> Dict[str, Any]:
+        """Auto-fix a footprint library (directory or single file).
+
+        Args:
+            input_path:  Source ``.pretty`` directory or ``.kicad_mod`` file.
+            output_path: Destination path.  Empty string means in-place.
+
+        Returns:
+            Dict with ``success``, ``fixes_applied`` (total), and
+            ``details`` dict mapping filenames to fix counts.
+        """
+        try:
+            from .kicad_parser.analyzer import LibraryAnalyzer
+
+            analyzer = LibraryAnalyzer()
+            p = Path(input_path)
+
+            if p.is_dir():
+                out = output_path if output_path else None
+                details = analyzer.fix_footprint_directory(p, out)
+                total = sum(details.values())
+                return {
+                    "success": True,
+                    "fixes_applied": total,
+                    "details": details,
+                }
+            elif p.is_file() and p.suffix == ".kicad_mod":
+                out = output_path if output_path else None
+                fixes = analyzer.fix_footprint(p, out)
+                return {
+                    "success": True,
+                    "fixes_applied": fixes,
+                    "details": {p.name: fixes},
+                }
+            else:
+                return {"success": False, "error": f"Unrecognised path: {input_path}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "fixes_applied": 0}
+
+    def analyzer_batch_scan(
+        self, libraries: list
+    ) -> Dict[str, Any]:
+        """Scan multiple libraries in one call.
+
+        Args:
+            libraries: List of dicts, each with ``nickname``, ``path``, and
+                       ``type`` (``"sym"`` or ``"fp"``).
+
+        Returns:
+            Dict with ``success`` and ``results`` — a list of per-library
+            result dicts containing ``nickname``, ``type``, and the report
+            data.
+        """
+        try:
+            from .kicad_parser.analyzer import LibraryAnalyzer
+
+            analyzer = LibraryAnalyzer()
+            results = []
+            for lib in libraries:
+                nickname = lib.get("nickname", "")
+                lib_path = lib.get("path", "")
+                lib_type = lib.get("type", "sym")
+                try:
+                    if lib_type == "sym":
+                        report = analyzer.analyze_symbol_library(lib_path)
+                        results.append({
+                            "nickname": nickname,
+                            "type": "sym",
+                            **report.to_dict(),
+                        })
+                    else:
+                        p = Path(lib_path)
+                        if p.is_dir():
+                            reports = analyzer.analyze_footprint_directory(p)
+                        elif p.is_file():
+                            reports = [analyzer.analyze_footprint(p)]
+                        else:
+                            results.append({
+                                "nickname": nickname,
+                                "type": "fp",
+                                "total": 0,
+                                "errors": 0,
+                                "warnings": 0,
+                                "fixable": 0,
+                                "issues": [],
+                                "error": f"Path not found: {lib_path}",
+                            })
+                            continue
+                        # Aggregate footprint reports for this library
+                        all_issues = []
+                        for r in reports:
+                            rd = r.to_dict()
+                            all_issues.extend(rd["issues"])
+                        results.append({
+                            "nickname": nickname,
+                            "type": "fp",
+                            "file_count": len(reports),
+                            "total": len(all_issues),
+                            "errors": sum(1 for i in all_issues if i["severity"] == "error"),
+                            "warnings": sum(1 for i in all_issues if i["severity"] == "warning"),
+                            "infos": sum(1 for i in all_issues if i["severity"] == "info"),
+                            "fixable": sum(1 for i in all_issues if i["fixable"]),
+                            "issues": all_issues,
+                        })
+                except Exception as inner_exc:
+                    results.append({
+                        "nickname": nickname,
+                        "type": lib_type,
+                        "total": 0,
+                        "errors": 1,
+                        "warnings": 0,
+                        "fixable": 0,
+                        "issues": [{
+                            "severity": "error",
+                            "category": "structure",
+                            "entity": nickname,
+                            "message": str(inner_exc),
+                            "fixable": False,
+                            "fix_action": "",
+                            "details": {},
+                        }],
+                    })
+            return {"success": True, "results": results}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "results": []}
+
+    def analyzer_batch_fix(
+        self, libraries: list
+    ) -> Dict[str, Any]:
+        """Fix multiple libraries in one call (in-place).
+
+        Args:
+            libraries: List of dicts, each with ``nickname``, ``path``, and
+                       ``type`` (``"sym"`` or ``"fp"``).
+
+        Returns:
+            Dict with ``success`` and ``results`` — per-library fix counts.
+        """
+        try:
+            from .kicad_parser.analyzer import LibraryAnalyzer
+
+            analyzer = LibraryAnalyzer()
+            results = []
+            total_fixed = 0
+            for lib in libraries:
+                nickname = lib.get("nickname", "")
+                lib_path = lib.get("path", "")
+                lib_type = lib.get("type", "sym")
+                try:
+                    if lib_type == "sym":
+                        fixes = analyzer.fix_symbol_library(lib_path)
+                    else:
+                        p = Path(lib_path)
+                        if p.is_dir():
+                            details = analyzer.fix_footprint_directory(p)
+                            fixes = sum(details.values())
+                        elif p.is_file():
+                            fixes = analyzer.fix_footprint(p)
+                        else:
+                            results.append({
+                                "nickname": nickname,
+                                "type": lib_type,
+                                "fixes_applied": 0,
+                                "error": f"Path not found: {lib_path}",
+                            })
+                            continue
+                    total_fixed += fixes
+                    results.append({
+                        "nickname": nickname,
+                        "type": lib_type,
+                        "fixes_applied": fixes,
+                    })
+                except Exception as inner_exc:
+                    results.append({
+                        "nickname": nickname,
+                        "type": lib_type,
+                        "fixes_applied": 0,
+                        "error": str(inner_exc),
+                    })
+            return {
+                "success": True,
+                "total_fixed": total_fixed,
+                "results": results,
+            }
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "total_fixed": 0}
 
 
 def get_frontend_path() -> Path:

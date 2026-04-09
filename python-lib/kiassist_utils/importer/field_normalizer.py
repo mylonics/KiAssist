@@ -153,7 +153,10 @@ def normalize_fields(raw_fields: Dict[str, str]) -> FieldSet:
         if name.strip().lower() in _SUPPLIER_FIELDS:
             continue
         # Keep the last non-empty value if we see the same canonical name twice
-        canonical[norm_name] = value.strip()
+        # Collapse internal whitespace/newlines into single spaces
+        cleaned = " ".join(value.split())
+        if cleaned:
+            canonical[norm_name] = cleaned
 
     fs = FieldSet()
     fs.reference = canonical.pop("Reference", "U")

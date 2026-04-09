@@ -125,7 +125,7 @@ function isHidden(node: SExpr[]): boolean {
 interface RLine   { kind: 'line';   x1: number; y1: number; x2: number; y2: number; stroke: number; color: string; dash?: boolean; layer?: number; }
 interface RRect   { kind: 'rect';   x: number; y: number; w: number; h: number; stroke: number; fill: string; color: string; layer?: number; }
 interface RCircle { kind: 'circle'; cx: number; cy: number; r: number; stroke: number; fill: string; color: string; layer?: number; }
-interface RArc    { kind: 'arc';    d: string; stroke: number; fill: string; color: string; dash?: boolean; layer?: number; }
+interface RArc    { kind: 'arc';    d: string; stroke: number; fill: string; color: string; dash?: boolean; layer?: number; mx?: number; my?: number; }
 interface RPoly   { kind: 'poly';   points: string; stroke: number; fill: string; color: string; layer?: number; }
 interface RText   { kind: 'text';   x: number; y: number; text: string; size: number; color: string; angle: number; anchor: string; weight?: string; layer?: number; }
 interface RPad    { kind: 'pad';    x: number; y: number; w: number; h: number; shape: string; angle: number; label: string; color: string; rx: number; padType: string; drill: number; layer?: number; }
@@ -315,6 +315,12 @@ function parseSymbol(src: string): { elements: RElement[]; bbox: { x1: number; y
   const units = findAll(symRoot, 'symbol');
 
   for (const unit of units) {
+    // Filter out alternate body styles (DeMorgan): render style 0 (shared)
+    // and style 1 (normal); skip style 2+ (DeMorgan alternate).
+    // Sub-symbol names follow: parentName_unitNumber_styleNumber
+    const unitName = str(unit[1]);
+    const styleMatch = unitName.match(/_(\d+)_(\d+)$/);
+    if (styleMatch && parseInt(styleMatch[2], 10) > 1) continue;
     // Polylines
     for (const poly of findAll(unit, 'polyline')) {
       const ptsNode = find(poly, 'pts');
@@ -378,12 +384,13 @@ function parseSymbol(src: string): { elements: RElement[]; bbox: { x1: number; y
       if (!startN || !midN || !endN) continue;
       const sw = resolveSymStroke(parseStroke(arc));
       const fill = parseFill(arc);
+      const amx = num(midN[1]), amy = Y * num(midN[2]);
       const d = arcPath(
         num(startN[1]), Y * num(startN[2]),
-        num(midN[1]),   Y * num(midN[2]),
+        amx,            amy,
         num(endN[1]),   Y * num(endN[2]),
       );
-      elements.push({ kind: 'arc', d, stroke: sw, fill, color: CLR.symBody, layer: 10 });
+      elements.push({ kind: 'arc', d, stroke: sw, fill, color: CLR.symBody, layer: 10, mx: amx, my: amy });
     }
 
     // Pins
@@ -648,11 +655,15 @@ function parseFootprint(src: string): { elements: RElement[]; bbox: { x1: number
     const dashed = isDashedLayer(layer);
 
     let d: string;
+    let fpArcMx: number | undefined;
+    let fpArcMy: number | undefined;
     if (midN) {
       // New KiCad format: start / mid / end (3 points on the arc)
+      fpArcMx = num(midN[1]);
+      fpArcMy = num(midN[2]);
       d = arcPath(
         num(startN[1]), num(startN[2]),
-        num(midN[1]), num(midN[2]),
+        fpArcMx, fpArcMy,
         num(endN[1]), num(endN[2]),
       );
     } else if (angleN) {
@@ -666,7 +677,7 @@ function parseFootprint(src: string): { elements: RElement[]; bbox: { x1: number
       // Fallback: straight line
       d = `M${num(startN[1])},${num(startN[2])} L${num(endN[1])},${num(endN[2])}`;
     }
-    elements.push({ kind: 'arc', d, stroke: sw, fill: 'none', color: layerColor(layer), dash: dashed, layer: layerOrder(layer) });
+    elements.push({ kind: 'arc', d, stroke: sw, fill: 'none', color: layerColor(layer), dash: dashed, layer: layerOrder(layer), mx: fpArcMx, my: fpArcMy });
   }
 
   // fp_poly
@@ -917,6 +928,10 @@ function computeBbox(elements: RElement[]): { x1: number; y1: number; x2: number
           expand(parseFloat(match[1]), parseFloat(match[2]));
           expand(parseFloat(match[3]), parseFloat(match[4]));
         }
+        // Include arc midpoint for accurate bounding box
+        if (el.mx !== undefined && el.my !== undefined) {
+          expand(el.mx, el.my);
+        }
         break;
       }
       case 'poly':
@@ -963,11 +978,13 @@ const renderData = computed(() => {
   }
 });
 
-/** Parsed comparison footprint (only for footprint type with compareSexpr) */
+/** Parsed comparison data (for footprint or symbol type with compareSexpr) */
 const compareData = computed(() => {
-  if (props.type !== 'footprint' || !props.compareSexpr?.trim()) return null;
+  if (!props.compareSexpr?.trim()) return null;
   try {
-    return parseFootprint(props.compareSexpr);
+    return props.type === 'symbol'
+      ? parseSymbol(props.compareSexpr)
+      : parseFootprint(props.compareSexpr);
   } catch {
     return null;
   }

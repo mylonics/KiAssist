@@ -25,7 +25,7 @@ Typical usage::
 from .models import CadSource, FieldSet, ImportedComponent, ImportMethod, ImportResult
 from .field_normalizer import normalize_fields
 from .lcsc_importer import import_lcsc, is_available as lcsc_available
-from .zip_importer import import_zip, import_zip_bytes
+from .zip_importer import import_zip, import_zip_bytes, import_raw_file, RAW_FILE_EXTS
 from .part_lookup import lookup_part, import_by_part
 from .kicad_lib_importer import (
     search_symbols,
@@ -59,6 +59,8 @@ __all__ = [
     "lcsc_available",
     "import_zip",
     "import_zip_bytes",
+    "import_raw_file",
+    "RAW_FILE_EXTS",
     "lookup_part",
     "import_by_part",
     "search_symbols",

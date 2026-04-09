@@ -7,6 +7,9 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 // Props
 // -----------------------------------------------------------------------
 
+type XYZ = {x:number,y:number,z:number};
+type ModelTransform = { offset: XYZ, scale: XYZ, rotate: XYZ };
+
 const props = defineProps<{
   /** Base64-encoded STEP file data for the primary/imported component */
   stepData?: string;
@@ -20,8 +23,10 @@ const props = defineProps<{
   primaryLabel?: string;
   /** Label for comparison items */
   compareLabel?: string;
+  /** Transform (offset/scale/rotate) to apply to the primary/imported 3D model (from footprint) */
+  modelTransform?: ModelTransform;
   /** Transform (offset/scale/rotate) to apply to the comparison 3D model */
-  compareModelTransform?: { offset: {x:number,y:number,z:number}, scale: {x:number,y:number,z:number}, rotate: {x:number,y:number,z:number} };
+  compareModelTransform?: ModelTransform;
 }>();
 
 // -----------------------------------------------------------------------
@@ -158,7 +163,7 @@ function str(v: SExpr | undefined): string {
 const PCB_GREEN  = 0x1a6b3c;
 const PCB_COPPER = 0xc87533;
 const PCB_SILK   = 0xf0f0e0;
-const PCB_THICKNESS = 0.2;
+const PCB_THICKNESS = 1.6;
 
 function buildPcbBoard(sexpr: string): THREE.Group {
   const group = new THREE.Group();
@@ -215,7 +220,7 @@ function buildPcbBoard(sexpr: string): THREE.Group {
       color: PCB_COPPER, metalness: 0.7, roughness: 0.3,
     });
     const padMesh = new THREE.Mesh(padGeo, padMat);
-    padMesh.position.set(px, PCB_THICKNESS / 2 + 0.02, py);
+    padMesh.position.set(px, 0.02, py);
     padMesh.rotation.y = -pa;
     padMesh.receiveShadow = true;
     group.add(padMesh);
@@ -229,7 +234,7 @@ function buildPcbBoard(sexpr: string): THREE.Group {
           const holeGeo = new THREE.CylinderGeometry(drillSize / 2, drillSize / 2, PCB_THICKNESS + 0.1, 24);
           const holeMat = new THREE.MeshStandardMaterial({ color: 0x222222, roughness: 0.9 });
           const holeMesh = new THREE.Mesh(holeGeo, holeMat);
-          holeMesh.position.set(px, 0, py);
+          holeMesh.position.set(px, -PCB_THICKNESS / 2, py);
           group.add(holeMesh);
         }
       }
@@ -264,7 +269,7 @@ function buildPcbBoard(sexpr: string): THREE.Group {
     }
     const lineGeo = new THREE.BoxGeometry(len, 0.02, lineW);
     const lineMesh = new THREE.Mesh(lineGeo, mat);
-    lineMesh.position.set((x1 + x2) / 2, PCB_THICKNESS / 2 + 0.01, (y1 + y2) / 2);
+    lineMesh.position.set((x1 + x2) / 2, 0.01, (y1 + y2) / 2);
     lineMesh.rotation.y = -Math.atan2(dy, dx);
     lineMesh.receiveShadow = true;
     group.add(lineMesh);
@@ -286,7 +291,7 @@ function buildPcbBoard(sexpr: string): THREE.Group {
 
     const ringGeo = new THREE.TorusGeometry(r, 0.06, 6, 48);
     const ringMesh = new THREE.Mesh(ringGeo, silkMat);
-    ringMesh.position.set(cx, PCB_THICKNESS / 2 + 0.01, cy);
+    ringMesh.position.set(cx, 0.01, cy);
     ringMesh.rotation.x = -Math.PI / 2;
     ringMesh.receiveShadow = true;
     group.add(ringMesh);
@@ -328,7 +333,7 @@ function buildPcbBoard(sexpr: string): THREE.Group {
       color: PCB_GREEN, roughness: 0.6, metalness: 0.05,
     });
     const boardMesh = new THREE.Mesh(boardGeo, boardMat);
-    boardMesh.position.set((bx1 + bx2) / 2, 0, (by1 + by2) / 2);
+    boardMesh.position.set((bx1 + bx2) / 2, -PCB_THICKNESS / 2, (by1 + by2) / 2);
     boardMesh.receiveShadow = true;
     boardMesh.castShadow = true;
     group.add(boardMesh);
@@ -338,7 +343,7 @@ function buildPcbBoard(sexpr: string): THREE.Group {
     const groundMat = new THREE.ShadowMaterial({ opacity: 0.18 });
     const groundMesh = new THREE.Mesh(groundGeo, groundMat);
     groundMesh.rotation.x = -Math.PI / 2;
-    groundMesh.position.y = -PCB_THICKNESS / 2 - 0.01;
+    groundMesh.position.y = -PCB_THICKNESS - 0.01;
     groundMesh.receiveShadow = true;
     group.add(groundMesh);
   }
@@ -495,12 +500,12 @@ function clearScene() {
 // -----------------------------------------------------------------------
 
 function applyTransform() {
-  if (!primaryModelGroup) return;
-  primaryModelGroup.position.set(xform.offsetX, xform.offsetZ, xform.offsetY);
-  primaryModelGroup.rotation.set(
+  if (!primaryTransformGroup) return;
+  primaryTransformGroup.position.set(xform.offsetX, xform.offsetY, xform.offsetZ);
+  primaryTransformGroup.rotation.set(
     xform.rotX * Math.PI / 180,
-    xform.rotZ * Math.PI / 180,
     xform.rotY * Math.PI / 180,
+    xform.rotZ * Math.PI / 180,
   );
 }
 
@@ -736,20 +741,38 @@ let resizeObserver: ResizeObserver | null = null;
 // -----------------------------------------------------------------------
 
 function resetView() {
-  xform.offsetX = 0;
-  xform.offsetY = 0;
-  xform.offsetZ = 0;
-  xform.rotX = 0;
-  xform.rotY = 0;
-  xform.rotZ = 0;
+  initXformFromProp();
   if (rootGroup) fitCamera(rootGroup);
 }
+
+/** Initialise xform reactive state from the modelTransform prop (or zero). */
+function initXformFromProp() {
+  const t = props.modelTransform;
+  xform.offsetX = t?.offset.x ?? 0;
+  xform.offsetY = t?.offset.y ?? 0;
+  xform.offsetZ = t?.offset.z ?? 0;
+  xform.rotX = t?.rotate.x ?? 0;
+  xform.rotY = t?.rotate.y ?? 0;
+  xform.rotZ = t?.rotate.z ?? 0;
+}
+
+/** Return the current transform values (for saving back to footprint). */
+function getTransform(): ModelTransform {
+  return {
+    offset: { x: xform.offsetX, y: xform.offsetY, z: xform.offsetZ },
+    scale: { x: 1, y: 1, z: 1 },
+    rotate: { x: xform.rotX, y: xform.rotY, z: xform.rotZ },
+  };
+}
+
+defineExpose({ getTransform });
 
 // -----------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------
 
 onMounted(async () => {
+  initXformFromProp();
   await nextTick();
   initScene();
   loadAll();
@@ -770,6 +793,10 @@ onBeforeUnmount(() => {
 });
 
 // --- Primary prop watchers ---
+watch(() => props.modelTransform, () => {
+  initXformFromProp();
+}, { deep: true });
+
 watch(() => props.stepData, async (val) => {
   if (!rootGroup) return;
   if (primaryModelGroup) { disposeGroup(primaryModelGroup); rootGroup.remove(primaryModelGroup); primaryModelGroup = null; primaryTransformGroup = null; }

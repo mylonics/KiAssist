@@ -221,6 +221,15 @@ def import_lcsc(
             except Exception as exc:
                 warnings.append(f"Footprint format upgrade failed (kept original): {exc}")
 
+        # Extract the Reference designator from the symbol S-expression
+        if sym_text:
+            import re as _re
+            ref_m = _re.search(
+                r'\(property\s+"Reference"\s+"([^"]+)"', sym_text
+            )
+            if ref_m and ref_m.group(1):
+                fields.reference = ref_m.group(1)
+
         # Extract the footprint name from the S-expression so the Footprint
         # field is populated with the EasyEDA-generated name (e.g.
         # "VSSOP-10_L3.0-W3.0-P0.50-LS4.9-BL").

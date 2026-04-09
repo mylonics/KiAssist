@@ -542,11 +542,10 @@ onUnmounted(() => {
 <style scoped>
 .kicad-selector {
   padding: 0.625rem 0.75rem 0.75rem;
-  height: 100%;
-  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  flex-shrink: 0;
 }
 
 /* ── App Header ── */

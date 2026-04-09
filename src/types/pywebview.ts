@@ -264,6 +264,85 @@ export interface ComponentSearchResult extends ApiResult {
   grounding?: 'google' | 'duckduckgo';
 }
 
+// Library Analyzer types
+
+export interface AnalyzerIssue {
+  severity: 'error' | 'warning' | 'info';
+  category: string;
+  entity: string;
+  message: string;
+  fixable: boolean;
+  fix_action: string;
+  details: Record<string, unknown>;
+}
+
+export interface AnalyzerReport {
+  file_path: string;
+  file_type: string;
+  total: number;
+  errors: number;
+  warnings: number;
+  infos: number;
+  fixable: number;
+  issues: AnalyzerIssue[];
+}
+
+export interface AnalyzerLibInfo {
+  nickname: string;
+  uri: string;
+  resolved_path: string;
+}
+
+export interface AnalyzerScanResult extends ApiResult {
+  symbol_libraries: AnalyzerLibInfo[];
+  footprint_libraries: AnalyzerLibInfo[];
+}
+
+export interface AnalyzerReportResult extends ApiResult, AnalyzerReport {}
+
+export interface AnalyzerFootprintResult extends ApiResult {
+  reports: AnalyzerReport[];
+  total_issues: number;
+  total_errors: number;
+  total_warnings: number;
+  total_fixable: number;
+}
+
+export interface AnalyzerFixResult extends ApiResult {
+  fixes_applied: number;
+  report?: AnalyzerReport;
+  details?: Record<string, number>;
+}
+
+export interface AnalyzerLibEntry {
+  nickname: string;
+  path: string;
+  type: 'sym' | 'fp';
+}
+
+export interface AnalyzerBatchResult extends AnalyzerReport {
+  nickname: string;
+  type: 'sym' | 'fp';
+  file_count?: number;
+  error?: string;
+}
+
+export interface AnalyzerBatchScanResult extends ApiResult {
+  results: AnalyzerBatchResult[];
+}
+
+export interface AnalyzerBatchFixEntry {
+  nickname: string;
+  type: string;
+  fixes_applied: number;
+  error?: string;
+}
+
+export interface AnalyzerBatchFixResult extends ApiResult {
+  total_fixed: number;
+  results: AnalyzerBatchFixEntry[];
+}
+
 export interface PyWebViewAPI {
   echo_message: (message: string) => Promise<string>;
   detect_kicad_instances: () => Promise<KiCadInstance[]>;
@@ -329,6 +408,14 @@ export interface PyWebViewAPI {
   is_schematic_api_available: () => Promise<boolean>;
   // Web component search
   web_search_components: (query: string, model?: string) => Promise<ComponentSearchResult>;
+  // Library Analyzer / Scanner API
+  analyzer_scan_libraries: (libType?: string) => Promise<AnalyzerScanResult>;
+  analyzer_analyze_symbol_library: (path: string) => Promise<AnalyzerReportResult>;
+  analyzer_analyze_footprint_library: (path: string) => Promise<AnalyzerFootprintResult>;
+  analyzer_fix_symbol_library: (inputPath: string, outputPath?: string) => Promise<AnalyzerFixResult>;
+  analyzer_fix_footprint_library: (inputPath: string, outputPath?: string) => Promise<AnalyzerFixResult>;
+  analyzer_batch_scan: (libraries: AnalyzerLibEntry[]) => Promise<AnalyzerBatchScanResult>;
+  analyzer_batch_fix: (libraries: AnalyzerLibEntry[]) => Promise<AnalyzerBatchFixResult>;
 }
 
 declare global {

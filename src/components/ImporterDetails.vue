@@ -1,8 +1,18 @@
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue';
+import { ref, watch, nextTick, onMounted, computed } from 'vue';
 import type { ImportedComponent } from '../types/importer';
 import KicadPreview from './KicadPreview.vue';
 import ModelPreview from './ModelPreview.vue';
+import { useAppSettings } from '../composables/useAppSettings';
+
+const {
+  settings: appSettings,
+  getEffectiveSymLib,
+  getEffectiveFpLib,
+  getEffectiveModelsDir,
+  recordLastUsedLibraries,
+  addModelsDirToHistory,
+} = useAppSettings();
 
 // -----------------------------------------------------------------------
 // Props & Emits
@@ -229,14 +239,95 @@ const variantSuccess = ref('');
 let variantTemplateTimer: ReturnType<typeof setTimeout> | null = null;
 
 // -----------------------------------------------------------------------
+// Save to Library
+// -----------------------------------------------------------------------
+
+const saveSymLibraries = ref<LibraryInfo[]>([]);
+const saveFpLibraries = ref<LibraryInfo[]>([]);
+const saveSymLib = ref('');          // nickname or 'custom'
+const saveSymLibCustom = ref('');    // absolute path when custom
+const saveFpLib = ref('');           // nickname or 'custom'
+const saveFpLibCustom = ref('');     // absolute path when custom
+const saveModelsDir = ref('');       // optional custom 3D models dir
+const saveModelsDirMode = ref<'auto' | 'history' | 'custom'>('auto'); // dropdown mode
+const saveLoading = ref(false);
+const saveError = ref('');
+const saveSuccess = ref('');
+const saveLibsLoaded = ref(false);
+
+// Overwrite confirmation dialog state
+type SaveAction = 'overwrite' | 'append' | 'ignore';
+const showOverwriteDialog = ref(false);
+const overwriteChecks = ref({
+  symbolExists: false, footprintExists: false, modelExists: false,
+  symbolName: '', footprintName: '', modelName: '',
+});
+const symbolAction = ref<SaveAction>('overwrite');
+const footprintAction = ref<SaveAction>('overwrite');
+const modelAction = ref<SaveAction>('overwrite');
+
+/** True when at least one saveable asset is loaded */
+const hasAnythingToSave = computed(() => {
+  return !!(props.component.symbol_sexpr || props.component.footprint_sexpr || props.component.step_data);
+});
+
+const hasSym = computed(() => !!props.component.symbol_sexpr);
+const hasFp = computed(() => !!props.component.footprint_sexpr);
+const hasModel = computed(() => !!props.component.step_data);
+
+// Template ref for the 3D model preview (used to read current transform on save)
+const modelPreviewRef = ref<InstanceType<typeof ModelPreview> | null>(null);
+
+/** Extract model transform from the imported component's footprint_sexpr */
+const importedModelTransform = computed(() => {
+  const sexpr = props.component.footprint_sexpr;
+  if (!sexpr) return undefined;
+  return parseModelTransformFromSexpr(sexpr);
+});
+
+function parseModelTransformFromSexpr(sexpr: string): { offset: {x:number,y:number,z:number}, scale: {x:number,y:number,z:number}, rotate: {x:number,y:number,z:number} } | undefined {
+  const xyzPat = (tag: string) => {
+    const m = sexpr.match(new RegExp(`\\(${tag}\\s+\\(xyz\\s+([\\d.eE+\\-]+)\\s+([\\d.eE+\\-]+)\\s+([\\d.eE+\\-]+)\\s*\\)`));
+    return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]), z: parseFloat(m[3]) } : null;
+  };
+  const offset = xyzPat('offset');
+  const scale = xyzPat('scale');
+  const rotate = xyzPat('rotate');
+  if (!offset && !scale && !rotate) return undefined;
+  return {
+    offset: offset ?? { x: 0, y: 0, z: 0 },
+    scale: scale ?? { x: 1, y: 1, z: 1 },
+    rotate: rotate ?? { x: 0, y: 0, z: 0 },
+  };
+}
+
+/** Update (model …) transform values inside a footprint S-expression string. */
+function updateFootprintTransform(
+  sexpr: string,
+  transform: { offset: {x:number,y:number,z:number}, scale: {x:number,y:number,z:number}, rotate: {x:number,y:number,z:number} },
+): string {
+  function replaceXyz(src: string, tag: string, vals: {x:number,y:number,z:number}): string {
+    const pat = new RegExp(`\\(${tag}\\s+\\(xyz\\s+[\\d.eE+\\-]+\\s+[\\d.eE+\\-]+\\s+[\\d.eE+\\-]+\\s*\\)\\s*\\)`);
+    return src.replace(pat, `(${tag} (xyz ${vals.x} ${vals.y} ${vals.z}))`);
+  }
+  let result = replaceXyz(sexpr, 'offset', transform.offset);
+  result = replaceXyz(result, 'scale', transform.scale);
+  result = replaceXyz(result, 'rotate', transform.rotate);
+  return result;
+}
+
+// -----------------------------------------------------------------------
 // Editable fields system
 // -----------------------------------------------------------------------
 
-/** Mandatory fields — always visible and editable */
-const MANDATORY_KEYS = [
+/** Default field keys loaded from user config (populated on mount). */
+const configuredFieldKeys = ref<{ key: string; enabled: boolean }[]>([]);
+
+/** Fallback mandatory keys if config fails to load */
+const FALLBACK_KEYS = [
   'Reference', 'Value', 'Footprint', 'Datasheet',
   'Description', 'MF', 'MPN', 'DKPN', 'LCSC',
-] as const;
+];
 
 interface FieldRow {
   key: string;
@@ -246,13 +337,10 @@ interface FieldRow {
   editingKey: boolean; // is the user editing the key name
 }
 
-/** Build the initial fields list from the imported component */
-function buildFieldRows(c: ImportedComponent): FieldRow[] {
+/** Map of known field keys to their source value from ImportedComponent */
+function fieldSourceMap(c: ImportedComponent): Record<string, string> {
   const f = c.fields;
-  const rows: FieldRow[] = [];
-
-  // Map of mandatory display-key → source value
-  const mandatoryMap: Record<string, string> = {
+  return {
     'Reference':   f.reference || 'U',
     'Value':       f.value || c.name || '',
     'Footprint':   f.footprint || '',
@@ -262,35 +350,49 @@ function buildFieldRows(c: ImportedComponent): FieldRow[] {
     'MPN':         f.mpn || '',
     'DKPN':        f.digikey_pn || '',
     'LCSC':        f.lcsc_pn || '',
+    'Mouser':      f.mouser_pn || '',
+    'Package':     f.package || '',
   };
+}
 
-  // Add mandatory fields (always enabled)
-  for (const key of MANDATORY_KEYS) {
+/** Build the initial fields list from the imported component */
+function buildFieldRows(c: ImportedComponent): FieldRow[] {
+  const rows: FieldRow[] = [];
+  const sourceMap = fieldSourceMap(c);
+  const addedKeys = new Set<string>();
+
+  // Use configured defaults if available, otherwise fallback
+  const defaults = configuredFieldKeys.value.length
+    ? configuredFieldKeys.value
+    : FALLBACK_KEYS.map(k => ({ key: k, enabled: true }));
+
+  // Add configured default fields
+  for (const { key, enabled } of defaults) {
     rows.push({
       key,
-      value: mandatoryMap[key] ?? '',
-      mandatory: true,
-      enabled: true,
+      value: sourceMap[key] ?? '',
+      mandatory: enabled,
+      enabled: enabled,
       editingKey: false,
     });
+    addedKeys.add(key);
   }
 
-  // Known optional fields
-  const optionalKnown: Record<string, string> = {
-    'Mouser': f.mouser_pn || '',
-    'Package': f.package || '',
-  };
-  for (const [key, val] of Object.entries(optionalKnown)) {
-    // Only include if there's actually a value
-    if (val) {
+  // Add any remaining known fields that have values but aren't in the defaults
+  for (const [key, val] of Object.entries(sourceMap)) {
+    if (!addedKeys.has(key) && val) {
       rows.push({ key, value: val, mandatory: false, enabled: false, editingKey: false });
+      addedKeys.add(key);
     }
   }
 
   // Extra fields from the import
-  if (f.extra) {
-    for (const [k, v] of Object.entries(f.extra)) {
-      if (v) rows.push({ key: k, value: v, mandatory: false, enabled: false, editingKey: false });
+  if (c.fields.extra) {
+    for (const [k, v] of Object.entries(c.fields.extra)) {
+      if (v && !addedKeys.has(k)) {
+        rows.push({ key: k, value: v, mandatory: false, enabled: false, editingKey: false });
+        addedKeys.add(k);
+      }
     }
   }
 
@@ -301,6 +403,38 @@ const fieldRows = ref<FieldRow[]>(buildFieldRows(props.component));
 
 // Initialize the original footprint value for reset support
 fpOriginalValue.value = props.component.fields.footprint || '';
+
+// Load field defaults from backend, then rebuild if available
+onMounted(async () => {
+  // Use settings composable for field defaults
+  if (appSettings.value.fieldDefaults.length) {
+    configuredFieldKeys.value = appSettings.value.fieldDefaults.map(f => ({
+      key: f.key,
+      enabled: f.enabled,
+    }));
+    fieldRows.value = buildFieldRows(props.component);
+  } else {
+    // Fall back to backend API
+    try {
+      const api = (window as any).pywebview?.api;
+      if (api?.get_symbol_field_defaults) {
+        const r = await api.get_symbol_field_defaults();
+        if (r?.success && r.fields?.length) {
+          configuredFieldKeys.value = r.fields.map((f: any) => ({
+            key: f.key || '',
+            enabled: f.enabled === 'true' || f.enabled === true,
+          }));
+          fieldRows.value = buildFieldRows(props.component);
+        }
+      }
+    } catch {
+      // Fall back to defaults silently
+    }
+  }
+
+  // Auto-load save-to-library data
+  await initSaveToLib();
+});
 
 // Rebuild if the component prop changes
 watch(() => props.component, (c) => {
@@ -624,6 +758,372 @@ async function addVariant() {
     variantLoading.value = false;
   }
 }
+
+// -----------------------------------------------------------------------
+// Save to Library
+// -----------------------------------------------------------------------
+
+async function initSaveToLib() {
+  if (saveLibsLoaded.value) return;
+  await loadSaveLibraries();
+  await loadSaveDefaults();
+  saveLibsLoaded.value = true;
+}
+
+async function loadSaveLibraries() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const [symRes, fpRes] = await Promise.all([
+      api.importer_get_sym_libraries(),
+      api.importer_get_fp_libraries(),
+    ]);
+    if (symRes?.success) {
+      saveSymLibraries.value = (symRes.libraries || []).map((l: any) => ({
+        nickname: l.nickname,
+        uri: l.uri,
+      }));
+    }
+    if (fpRes?.success) {
+      saveFpLibraries.value = (fpRes.libraries || []).map((l: any) => ({
+        nickname: l.nickname,
+        uri: l.uri,
+      }));
+    }
+  } catch { /* ignore */ }
+}
+
+async function loadSaveDefaults() {
+  // Use settings composable for effective defaults
+  const effectiveSym = getEffectiveSymLib();
+  const effectiveFp = getEffectiveFpLib();
+  const effectiveModels = getEffectiveModelsDir();
+
+  if (effectiveSym) {
+    const isNickname = saveSymLibraries.value.some(l => l.nickname === effectiveSym);
+    if (isNickname) {
+      saveSymLib.value = effectiveSym;
+      saveSymLibCustom.value = '';
+    } else {
+      saveSymLib.value = 'custom';
+      saveSymLibCustom.value = effectiveSym;
+    }
+  }
+  if (effectiveFp) {
+    const isNickname = saveFpLibraries.value.some(l => l.nickname === effectiveFp);
+    if (isNickname) {
+      saveFpLib.value = effectiveFp;
+      saveFpLibCustom.value = '';
+    } else {
+      saveFpLib.value = 'custom';
+      saveFpLibCustom.value = effectiveFp;
+    }
+  }
+  if (effectiveModels) {
+    saveModelsDir.value = effectiveModels;
+    saveModelsDirMode.value = 'custom';
+  }
+
+  // Also try backend defaults as fallback
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_get_library_defaults();
+    if (r?.success) {
+      const savedSym = r.sym_lib || '';
+      const savedFp = r.fp_lib || '';
+      const savedModels = r.models_dir || '';
+
+      if (savedSym && !saveSymLib.value) {
+        const isNickname = saveSymLibraries.value.some(l => l.nickname === savedSym);
+        if (isNickname) {
+          saveSymLib.value = savedSym;
+        } else {
+          saveSymLib.value = 'custom';
+          saveSymLibCustom.value = savedSym;
+        }
+      }
+      if (savedFp && !saveFpLib.value) {
+        const isNickname = saveFpLibraries.value.some(l => l.nickname === savedFp);
+        if (isNickname) {
+          saveFpLib.value = savedFp;
+        } else {
+          saveFpLib.value = 'custom';
+          saveFpLibCustom.value = savedFp;
+        }
+      }
+      if (savedModels && !saveModelsDir.value) {
+        saveModelsDir.value = savedModels;
+        saveModelsDirMode.value = 'custom';
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+function isKicadLib(uri: string): boolean {
+  const kicadVars = ['KICAD_SYMBOL_DIR', 'KICAD_FOOTPRINT_DIR', 'KICAD_3DMODEL_DIR',
+    'KICAD10_SYMBOL_DIR', 'KICAD10_FOOTPRINT_DIR', 'KICAD11_SYMBOL_DIR',
+    'KICAD11_FOOTPRINT_DIR', 'KICAD12_SYMBOL_DIR', 'KICAD12_FOOTPRINT_DIR'];
+  return kicadVars.some(v => uri.includes('${' + v + '}'));
+}
+
+async function browseSaveSymLib() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_browse_sym_library();
+    if (r?.success && r.path) {
+      saveSymLib.value = 'custom';
+      saveSymLibCustom.value = r.path;
+    }
+  } catch { /* ignore */ }
+}
+
+async function browseSaveFpLib() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_browse_fp_library();
+    if (r?.success && r.path) {
+      saveFpLib.value = 'custom';
+      saveFpLibCustom.value = r.path;
+    }
+  } catch { /* ignore */ }
+}
+
+async function browseSaveModelsDir() {
+  const api = getApi();
+  if (!api) return;
+  try {
+    const r = await api.importer_browse_models_dir();
+    if (r?.success && r.path) {
+      saveModelsDir.value = r.path;
+      saveModelsDirMode.value = 'custom';
+      addModelsDirToHistory(r.path);
+    }
+  } catch { /* ignore */ }
+}
+
+function onModelsDirModeChange(mode: string) {
+  if (mode === 'auto') {
+    saveModelsDirMode.value = 'auto';
+    saveModelsDir.value = '';
+  } else if (mode === 'custom') {
+    saveModelsDirMode.value = 'custom';
+    // Keep current value or clear for manual entry
+  } else {
+    // It's a history path
+    saveModelsDirMode.value = 'history';
+    saveModelsDir.value = mode;
+  }
+}
+
+/** Build the component data dict from current state (with edited fields) */
+function buildComponentData(): Record<string, any> {
+  const c = props.component;
+  const fields: Record<string, any> = {};
+
+  // Map field rows back to the flat field structure
+  const knownFieldMap: Record<string, string> = {
+    'Reference': 'reference',
+    'Value': 'value',
+    'Footprint': 'footprint',
+    'Datasheet': 'datasheet',
+    'Description': 'description',
+    'MF': 'manufacturer',
+    'MPN': 'mpn',
+    'DKPN': 'digikey_pn',
+    'Mouser': 'mouser_pn',
+    'MSPN': 'mouser_pn',
+    'LCSC': 'lcsc_pn',
+    'Package': 'package',
+  };
+
+  // Initialize all fields with empty defaults
+  fields.reference = '';
+  fields.value = '';
+  fields.footprint = '';
+  fields.datasheet = '';
+  fields.description = '';
+  fields.manufacturer = '';
+  fields.mpn = '';
+  fields.digikey_pn = '';
+  fields.mouser_pn = '';
+  fields.lcsc_pn = '';
+  fields.package = '';
+  fields.extra = {};
+
+  // Apply enabled field rows
+  for (const row of fieldRows.value) {
+    if (!row.enabled || !row.key) continue;
+    const attr = knownFieldMap[row.key];
+    if (attr) {
+      fields[attr] = row.value || '';
+    } else {
+      fields.extra[row.key] = row.value || '';
+    }
+  }
+
+  // Apply current 3D model transform from the UI controls to the footprint
+  let fpSexpr = c.footprint_sexpr;
+  if (fpSexpr && modelPreviewRef.value) {
+    const currentXform = modelPreviewRef.value.getTransform();
+    if (currentXform) {
+      fpSexpr = updateFootprintTransform(fpSexpr, currentXform);
+    }
+  }
+
+  return {
+    name: c.name,
+    import_method: c.import_method,
+    source_info: c.source_info,
+    symbol_sexpr: c.symbol_sexpr,
+    footprint_sexpr: fpSexpr,
+    step_data: c.step_data,
+    fields,
+  };
+}
+
+function _getSaveLibPaths() {
+  const symNickname = saveSymLib.value !== 'custom' ? saveSymLib.value : '';
+  const symPath = saveSymLib.value === 'custom' ? saveSymLibCustom.value : '';
+  const fpNickname = saveFpLib.value !== 'custom' ? saveFpLib.value : '';
+  const fpPath = saveFpLib.value === 'custom' ? saveFpLibCustom.value : '';
+  return { symNickname, symPath, fpNickname, fpPath };
+}
+
+async function saveToLibrary() {
+  const api = getApi();
+  if (!api) return;
+
+  const _hasSym = !!props.component.symbol_sexpr;
+  const _hasFp = !!props.component.footprint_sexpr;
+  const _hasModel = !!props.component.step_data;
+  const { symNickname, symPath, fpNickname, fpPath } = _getSaveLibPaths();
+
+  if (_hasSym && !symNickname && !symPath) {
+    saveError.value = 'Please select a symbol library.';
+    return;
+  }
+  if (_hasFp && !fpNickname && !fpPath) {
+    saveError.value = 'Please select a footprint library.';
+    return;
+  }
+
+  saveError.value = '';
+  saveSuccess.value = '';
+
+  // Check for existing files first
+  try {
+    const checkResult = await api.importer_check_library_existing(
+      props.component.name,
+      symNickname, symPath,
+      fpNickname, fpPath,
+      saveModelsDir.value,
+      _hasSym, _hasFp, _hasModel,
+    );
+
+    if (checkResult?.success) {
+      const anyExists = checkResult.symbol_exists || checkResult.footprint_exists || checkResult.model_exists;
+      if (anyExists) {
+        overwriteChecks.value = {
+          symbolExists: checkResult.symbol_exists,
+          footprintExists: checkResult.footprint_exists,
+          modelExists: checkResult.model_exists,
+          symbolName: checkResult.symbol_name || props.component.name,
+          footprintName: checkResult.footprint_name || props.component.name,
+          modelName: checkResult.model_name || (props.component.name + '.step'),
+        };
+        // Default all to overwrite
+        symbolAction.value = 'overwrite';
+        footprintAction.value = 'overwrite';
+        modelAction.value = 'overwrite';
+        showOverwriteDialog.value = true;
+        return;
+      }
+    }
+  } catch {
+    // If check fails, proceed with save anyway
+  }
+
+  // No conflicts — save directly
+  await doSaveToLibrary(false, false, false, false, false, false);
+}
+
+function confirmOverwrite() {
+  showOverwriteDialog.value = false;
+  doSaveToLibrary(
+    symbolAction.value === 'overwrite',
+    footprintAction.value === 'overwrite',
+    modelAction.value === 'overwrite',
+    symbolAction.value === 'ignore',
+    footprintAction.value === 'ignore',
+    modelAction.value === 'ignore',
+  );
+}
+
+function cancelOverwrite() {
+  showOverwriteDialog.value = false;
+}
+
+async function doSaveToLibrary(
+  owSymbol: boolean, owFootprint: boolean, owModel: boolean,
+  skipSymbol: boolean, skipFootprint: boolean, skipModel: boolean,
+) {
+  const api = getApi();
+  if (!api) return;
+
+  const { symNickname, symPath, fpNickname, fpPath } = _getSaveLibPaths();
+
+  saveLoading.value = true;
+  saveError.value = '';
+  saveSuccess.value = '';
+
+  try {
+    const componentData = buildComponentData();
+    const r = await api.importer_commit_to_library(
+      componentData,
+      symNickname,
+      symPath,
+      fpNickname,
+      fpPath,
+      saveModelsDir.value,
+      false,  // overwrite (legacy global flag)
+      owSymbol,
+      owFootprint,
+      owModel,
+      skipSymbol,
+      skipFootprint,
+      skipModel,
+      true,  // save_as_default
+    );
+
+    if (r?.success) {
+      const parts: string[] = [];
+      if (r.symbol_name) parts.push(`Symbol "${r.symbol_name}" saved`);
+      if (r.footprint_path) parts.push(`Footprint saved`);
+      if (r.model_paths?.length) parts.push(`${r.model_paths.length} 3D model(s) saved`);
+      if (r.footprint_ref) parts.push(`Linked as ${r.footprint_ref}`);
+      saveSuccess.value = parts.join(' · ') || 'Saved successfully';
+
+      if (r.warnings?.length) {
+        saveSuccess.value += '\n⚠ ' + r.warnings.join('; ');
+      }
+
+      recordLastUsedLibraries(
+        symNickname || symPath,
+        fpNickname || fpPath,
+        saveModelsDir.value,
+      );
+    } else {
+      saveError.value = r?.error || 'Save failed';
+    }
+  } catch (e: any) {
+    saveError.value = e.message || 'Save failed';
+  } finally {
+    saveLoading.value = false;
+  }
+}
 </script>
 
 <template>
@@ -682,8 +1182,10 @@ async function addVariant() {
             <template v-else>3D Model</template>
           </div>
           <ModelPreview
+            ref="modelPreviewRef"
             :stepData="component.step_data || undefined"
             :footprintSexpr="component.footprint_sexpr || undefined"
+            :modelTransform="importedModelTransform || undefined"
             :compareStepData="selectedFpStepData || undefined"
             :compareFootprintSexpr="selectedFpSexpr || undefined"
             :compareModelTransform="selectedFpModelTransform || undefined"
@@ -933,6 +1435,139 @@ async function addVariant() {
             </div>
           </div>
 
+          <!-- ===== Save to Library Section (always open) ===== -->
+          <div class="detail-section">
+            <div class="section-label">
+              <span class="material-icons section-icon">save</span>
+              Save to Library
+            </div>
+
+            <div class="save-panel">
+              <div class="variant-hint">
+                Save the imported symbol, footprint, and 3D model to your libraries with proper linking.
+              </div>
+
+              <!-- Symbol library selector (always visible, greyed out when no symbol) -->
+              <label :class="['variant-label', { 'label-disabled': !hasSym }]">
+                Symbol Library
+                <span v-if="!hasSym" class="label-status">(no symbol loaded)</span>
+              </label>
+              <div :class="['save-lib-row', { 'row-disabled': !hasSym }]">
+                <select v-model="saveSymLib" class="variant-select save-lib-select" :disabled="!hasSym">
+                  <option value="">— Select symbol library —</option>
+                  <optgroup label="Custom Libraries">
+                    <template v-for="lib in saveSymLibraries" :key="lib.nickname">
+                      <option v-if="!isKicadLib(lib.uri)" :value="lib.nickname">
+                        {{ lib.nickname }}
+                      </option>
+                    </template>
+                  </optgroup>
+                  <optgroup label="KiCad Libraries">
+                    <template v-for="lib in saveSymLibraries" :key="lib.nickname">
+                      <option v-if="isKicadLib(lib.uri)" :value="lib.nickname">
+                        {{ lib.nickname }}
+                      </option>
+                    </template>
+                  </optgroup>
+                  <option value="custom">Browse for file…</option>
+                </select>
+                <button class="fp-btn save-browse-btn" @click="browseSaveSymLib" :disabled="!hasSym" title="Browse for .kicad_sym file">
+                  <span class="material-icons">folder_open</span>
+                </button>
+              </div>
+              <div v-if="hasSym && saveSymLib === 'custom' && saveSymLibCustom" class="save-custom-path">
+                <span class="material-icons" style="font-size: 14px">description</span>
+                {{ saveSymLibCustom }}
+              </div>
+
+              <!-- Footprint library selector (always visible, greyed out when no footprint) -->
+              <label :class="['variant-label', { 'label-disabled': !hasFp }]">
+                Footprint Library
+                <span v-if="!hasFp" class="label-status">(no footprint loaded)</span>
+              </label>
+              <div :class="['save-lib-row', { 'row-disabled': !hasFp }]">
+                <select v-model="saveFpLib" class="variant-select save-lib-select" :disabled="!hasFp">
+                  <option value="">— Select footprint library —</option>
+                  <optgroup label="Custom Libraries">
+                    <template v-for="lib in saveFpLibraries" :key="lib.nickname">
+                      <option v-if="!isKicadLib(lib.uri)" :value="lib.nickname">
+                        {{ lib.nickname }}
+                      </option>
+                    </template>
+                  </optgroup>
+                  <optgroup label="KiCad Libraries">
+                    <template v-for="lib in saveFpLibraries" :key="lib.nickname">
+                      <option v-if="isKicadLib(lib.uri)" :value="lib.nickname">
+                        {{ lib.nickname }}
+                      </option>
+                    </template>
+                  </optgroup>
+                  <option value="custom">Browse for directory…</option>
+                </select>
+                <button class="fp-btn save-browse-btn" @click="browseSaveFpLib" :disabled="!hasFp" title="Browse for .pretty directory">
+                  <span class="material-icons">folder_open</span>
+                </button>
+              </div>
+              <div v-if="hasFp && saveFpLib === 'custom' && saveFpLibCustom" class="save-custom-path">
+                <span class="material-icons" style="font-size: 14px">folder</span>
+                {{ saveFpLibCustom }}
+              </div>
+
+              <!-- 3D Models directory (always visible, greyed out when no model) -->
+              <label :class="['variant-label', { 'label-disabled': !hasModel }]">
+                3D Models Directory
+                <span v-if="!hasModel" class="label-status">(no 3D model loaded)</span>
+                <span v-else class="variant-hint-inline">(optional — defaults to footprint lib/3dmodels)</span>
+              </label>
+              <div :class="['save-lib-row', { 'row-disabled': !hasModel }]">
+                <select
+                  class="variant-select save-lib-select models-dir-select"
+                  :disabled="!hasModel"
+                  :value="saveModelsDirMode === 'auto' ? 'auto' : (saveModelsDirMode === 'custom' ? 'custom' : saveModelsDir)"
+                  @change="(e: Event) => onModelsDirModeChange((e.target as HTMLSelectElement).value)"
+                >
+                  <option value="auto">Auto: &lt;footprint_lib&gt;/3dmodels</option>
+                  <template v-for="dir in appSettings.modelsDirHistory" :key="dir">
+                    <option :value="dir">{{ dir }}</option>
+                  </template>
+                  <option value="custom">Custom path…</option>
+                </select>
+                <button class="fp-btn save-browse-btn" @click="browseSaveModelsDir" :disabled="!hasModel" title="Browse for 3D models directory">
+                  <span class="material-icons">folder_open</span>
+                </button>
+              </div>
+              <div v-if="hasModel && saveModelsDirMode === 'custom'" class="save-models-custom-row">
+                <input
+                  v-model="saveModelsDir"
+                  class="field-input save-models-input"
+                  placeholder="Enter custom 3D models directory path…"
+                  :disabled="!hasModel"
+                />
+              </div>
+
+              <!-- Action -->
+              <div class="variant-actions">
+                <button
+                  class="action-btn primary"
+                  @click="saveToLibrary"
+                  :disabled="saveLoading || !hasAnythingToSave"
+                >
+                  <span class="material-icons">{{ saveLoading ? 'sync' : 'save' }}</span>
+                  {{ saveLoading ? 'Saving…' : 'Save to Library' }}
+                </button>
+              </div>
+
+              <div v-if="saveSuccess" class="notice success" style="margin-top: 0.5rem">
+                <span class="material-icons">check_circle</span>
+                {{ saveSuccess }}
+              </div>
+              <div v-if="saveError" class="notice error" style="margin-top: 0.5rem">
+                <span class="material-icons">error_outline</span>
+                {{ saveError }}
+              </div>
+            </div>
+          </div>
+
           <!-- Files -->
           <div v-if="component.symbol_path || component.footprint_path || component.model_paths?.length" class="detail-section">
             <div class="section-label">
@@ -1123,6 +1758,62 @@ async function addVariant() {
       </div>
     </div>
   </div>
+
+  <!-- Overwrite confirmation modal -->
+  <Teleport to="body">
+    <Transition name="modal-fade">
+      <div v-if="showOverwriteDialog" class="overwrite-overlay" @click.self="cancelOverwrite">
+        <div class="overwrite-modal">
+          <div class="overwrite-modal-header">
+            <span class="material-icons overwrite-modal-warn">warning</span>
+            <span>Files Already Exist</span>
+          </div>
+          <div class="overwrite-modal-body">
+            <p class="overwrite-hint">Choose an action for each existing file:</p>
+
+            <!-- Symbol row -->
+            <div v-if="overwriteChecks.symbolExists" class="overwrite-item">
+              <span class="material-icons overwrite-item-icon">memory</span>
+              <span class="overwrite-item-name">Symbol: <strong>{{ overwriteChecks.symbolName }}</strong></span>
+              <div class="overwrite-radios">
+                <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="overwrite" /> Overwrite</label>
+                <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="append" /> Append</label>
+                <label class="overwrite-radio"><input type="radio" v-model="symbolAction" value="ignore" /> Ignore</label>
+              </div>
+            </div>
+
+            <!-- Footprint row -->
+            <div v-if="overwriteChecks.footprintExists" class="overwrite-item">
+              <span class="material-icons overwrite-item-icon">crop_square</span>
+              <span class="overwrite-item-name">Footprint: <strong>{{ overwriteChecks.footprintName }}</strong></span>
+              <div class="overwrite-radios">
+                <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="overwrite" /> Overwrite</label>
+                <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="append" /> Append</label>
+                <label class="overwrite-radio"><input type="radio" v-model="footprintAction" value="ignore" /> Ignore</label>
+              </div>
+            </div>
+
+            <!-- 3D Model row -->
+            <div v-if="overwriteChecks.modelExists" class="overwrite-item">
+              <span class="material-icons overwrite-item-icon">view_in_ar</span>
+              <span class="overwrite-item-name">3D Model: <strong>{{ overwriteChecks.modelName }}</strong></span>
+              <div class="overwrite-radios">
+                <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="overwrite" /> Overwrite</label>
+                <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="append" /> Append</label>
+                <label class="overwrite-radio"><input type="radio" v-model="modelAction" value="ignore" /> Ignore</label>
+              </div>
+            </div>
+          </div>
+          <div class="overwrite-modal-actions">
+            <button class="action-btn secondary" @click="cancelOverwrite">Cancel</button>
+            <button class="action-btn primary" @click="confirmOverwrite">
+              <span class="material-icons">save</span> Confirm Save
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+  </Teleport>
 </template>
 
 <style scoped>
@@ -2026,5 +2717,217 @@ tr.unmapped {
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, #27ae60 10%, var(--bg-tertiary));
   color: #27ae60;
+}
+
+/* ===== Save to Library Section ===== */
+.save-lib-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.save-lib-select {
+  flex: 1;
+  border-top-right-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+}
+
+.save-browse-btn {
+  border-top-left-radius: 0 !important;
+  border-bottom-left-radius: 0 !important;
+  height: auto;
+  padding: 0.35rem 0.5rem !important;
+}
+
+.save-browse-btn .material-icons {
+  font-size: 0.95rem;
+}
+
+.save-custom-path {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-top: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  background: color-mix(in srgb, var(--accent-color) 8%, var(--bg-tertiary));
+  border-radius: var(--radius-sm);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  font-family: monospace;
+  word-break: break-all;
+}
+
+.save-models-input {
+  flex: 1;
+  border-top-right-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+}
+
+/* Overwrite confirmation modal */
+.overwrite-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(3px);
+}
+
+.overwrite-modal {
+  background: var(--bg-card, #1e1e2e);
+  border: 1px solid #f39c12;
+  border-radius: 10px;
+  padding: 1.2rem 1.4rem;
+  min-width: 380px;
+  max-width: 520px;
+  width: 90vw;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  animation: modal-enter 0.2s ease-out;
+}
+
+@keyframes modal-enter {
+  from { opacity: 0; transform: translateY(-12px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.overwrite-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.75rem;
+}
+
+.overwrite-modal-warn {
+  font-size: 1.4rem;
+  color: #f39c12;
+}
+
+.overwrite-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.overwrite-hint {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+  margin: 0 0 0.2rem 0;
+}
+
+.overwrite-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  padding: 0.45rem 0.55rem;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.overwrite-item-icon {
+  font-size: 1rem;
+  color: var(--text-secondary);
+}
+
+.overwrite-item-name {
+  flex: 1;
+  min-width: 120px;
+}
+
+.overwrite-radios {
+  display: flex;
+  gap: 0.75rem;
+  margin-left: auto;
+}
+
+.overwrite-radio {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.overwrite-radio:hover {
+  color: var(--text-primary);
+}
+
+.overwrite-radio input[type="radio"] {
+  margin: 0;
+  accent-color: var(--accent, #4fc3f7);
+}
+
+.overwrite-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+}
+
+/* Modal transition */
+.modal-fade-enter-active,
+.modal-fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+.modal-fade-enter-active .overwrite-modal,
+.modal-fade-leave-active .overwrite-modal {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.modal-fade-enter-from,
+.modal-fade-leave-to {
+  opacity: 0;
+}
+.modal-fade-enter-from .overwrite-modal {
+  transform: translateY(-12px) scale(0.97);
+}
+.modal-fade-leave-to .overwrite-modal {
+  transform: translateY(8px) scale(0.97);
+}
+
+.variant-hint-inline {
+  font-weight: 400;
+  font-style: italic;
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+}
+
+/* Save to Library panel (always open) */
+.save-panel {
+  padding: 0.5rem 0.75rem;
+}
+
+.label-disabled {
+  opacity: 0.45;
+}
+
+.label-status {
+  font-weight: 400;
+  font-style: italic;
+  font-size: 0.68rem;
+}
+
+.row-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.save-models-custom-row {
+  margin-top: 0.25rem;
+}
+
+.models-dir-select {
+  font-size: 0.75rem;
 }
 </style>

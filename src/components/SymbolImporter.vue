@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
 import type { ImportedComponent, CadSource } from '../types/importer';
 
 // -----------------------------------------------------------------------
@@ -42,10 +42,6 @@ const symLibraries = ref<LibraryInfo[]>([]);
 const fpLibraries = ref<LibraryInfo[]>([]);
 const librariesLoading = ref(false);
 const librariesError = ref('');
-const libraryFilter = ref('');
-const libraryTab = ref<'symbols' | 'footprints'>('symbols');
-const librariesCollapsed = ref(false);
-const libraryScope = ref<'all' | 'custom'>('all');
 
 // Part lookup fields
 const partMpn = ref('');
@@ -57,15 +53,16 @@ const cadSources = ref<CadSource[]>([]);
 const octopartUrl = ref('');
 const partLookupFailed = ref(false);
 
+// Saved fields from Octopart/part-lookup to overlay on ZIP imports
+const partLookupFields = ref<Record<string, any> | null>(null);
+
 // Progress polling timer
 let _progressTimer: ReturnType<typeof setInterval> | null = null;
 
-// ZIP
-const zipPath = ref('');
-
-// Multi-ZIP (used from CAD sources / Part Lookup fallback)
+// File import state
 const zipPaths = ref<string[]>([]);
 const zipsLoading = ref(false);
+const zipDragging = ref(false);
 
 // KiCad lib search
 const searchQuery = ref('');
@@ -73,28 +70,6 @@ const searchLibrary = ref('');
 const searchResults = ref<SearchResult[]>([]);
 const selectedResult = ref<SearchResult | null>(null);
 const searching = ref(false);
-
-/** Returns true when the library entry is a built-in KiCad library. */
-function isBuiltinLib(lib: LibraryInfo): boolean {
-  return /\$\{KICAD\d*_/.test(lib.uri);
-}
-
-// Computed — filtered library list
-const filteredLibraries = computed(() => {
-  let list = libraryTab.value === 'symbols' ? symLibraries.value : fpLibraries.value;
-  if (libraryScope.value === 'custom') {
-    list = list.filter(l => !isBuiltinLib(l));
-  }
-  if (libraryFilter.value.trim()) {
-    const q = libraryFilter.value.toLowerCase();
-    list = list.filter(l => l.nickname.toLowerCase().includes(q));
-  }
-  return list;
-});
-
-// Counts for the badge
-const customSymCount = computed(() => symLibraries.value.filter(l => !isBuiltinLib(l)).length);
-const customFpCount = computed(() => fpLibraries.value.filter(l => !isBuiltinLib(l)).length);
 
 // -----------------------------------------------------------------------
 // Lifecycle
@@ -162,12 +137,6 @@ function clearError() {
   error.value = '';
 }
 
-/** Scroll the importer body so the KiCad Library search section is visible */
-function leftPanelScrollToSearch() {
-  const el = document.querySelector('.importer-body .kicad-lib-section');
-  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
 // -----------------------------------------------------------------------
 // Part lookup import (MPN / SPN / LCSC → Octopart + EasyEDA)
 // -----------------------------------------------------------------------
@@ -184,6 +153,7 @@ async function importByPart() {
   cadSources.value = [];
   octopartUrl.value = '';
   partLookupFailed.value = false;
+  partLookupFields.value = null;
   zipPaths.value = [];
   lookupStatus.value = 'Starting lookup…';
   loading.value = true;
@@ -204,6 +174,10 @@ async function importByPart() {
       cadSources.value = r.cad_sources;
       octopartUrl.value = r.octopart_url || '';
     }
+    // Save lookup fields so they can be overlaid onto ZIP imports
+    if (r?.component?.fields) {
+      partLookupFields.value = { ...r.component.fields };
+    }
     if (!r?.success) {
       partLookupFailed.value = true;
     }
@@ -222,71 +196,91 @@ async function importByPart() {
 // ZIP import
 // -----------------------------------------------------------------------
 
-async function browseZip() {
-  const api = getApi();
-  if (!api) return;
-  try {
-    const r = await api.importer_browse_zip();
-    if (r?.path) zipPath.value = r.path;
-  } catch (e: any) {
-    error.value = e.message || 'File dialog failed';
-  }
-}
-
-async function importZip() {
-  const api = getApi();
-  if (!api) { error.value = 'Backend not available'; return; }
-  if (!zipPath.value.trim()) { error.value = 'Please select a ZIP file'; return; }
-
-  clearError();
-  loading.value = true;
-  try {
-    const r = await api.importer_import_zip(
-      zipPath.value.trim(),
-      '',
-      '',
-      '',
-      false,
-    );
-    handleResult(r);
-  } catch (e: any) {
-    error.value = e.message || 'Import failed';
-  } finally {
-    loading.value = false;
-  }
-}
-
 // -----------------------------------------------------------------------
-// Multi-ZIP import (from CAD sources fallback)
+// Browse & auto-import
 // -----------------------------------------------------------------------
 
-async function browseZips() {
+async function browseAndImport() {
   const api = getApi();
   if (!api) return;
   try {
     const r = await api.importer_browse_zips();
     if (r?.paths?.length) {
-      // Append new paths, avoiding duplicates
-      const existing = new Set(zipPaths.value);
-      for (const p of r.paths) {
-        if (!existing.has(p)) {
-          zipPaths.value.push(p);
-        }
-      }
+      zipPaths.value = r.paths;
+      await importZips();
     }
   } catch (e: any) {
     error.value = e.message || 'File dialog failed';
   }
 }
 
-function removeZipPath(index: number) {
-  zipPaths.value.splice(index, 1);
+// -----------------------------------------------------------------------
+// Drag-and-drop files (ZIP, KiCad, STEP)
+// -----------------------------------------------------------------------
+
+function onZipDragOver(e: DragEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  zipDragging.value = true;
 }
+
+function onZipDragLeave(e: DragEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  zipDragging.value = false;
+}
+
+async function onZipDrop(e: DragEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  zipDragging.value = false;
+
+  const files = e.dataTransfer?.files;
+  if (!files || !files.length) return;
+
+  const api = getApi();
+  if (!api) { error.value = 'Backend not available'; return; }
+
+  // Read each file as base64 and send to backend for temp-saving
+  const SUPPORTED_EXTS = ['.zip', '.kicad_sym', '.lib', '.kicad_mod', '.mod', '.step', '.stp', '.wrl'];
+  const fileEntries: { name: string; data: string }[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+    if (!SUPPORTED_EXTS.includes(ext)) {
+      error.value = `Skipped unsupported file: ${file.name}`;
+      continue;
+    }
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    let binary = '';
+    for (let j = 0; j < bytes.length; j++) {
+      binary += String.fromCharCode(bytes[j]);
+    }
+    fileEntries.push({ name: file.name, data: btoa(binary) });
+  }
+
+  if (!fileEntries.length) return;
+
+  try {
+    const r = await api.importer_save_dropped_zips(fileEntries);
+    if (r?.success && r.paths?.length) {
+      zipPaths.value = r.paths;
+      await importZips();
+    } else if (r?.error) {
+      error.value = r.error;
+    }
+  } catch (e: any) {
+    error.value = e.message || 'Failed to process dropped files';
+  }
+}
+
 
 async function importZips() {
   const api = getApi();
   if (!api) { error.value = 'Backend not available'; return; }
-  if (!zipPaths.value.length) { error.value = 'Please select at least one ZIP file'; return; }
+  if (!zipPaths.value.length) { error.value = 'Please select at least one file'; return; }
 
   clearError();
   zipsLoading.value = true;
@@ -298,6 +292,7 @@ async function importZips() {
       '',
       '',
       false,
+      partLookupFields.value || {},
     );
     handleResult(r);
   } catch (e: any) {
@@ -386,103 +381,9 @@ function handleResult(r: any) {
     <div class="importer-header">
       <span class="material-icons header-icon">download</span>
       <span class="header-title">Component Importer</span>
-      <button
-        class="action-btn secondary refresh-btn"
-        @click="loadLibraries"
-        :disabled="librariesLoading"
-        title="Refresh KiCad libraries"
-      >
-        <span class="material-icons" :class="{ spinning: librariesLoading }">refresh</span>
-      </button>
     </div>
 
     <div class="importer-body">
-
-      <!-- ======== KiCad Libraries Section ======== -->
-      <div class="method-section">
-        <div class="method-label" style="cursor: pointer;" @click="librariesCollapsed = !librariesCollapsed">
-          <span class="material-icons method-icon">local_library</span>
-          KiCad Libraries
-          <span class="lib-badge" v-if="symLibraries.length || fpLibraries.length">
-            {{ symLibraries.length }} sym · {{ fpLibraries.length }} fp
-          </span>
-          <span class="material-icons collapse-chevron">{{ librariesCollapsed ? 'expand_more' : 'expand_less' }}</span>
-        </div>
-
-        <template v-if="!librariesCollapsed">
-          <div v-if="librariesLoading" class="empty-hint">
-            <span class="material-icons spinning" style="font-size:0.9rem">autorenew</span>
-            Loading libraries…
-          </div>
-
-          <div v-else-if="librariesError" class="notice error" style="margin-top:0.25rem">
-            <span class="material-icons">error_outline</span>
-            {{ librariesError }}
-          </div>
-
-          <template v-else>
-            <!-- Tab toggle -->
-            <div class="lib-tabs">
-              <button
-                :class="['lib-tab-btn', { active: libraryTab === 'symbols' }]"
-                @click="libraryTab = 'symbols'"
-              >
-                Symbols ({{ symLibraries.length }})
-              </button>
-              <button
-                :class="['lib-tab-btn', { active: libraryTab === 'footprints' }]"
-                @click="libraryTab = 'footprints'"
-              >
-                Footprints ({{ fpLibraries.length }})
-              </button>
-            </div>
-
-            <!-- Scope toggle: All / Custom -->
-            <div class="lib-tabs" style="margin-top:0.2rem">
-              <button
-                :class="['lib-tab-btn', { active: libraryScope === 'all' }]"
-                @click="libraryScope = 'all'"
-              >
-                All
-              </button>
-              <button
-                :class="['lib-tab-btn', { active: libraryScope === 'custom' }]"
-                @click="libraryScope = 'custom'"
-              >
-                Custom ({{ libraryTab === 'symbols' ? customSymCount : customFpCount }})
-              </button>
-            </div>
-
-            <!-- Filter -->
-            <div class="input-row" style="margin-top:0.2rem">
-              <input
-                v-model="libraryFilter"
-                class="text-input"
-                placeholder="Filter libraries…"
-              />
-            </div>
-
-            <!-- Library list -->
-            <div class="library-list" v-if="filteredLibraries.length">
-              <div
-                v-for="lib in filteredLibraries"
-                :key="lib.nickname"
-                class="library-row"
-                :title="lib.uri"
-                @click="searchLibrary = lib.nickname; searchQuery = ''; leftPanelScrollToSearch()"
-              >
-                <span class="material-icons lib-row-icon">
-                  {{ libraryTab === 'symbols' ? 'memory' : 'view_in_ar' }}
-                </span>
-                <span class="lib-nick">{{ lib.nickname }}</span>
-              </div>
-            </div>
-            <div v-else class="empty-hint">No libraries found.</div>
-          </template>
-        </template>
-      </div>
-
-      <div class="section-divider"></div>
 
       <!-- ======== Part Lookup Section ======== -->
       <div class="method-section">
@@ -534,16 +435,16 @@ function handleResult(r: any) {
         <div class="button-row" style="margin-top: 0.35rem">
           <button
             class="action-btn primary"
-            style="flex: 1"
+            style="flex: 1; min-width: 12rem"
             @click="importByPart"
             :disabled="loading || (!partMpn.trim() && !partSpn.trim() && !partLcsc.trim())"
           >
             <span class="material-icons">download</span>
-            {{ loading ? (lookupStatus || 'Looking up…') : 'Import' }}
+            {{ loading ? (lookupStatus || 'Looking up…') : 'Lookup' }}
           </button>
           <button
             class="action-btn secondary"
-            @click="partMpn = ''; partSpn = ''; partLcsc = ''; cadSources = []; octopartUrl = ''; partLookupFailed = false; zipPaths = []"
+            @click="partMpn = ''; partSpn = ''; partLcsc = ''; cadSources = []; octopartUrl = ''; partLookupFailed = false; partLookupFields = null; zipPaths = []"
             :disabled="loading || (!partMpn.trim() && !partSpn.trim() && !partLcsc.trim())"
             title="Clear part lookup fields"
           >
@@ -586,39 +487,19 @@ function handleResult(r: any) {
             Download on Octopart
           </a>
 
-          <!-- Import from ZIP(s) subsection -->
+          <!-- Import from file(s) subsection -->
           <div class="zip-import-section">
-            <div class="zip-import-header">
-              <span class="material-icons" style="font-size:0.8rem">folder_zip</span>
-              Import from downloaded ZIP file(s):
-            </div>
-            <div v-if="zipPaths.length" class="zip-paths-list">
-              <div v-for="(zp, idx) in zipPaths" :key="idx" class="zip-path-row">
-                <span class="zip-path-name" :title="zp">{{ zp.split(/[\\/]/).pop() }}</span>
-                <button class="zip-remove-btn" @click="removeZipPath(idx)" title="Remove">
-                  <span class="material-icons" style="font-size:0.7rem">close</span>
-                </button>
-              </div>
-            </div>
-            <div class="zip-import-actions">
-              <button
-                class="action-btn secondary"
-                @click="browseZips"
-                :disabled="loading"
-                style="flex:1"
-              >
-                <span class="material-icons">folder_open</span>
-                {{ zipPaths.length ? 'Add ZIP files…' : 'Select ZIP files…' }}
-              </button>
-              <button
-                class="action-btn primary"
-                @click="importZips"
-                :disabled="loading || !zipPaths.length"
-                style="flex:1"
-              >
-                <span class="material-icons">download</span>
-                {{ zipsLoading ? '…' : `Import (${zipPaths.length})` }}
-              </button>
+            <div
+              class="zip-drop-zone"
+              :class="{ 'drag-over': zipDragging, 'importing': loading }"
+              @dragover="onZipDragOver"
+              @dragleave="onZipDragLeave"
+              @drop="onZipDrop"
+              @click="browseAndImport"
+            >
+              <span class="material-icons drop-icon">{{ loading ? 'hourglass_empty' : 'cloud_upload' }}</span>
+              <span class="drop-text">{{ loading ? 'Importing…' : 'Drop files here or click to browse' }}</span>
+              <span class="drop-hint">.zip · .kicad_sym · .kicad_mod · .step</span>
             </div>
           </div>
         </div>
@@ -628,67 +509,42 @@ function handleResult(r: any) {
         <div v-if="partLookupFailed && !cadSources.length" class="cad-sources-panel">
           <div class="cad-sources-header">
             <span class="material-icons" style="font-size:0.85rem">info</span>
-            Part not found via EasyEDA. You can import from ZIP files downloaded from SnapEDA, Ultra Librarian, or other sources:
+            Part not found via EasyEDA. Import from ZIP or KiCad files:
           </div>
           <div class="zip-import-section" style="margin-top: 0.2rem; padding-top: 0; border-top: none;">
-            <div v-if="zipPaths.length" class="zip-paths-list">
-              <div v-for="(zp, idx) in zipPaths" :key="idx" class="zip-path-row">
-                <span class="zip-path-name" :title="zp">{{ zp.split(/[\\/]/).pop() }}</span>
-                <button class="zip-remove-btn" @click="removeZipPath(idx)" title="Remove">
-                  <span class="material-icons" style="font-size:0.7rem">close</span>
-                </button>
-              </div>
-            </div>
-            <div class="zip-import-actions">
-              <button
-                class="action-btn secondary"
-                @click="browseZips"
-                :disabled="loading"
-                style="flex:1"
-              >
-                <span class="material-icons">folder_open</span>
-                {{ zipPaths.length ? 'Add ZIP files\u2026' : 'Select ZIP files\u2026' }}
-              </button>
-              <button
-                class="action-btn primary"
-                @click="importZips"
-                :disabled="loading || !zipPaths.length"
-                style="flex:1"
-              >
-                <span class="material-icons">download</span>
-                {{ zipsLoading ? '\u2026' : `Import (${zipPaths.length})` }}
-              </button>
+            <div
+              class="zip-drop-zone"
+              :class="{ 'drag-over': zipDragging, 'importing': loading }"
+              @dragover="onZipDragOver"
+              @dragleave="onZipDragLeave"
+              @drop="onZipDrop"
+              @click="browseAndImport"
+            >
+              <span class="material-icons drop-icon">{{ loading ? 'hourglass_empty' : 'cloud_upload' }}</span>
+              <span class="drop-text">{{ loading ? 'Importing…' : 'Drop files here or click to browse' }}</span>
+              <span class="drop-hint">.zip · .kicad_sym · .kicad_mod · .step</span>
             </div>
           </div>
         </div>
 
-      <div class="section-divider"></div>
-      <div class="method-section">
+      <div v-if="!cadSources.length && !partLookupFailed" class="section-divider"></div>
+      <div v-if="!cadSources.length && !partLookupFailed" class="method-section">
         <div class="method-label">
           <span class="material-icons method-icon">folder_zip</span>
-          ZIP File (SnapEDA / Ultra Librarian)
+          Import Files (ZIP / KiCad / STEP)
         </div>
-        <div class="input-row">
-          <input
-            v-model="zipPath"
-            class="text-input"
-            placeholder="Path to .zip file"
-            :disabled="loading"
-            @keydown.enter="importZip"
-          />
-          <button class="action-btn secondary" @click="browseZip" :disabled="loading">
-            <span class="material-icons">folder_open</span>
-          </button>
-        </div>
-        <button
-          class="action-btn primary full-width"
-          @click="importZip"
-          :disabled="loading || !zipPath.trim()"
-          style="margin-top: 0.35rem"
+        <div
+          class="zip-drop-zone"
+          :class="{ 'drag-over': zipDragging, 'importing': loading }"
+          @dragover="onZipDragOver"
+          @dragleave="onZipDragLeave"
+          @drop="onZipDrop"
+          @click="browseAndImport"
         >
-          <span class="material-icons">download</span>
-          {{ loading ? '…' : 'Import ZIP' }}
-        </button>
+          <span class="material-icons drop-icon">{{ loading ? 'hourglass_empty' : 'cloud_upload' }}</span>
+          <span class="drop-text">{{ loading ? 'Importing…' : 'Drop files here or click to browse' }}</span>
+          <span class="drop-hint">.zip · .kicad_sym · .kicad_mod · .step</span>
+        </div>
       </div>
 
       <div class="section-divider"></div>
@@ -773,6 +629,7 @@ function handleResult(r: any) {
         {{ error }}
       </div>
 
+
     </div><!-- /importer-body -->
   </div>
 </template>
@@ -781,7 +638,6 @@ function handleResult(r: any) {
 .importer-panel {
   display: flex;
   flex-direction: column;
-  height: 100%;
   overflow: hidden;
   font-size: 0.8rem;
 }
@@ -811,13 +667,10 @@ function handleResult(r: any) {
 
 /* ===== Body ===== */
 .importer-body {
-  flex: 1;
-  overflow-y: auto;
   padding: 0.6rem;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
-  min-height: 0;
 }
 
 /* ===== Method sections ===== */
@@ -1056,109 +909,7 @@ code {
   font-size: 0.9em;
 }
 
-/* ===== Refresh button ===== */
-.refresh-btn {
-  margin-left: auto;
-  padding: 0.2rem 0.3rem !important;
-}
 
-.refresh-btn .material-icons {
-  font-size: 1rem;
-}
-
-/* ===== Library section ===== */
-.lib-badge {
-  margin-left: auto;
-  font-size: 0.6rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  background-color: var(--bg-tertiary);
-  padding: 0.1rem 0.35rem;
-  border-radius: 8px;
-}
-
-.collapse-chevron {
-  font-size: 0.9rem;
-  color: var(--text-secondary);
-  margin-left: 0.15rem;
-}
-
-.lib-tabs {
-  display: flex;
-  gap: 0;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  margin-top: 0.2rem;
-}
-
-.lib-tab-btn {
-  flex: 1;
-  padding: 0.25rem 0.3rem;
-  border: none;
-  background: var(--bg-tertiary);
-  color: var(--text-secondary);
-  font-size: 0.65rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.lib-tab-btn:not(:last-child) {
-  border-right: 1px solid var(--border-color);
-}
-
-.lib-tab-btn.active {
-  background-color: var(--accent-color);
-  color: #fff;
-}
-
-.lib-tab-btn:hover:not(.active) {
-  background-color: var(--bg-secondary);
-  color: var(--text-primary);
-}
-
-.library-list {
-  max-height: 180px;
-  overflow-y: auto;
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  background-color: var(--bg-input);
-  margin-top: 0.2rem;
-}
-
-.library-row {
-  display: flex;
-  align-items: center;
-  gap: 0.3rem;
-  padding: 0.25rem 0.45rem;
-  cursor: pointer;
-  border-bottom: 1px solid var(--border-color);
-  font-size: 0.68rem;
-  transition: background-color 0.12s;
-}
-
-.library-row:last-child {
-  border-bottom: none;
-}
-
-.library-row:hover {
-  background-color: var(--bg-tertiary);
-}
-
-.lib-row-icon {
-  font-size: 0.8rem;
-  color: var(--accent-color);
-  flex-shrink: 0;
-}
-
-.lib-nick {
-  color: var(--text-primary);
-  font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 /* ===== Spinning animation ===== */
 @keyframes spin {
@@ -1288,54 +1039,59 @@ code {
   margin-bottom: 0.3rem;
 }
 
-.zip-paths-list {
+/* ===== Drop Zone ===== */
+
+.zip-drop-zone {
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
-  margin-bottom: 0.3rem;
-}
-
-.zip-path-row {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
-  padding: 0.15rem 0.3rem;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  font-size: 0.65rem;
-}
-
-.zip-path-name {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-primary);
-}
-
-.zip-remove-btn {
-  display: flex;
   align-items: center;
   justify-content: center;
-  width: 1rem;
-  height: 1rem;
-  border: none;
-  background: transparent;
+  gap: 0.15rem;
+  padding: 0.7rem 0.5rem;
+  border: 2px dashed var(--border-color);
+  border-radius: var(--radius-sm);
+  background: var(--bg-secondary);
   color: var(--text-secondary);
   cursor: pointer;
-  border-radius: 2px;
-  flex-shrink: 0;
-  padding: 0;
+  transition: all 0.15s ease;
+  user-select: none;
 }
 
-.zip-remove-btn:hover {
-  background: color-mix(in srgb, #e74c3c 20%, transparent);
-  color: #e74c3c;
+.zip-drop-zone:hover {
+  border-color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 6%, transparent);
 }
 
-.zip-import-actions {
-  display: flex;
-  gap: 0.3rem;
+.zip-drop-zone.drag-over {
+  border-color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 12%, transparent);
+  color: var(--accent-color);
+}
+
+.zip-drop-zone.importing {
+  cursor: wait;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+.zip-drop-zone .drop-icon {
+  font-size: 1.3rem;
+  opacity: 0.45;
+}
+
+.zip-drop-zone:hover .drop-icon,
+.zip-drop-zone.drag-over .drop-icon {
+  opacity: 1;
+}
+
+.zip-drop-zone .drop-text {
+  font-size: 0.68rem;
+  font-weight: 600;
+}
+
+.zip-drop-zone .drop-hint {
+  font-size: 0.58rem;
+  opacity: 0.55;
+  font-weight: 400;
 }
 </style>

@@ -673,7 +673,7 @@ def import_by_part(
     # LCSC numbers (e.g. "C8734") are meaningless on Octopart; we need
     # the real MPN before querying Octopart.
     if lcsc and not mpn and not spn:
-        _progress(f"Resolving LCSC {lcsc} via JLCPCB…")
+        _progress("Resolving via JLCPCB…")
         try:
             jlcpcb_data = _jlcpcb_search(lcsc)
             if jlcpcb_data.get("found"):
@@ -691,7 +691,7 @@ def import_by_part(
 
     # --- Step 1: Octopart cross-reference (MPN/SPN only) ---
     if octopart_terms:
-        _progress(f"Querying Octopart for {octopart_terms[0]}…")
+        _progress("Querying Octopart…")
         try:
             octopart_data = lookup_part(octopart_terms[0])
             if not octopart_data.get("found"):
@@ -715,7 +715,7 @@ def import_by_part(
     if not lcsc_pn and not jlcpcb_data.get("found"):
         jlcpcb_query = mpn or spn or (octopart_data.get("mpn") or "")
         if jlcpcb_query:
-            _progress(f"Searching JLCPCB for {jlcpcb_query}…")
+            _progress("Searching JLCPCB…")
             try:
                 jlcpcb_data = _jlcpcb_search(jlcpcb_query)
                 if jlcpcb_data.get("found") and jlcpcb_data.get("lcsc_pn"):
@@ -732,7 +732,7 @@ def import_by_part(
     # --- Step 3: Import via EasyEDA if we have an LCSC number ---
     easyeda_result: Optional[ImportResult] = None
     if lcsc_pn:
-        _progress(f"Importing from EasyEDA ({lcsc_pn})…")
+        _progress("Importing from EasyEDA…")
         try:
             from .lcsc_importer import import_lcsc, is_available
 
@@ -790,7 +790,7 @@ def import_by_part(
     ) if not _octo_dkpn else ""
 
     # --- Run independent lookups concurrently ---
-    _progress("Fetching CAD sources & seller data…")
+    _progress("Fetching CAD sources…")
     _fut_cad: concurrent.futures.Future | None = None
     _fut_ul: concurrent.futures.Future | None = None
     _fut_dk: concurrent.futures.Future | None = None
@@ -897,7 +897,7 @@ def import_by_part(
     if fields.mpn and not fields.value:
         fields.value = fields.mpn
 
-    _progress("Finalizing…")
+    _progress("Finalizing import…")
     component.fields = fields
     component.source_info = f"Part:{mpn or spn or lcsc}" + (f" LCSC:{lcsc_pn}" if lcsc_pn else "")
 

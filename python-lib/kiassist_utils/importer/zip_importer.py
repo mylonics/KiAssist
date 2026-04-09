@@ -132,6 +132,30 @@ def _extract_meta_fields(text: str) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Symbol property extraction
+# ---------------------------------------------------------------------------
+
+_PROP_RE = re.compile(r'\(property\s+"([^"]+)"\s+"([^"]*)"')
+
+
+def _extract_symbol_properties(sym_text: str) -> Dict[str, str]:
+    """Extract ``(property "Name" "Value" ...)`` pairs from a symbol S-expression.
+
+    Returns a raw field dict suitable for :func:`normalize_fields`.
+    """
+    props: Dict[str, str] = {}
+    for m in _PROP_RE.finditer(sym_text):
+        name, value = m.group(1), m.group(2)
+        if name and value:
+            # Clean up SnapEDA-style escaped newlines and excessive whitespace
+            cleaned = value.replace("\\n", " ")
+            cleaned = " ".join(cleaned.split()).strip()
+            if cleaned and cleaned != "~":
+                props[name] = cleaned
+    return props
+
+
+# ---------------------------------------------------------------------------
 # Main ZIP importer
 # ---------------------------------------------------------------------------
 
@@ -234,15 +258,34 @@ def import_zip(
         # Determine component name from file names
         name_hint = (sym_path or fp_path).stem  # type: ignore[union-attr]
 
+        sym_text = sym_path.read_text(encoding="utf-8") if sym_path else ""
+        fp_text = fp_path.read_text(encoding="utf-8") if fp_path else ""
+
+        # Extract properties from the symbol S-expression and merge them with
+        # any text/CSV metadata (symbol props are the base, metadata overrides).
+        if sym_text:
+            sym_props = _extract_symbol_properties(sym_text)
+            # Symbol properties are the base; explicit metadata files override.
+            merged_meta = {**sym_props, **meta_fields}
+        else:
+            merged_meta = meta_fields
+
         # Build field set
-        fields = normalize_fields(meta_fields)
+        fields = normalize_fields(merged_meta)
         if not fields.mpn:
             fields.mpn = name_hint
         if not fields.value:
             fields.value = fields.mpn
 
-        sym_text = sym_path.read_text(encoding="utf-8") if sym_path else ""
-        fp_text = fp_path.read_text(encoding="utf-8") if fp_path else ""
+        # Read STEP binary for frontend 3D preview
+        step_data: Optional[bytes] = None
+        for mp in model_paths:
+            if mp.suffix.lower() in (".step", ".stp"):
+                try:
+                    step_data = mp.read_bytes()
+                except Exception:
+                    logger.warning("Failed to read STEP file: %s", mp)
+                break
 
         # Extract the footprint name from the S-expression if not already set
         if fp_text and not fields.footprint:
@@ -258,6 +301,7 @@ def import_zip(
             fields=fields,
             symbol_sexpr=sym_text,
             footprint_sexpr=fp_text,
+            step_data=step_data,
             import_method=ImportMethod.ZIP,
             source_info=str(zip_path.name),
         )
@@ -269,6 +313,136 @@ def import_zip(
 
     except Exception as exc:
         logger.exception("ZIP import failed: %s", zip_path)
+        return ImportResult(success=False, error=str(exc), warnings=warnings)
+
+
+# ---------------------------------------------------------------------------
+# Supported raw (non-ZIP) file extensions
+# ---------------------------------------------------------------------------
+
+_RAW_SYMBOL_EXTS = {".kicad_sym", ".lib"}
+_RAW_FOOTPRINT_EXTS = {".kicad_mod", ".mod"}
+_RAW_MODEL_EXTS = {".step", ".stp", ".wrl"}
+RAW_FILE_EXTS = _RAW_SYMBOL_EXTS | _RAW_FOOTPRINT_EXTS | _RAW_MODEL_EXTS
+
+
+def import_raw_file(
+    file_path: str | Path,
+    output_dir: Optional[str | Path] = None,
+) -> ImportResult:
+    """Import a single raw KiCad / 3-D model file.
+
+    Supported extensions: ``.kicad_sym``, ``.lib``, ``.kicad_mod``, ``.mod``,
+    ``.step``, ``.stp``, ``.wrl``.
+
+    Parameters
+    ----------
+    file_path:
+        Path to the raw file.
+    output_dir:
+        Working directory for any converted files.  A temp dir is created if
+        *None*.
+
+    Returns
+    -------
+    ImportResult
+        Populated :class:`ImportedComponent` on success.
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        return ImportResult(success=False, error=f"File not found: {file_path}")
+
+    ext = file_path.suffix.lower()
+    if ext not in RAW_FILE_EXTS:
+        return ImportResult(
+            success=False,
+            error=f"Unsupported file type '{ext}'. Expected one of: {', '.join(sorted(RAW_FILE_EXTS))}",
+        )
+
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp(prefix="kiassist_raw_")
+    tmp_dir = Path(output_dir)
+
+    warnings: list[str] = []
+    sym_text = ""
+    fp_text = ""
+    step_data: Optional[bytes] = None
+    model_paths: List[Path] = []
+    sym_path: Optional[Path] = None
+    fp_path: Optional[Path] = None
+    name_hint = file_path.stem
+
+    try:
+        if ext == ".kicad_sym":
+            sym_text = file_path.read_text(encoding="utf-8", errors="replace")
+            sym_path = file_path
+        elif ext == ".lib":
+            try:
+                converted = _convert_legacy_sym(
+                    file_path.read_text(encoding="utf-8", errors="replace")
+                )
+                sym_path = tmp_dir / (file_path.stem + ".kicad_sym")
+                sym_path.write_text(converted, encoding="utf-8")
+                sym_text = converted
+            except Exception as exc:
+                warnings.append(f"Legacy symbol conversion failed: {exc}")
+        elif ext == ".kicad_mod":
+            fp_text = file_path.read_text(encoding="utf-8", errors="replace")
+            fp_path = file_path
+        elif ext == ".mod":
+            fp_text = file_path.read_text(encoding="utf-8", errors="replace")
+            fp_path = file_path
+        elif ext in (".step", ".stp"):
+            model_paths.append(file_path)
+            try:
+                step_data = file_path.read_bytes()
+            except Exception:
+                logger.warning("Failed to read STEP file: %s", file_path)
+        elif ext == ".wrl":
+            model_paths.append(file_path)
+
+        if not sym_text and not fp_text and not model_paths:
+            return ImportResult(
+                success=False,
+                error=f"Could not extract any useful data from {file_path.name}",
+                warnings=warnings,
+            )
+
+        # Build field set from symbol properties (if available)
+        sym_props = _extract_symbol_properties(sym_text) if sym_text else {}
+        fields = normalize_fields(sym_props)
+        if not fields.mpn:
+            fields.mpn = name_hint
+        if not fields.value:
+            fields.value = name_hint
+
+        # Extract footprint name from S-expression
+        if fp_text and not fields.footprint:
+            import re as _re
+
+            m = _re.search(r'\(footprint\s+"([^"]+)"', fp_text)
+            if not m:
+                m = _re.search(r'\(module\s+"([^"]+)"', fp_text)
+            if m:
+                fields.footprint = m.group(1)
+
+        component = ImportedComponent(
+            name=name_hint,
+            fields=fields,
+            symbol_sexpr=sym_text,
+            footprint_sexpr=fp_text,
+            step_data=step_data,
+            import_method=ImportMethod.ZIP,
+            source_info=str(file_path.name),
+        )
+        component.symbol_path = sym_path
+        component.footprint_path = fp_path
+        component.model_paths = model_paths
+
+        return ImportResult(success=True, component=component, warnings=warnings)
+
+    except Exception as exc:
+        logger.exception("Raw file import failed: %s", file_path)
         return ImportResult(success=False, error=str(exc), warnings=warnings)
 
 

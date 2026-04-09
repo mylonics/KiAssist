@@ -26,6 +26,7 @@ from .models import ImportedComponent, ImportResult
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
 # Property helpers
 # ---------------------------------------------------------------------------
@@ -201,6 +202,8 @@ def write_footprint_to_library(
     target_lib_dir: str | Path,
     models_dir: Optional[str | Path] = None,
     overwrite: bool = False,
+    overwrite_models: Optional[bool] = None,
+    skip_models: bool = False,
 ) -> Tuple[bool, str, List[Path]]:
     """Write a ``.kicad_mod`` footprint into a ``*.pretty`` library directory.
 
@@ -215,6 +218,11 @@ def write_footprint_to_library(
         subdirectory inside *target_lib_dir* is used.
     overwrite:
         If ``True``, replace an existing ``.kicad_mod`` with the same name.
+    overwrite_models:
+        If ``True``, replace existing 3-D model files.  If *None*, falls
+        back to the *overwrite* flag.
+    skip_models:
+        If ``True``, do not copy 3-D model files at all (ignore).
 
     Returns
     -------
@@ -240,19 +248,21 @@ def write_footprint_to_library(
     else:
         m_dir = Path(models_dir)
 
-    # Copy 3-D models
+    # Copy 3-D models (unless skip_models is set)
+    eff_overwrite_models = overwrite_models if overwrite_models is not None else overwrite
     copied_models: List[Path] = []
-    for src in component.model_paths:
-        m_dir.mkdir(parents=True, exist_ok=True)
-        dst = m_dir / src.name
-        if dst.exists() and not overwrite:
-            i = 2
-            stem, suffix = src.stem, src.suffix
-            while (m_dir / f"{stem}_{i}{suffix}").exists():
-                i += 1
-            dst = m_dir / f"{stem}_{i}{suffix}"
-        shutil.copy2(src, dst)
-        copied_models.append(dst)
+    if not skip_models:
+        for src in component.model_paths:
+            m_dir.mkdir(parents=True, exist_ok=True)
+            dst = m_dir / src.name
+            if dst.exists() and not eff_overwrite_models:
+                i = 2
+                stem, suffix = src.stem, src.suffix
+                while (m_dir / f"{stem}_{i}{suffix}").exists():
+                    i += 1
+                dst = m_dir / f"{stem}_{i}{suffix}"
+            shutil.copy2(src, dst)
+            copied_models.append(dst)
 
     # Prepare footprint text
     fp_text = component.footprint_sexpr
@@ -289,40 +299,265 @@ def _inject_3d_models(fp_text: str, model_paths: List[Path], fp_lib_dir: Optiona
     Paths are stored using the ``${FOOTPRINTLIB_DIR}`` KiCad variable when the
     model is inside *fp_lib_dir*, making the library portable.  Absolute paths
     (normalised to forward slashes) are used as a fallback.
+
+    Uses the S-expression parser for correct handling of nested parentheses
+    (the previous regex-based approach couldn't handle the ``(xyz ...)`` nesting
+    inside model blocks).
     """
-    # Remove any existing model nodes for cleanliness
-    cleaned = re.sub(
-        r"\(model\s+[^\)]*(?:\([^\)]*\)\s*)*\)",
-        "",
-        fp_text,
-        flags=re.DOTALL,
-    )
-    # Remove the trailing closing paren of the footprint
+    # Build model reference strings
+    model_refs: List[str] = []
+    for mp in model_paths:
+        if fp_lib_dir is not None:
+            try:
+                rel = mp.resolve().relative_to(fp_lib_dir.resolve())
+                model_refs.append("${FOOTPRINTLIB_DIR}/" + rel.as_posix())
+            except ValueError:
+                model_refs.append(mp.as_posix())
+        else:
+            model_refs.append(mp.as_posix())
+
+    # Parse → extract existing model transforms → remove old models →
+    # add new models with preserved transforms → serialize
+    try:
+        tree = parse(fp_text.strip())
+    except ValueError:
+        logger.warning("Could not parse footprint S-expr; appending models via text fallback")
+        return _inject_3d_models_text_fallback(fp_text, model_refs)
+
+    # Extract transform data from existing model nodes before removing them.
+    # We collect transforms keyed by the model filename stem so we can match
+    # them to the new model paths (the path itself changes but the file name
+    # is the same).  We also keep a list ordered by appearance as a fallback.
+    existing_transforms: list[dict] = []
+    transforms_by_stem: dict[str, dict] = {}
+    for node in tree:
+        if isinstance(node, list) and node and node[0] == "model":
+            xform = _extract_model_transforms(node)
+            existing_transforms.append(xform)
+            # Key by the filename stem of the old model path
+            old_path_str = node[1] if len(node) > 1 else ""
+            if isinstance(old_path_str, QStr):
+                old_path_str = str(old_path_str)
+            stem = Path(old_path_str).stem if old_path_str else ""
+            if stem:
+                transforms_by_stem[stem] = xform
+
+    # Remove existing (model ...) nodes
+    tree[:] = [
+        node for node in tree
+        if not (isinstance(node, list) and node and node[0] == "model")
+    ]
+
+    # Append new model nodes, preserving transforms from the original
+    for idx, ref in enumerate(model_refs):
+        ref_stem = Path(ref).stem
+        # Try to match by filename stem first, then by position, else use defaults
+        xform = (
+            transforms_by_stem.get(ref_stem)
+            or (existing_transforms[idx] if idx < len(existing_transforms) else None)
+            or {"offset": [0, 0, 0], "scale": [1, 1, 1], "rotate": [0, 0, 0]}
+        )
+        tree.append([
+            "model", QStr(ref),
+            ["offset", ["xyz"] + xform["offset"]],
+            ["scale", ["xyz"] + xform["scale"]],
+            ["rotate", ["xyz"] + xform["rotate"]],
+        ])
+
+    return serialize(tree, number_precision=6) + "\n"
+
+
+def _extract_model_transforms(model_node: list) -> dict:
+    """Extract offset, scale, rotate from a parsed ``(model ...)`` node.
+
+    Returns a dict with keys ``offset``, ``scale``, ``rotate``, each a list
+    ``[x, y, z]``.  Falls back to identity/zero values if not found.
+    """
+    result = {
+        "offset": [0, 0, 0],
+        "scale": [1, 1, 1],
+        "rotate": [0, 0, 0],
+    }
+    for child in model_node:
+        if not isinstance(child, list) or len(child) < 2:
+            continue
+        tag = child[0]
+        if tag in ("offset", "scale", "rotate"):
+            # child is e.g. ["offset", ["xyz", x, y, z]]  or  ["at", ["xyz", x, y, z]]
+            xyz_node = child[1] if isinstance(child[1], list) else None
+            if xyz_node and len(xyz_node) >= 4 and xyz_node[0] == "xyz":
+                result[tag] = [
+                    _num(xyz_node[1]),
+                    _num(xyz_node[2]),
+                    _num(xyz_node[3]),
+                ]
+    return result
+
+
+def _num(v) -> float:
+    """Convert a parsed value to float, defaulting to 0."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _inject_3d_models_text_fallback(fp_text: str, model_refs: List[str]) -> str:
+    """Fallback model injection using paren-aware text manipulation.
+
+    Used only when the S-expression parser fails (e.g. already-corrupt files).
+    Attempts to preserve transforms from existing model blocks before replacing.
+    """
+    # Extract transforms from existing model blocks before removing them
+    existing_transforms = _extract_model_transforms_text(fp_text)
+
+    # Remove model blocks by counting parentheses
+    cleaned = _remove_model_blocks_text(fp_text)
+
+    # Strip trailing close-paren of the footprint
     cleaned = cleaned.rstrip()
     if cleaned.endswith(")"):
         cleaned = cleaned[:-1].rstrip()
 
     model_blocks = []
-    for mp in model_paths:
-        # Prefer a ${FOOTPRINTLIB_DIR}-relative path for portability
-        if fp_lib_dir is not None:
-            try:
-                rel = mp.resolve().relative_to(fp_lib_dir.resolve())
-                model_ref = "${FOOTPRINTLIB_DIR}/" + rel.as_posix()
-            except ValueError:
-                # model is outside the library dir — use normalised absolute path
-                model_ref = mp.as_posix()
-        else:
-            model_ref = mp.as_posix()
+    for idx, ref in enumerate(model_refs):
+        ref_stem = Path(ref).stem
+        # Try to match by stem first, then by index, else use defaults
+        xform = None
+        for et in existing_transforms:
+            if et.get("stem") == ref_stem:
+                xform = et
+                break
+        if xform is None and idx < len(existing_transforms):
+            xform = existing_transforms[idx]
+        if xform is None:
+            xform = {"offset": [0, 0, 0], "scale": [1, 1, 1], "rotate": [0, 0, 0]}
 
+        ox, oy, oz = xform["offset"]
+        sx, sy, sz = xform["scale"]
+        rx, ry, rz = xform["rotate"]
         model_blocks.append(
-            f'  (model "{model_ref}"\n'
-            f"    (offset (xyz 0 0 0))\n"
-            f"    (scale (xyz 1 1 1))\n"
-            f"    (rotate (xyz 0 0 0))\n"
+            f'  (model "{ref}"\n'
+            f"    (offset (xyz {ox} {oy} {oz}))\n"
+            f"    (scale (xyz {sx} {sy} {sz}))\n"
+            f"    (rotate (xyz {rx} {ry} {rz}))\n"
             f"  )"
         )
     return cleaned + "\n" + "\n".join(model_blocks) + "\n)\n"
+
+
+def _extract_model_transforms_text(fp_text: str) -> list[dict]:
+    """Extract model transforms from footprint text using regex.
+
+    Returns a list of dicts with offset/scale/rotate arrays and a 'stem' key.
+    """
+    results = []
+    # Find all (model "path" ...) blocks
+    pattern = re.compile(
+        r'\(model\s+"([^"]*)"(.*?)\)',
+        re.DOTALL,
+    )
+    # We need paren-aware matching for the model block
+    i = 0
+    n = len(fp_text)
+    while i < n:
+        if fp_text[i:i+6] == "(model" and (i + 6 >= n or fp_text[i+6] in " \t\n\r"):
+            # Find the model path
+            depth = 0
+            j = i
+            block_chars = []
+            in_str = False
+            while j < n:
+                c = fp_text[j]
+                if c == '"' and not in_str:
+                    in_str = True
+                elif c == '"' and in_str:
+                    bs = 0
+                    k = j - 1
+                    while k >= 0 and fp_text[k] == '\\':
+                        bs += 1
+                        k -= 1
+                    if bs % 2 == 0:
+                        in_str = False
+                elif not in_str:
+                    if c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            block_chars.append(c)
+                            j += 1
+                            break
+                block_chars.append(c)
+                j += 1
+            block = "".join(block_chars)
+            # Extract path
+            path_m = re.search(r'\(model\s+"([^"]*)"', block)
+            stem = Path(path_m.group(1)).stem if path_m else ""
+            # Extract xyz values
+            xform: dict = {"offset": [0, 0, 0], "scale": [1, 1, 1], "rotate": [0, 0, 0], "stem": stem}
+            for key in ("offset", "scale", "rotate"):
+                m = re.search(
+                    rf'\({key}\s+\(xyz\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s*\)',
+                    block,
+                )
+                if m:
+                    try:
+                        xform[key] = [float(m.group(1)), float(m.group(2)), float(m.group(3))]
+                    except ValueError:
+                        pass
+                elif key == "scale":
+                    xform[key] = [1, 1, 1]
+            results.append(xform)
+            i = j
+        else:
+            i += 1
+    return results
+
+
+def _remove_model_blocks_text(text: str) -> str:
+    """Remove all ``(model ...)`` blocks using paren-aware matching."""
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Check for "(model" followed by whitespace
+        if (text[i] == "(" and text[i + 1:i + 6] == "model"
+                and (i + 6 >= n or text[i + 6] in " \t\n\r")):
+            # Skip the entire block by counting parens
+            depth = 0
+            in_str = False
+            j = i
+            while j < n:
+                c = text[j]
+                if c == '"' and not in_str:
+                    in_str = True
+                elif c == '"' and in_str:
+                    # Check preceding backslashes
+                    bs = 0
+                    k = j - 1
+                    while k >= 0 and text[k] == '\\':
+                        bs += 1
+                        k -= 1
+                    if bs % 2 == 0:
+                        in_str = False
+                elif not in_str:
+                    if c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            j += 1
+                            break
+                j += 1
+            # Skip trailing whitespace
+            while j < n and text[j] in " \t\n\r":
+                j += 1
+            i = j
+        else:
+            result.append(text[i])
+            i += 1
+    return "".join(result)
 
 
 # ---------------------------------------------------------------------------
