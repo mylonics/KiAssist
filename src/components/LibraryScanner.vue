@@ -82,7 +82,7 @@ const {
             <span class="material-icons" style="font-size: 0.9rem">{{ showDefaults ? 'visibility_off' : 'visibility' }}</span>
             <span class="toggle-label">{{ showDefaults ? 'Hide' : 'Show' }} defaults ({{ allLibraries.length - customLibCount }})</span>
           </button>
-          <button class="scanner-btn-sm" @click="discoverLibraries" title="Refresh">
+          <button class="scanner-btn-sm" @click="discoverLibraries" title="Refresh" aria-label="Refresh library list">
             <span class="material-icons" style="font-size: 0.9rem">refresh</span>
           </button>
         </div>

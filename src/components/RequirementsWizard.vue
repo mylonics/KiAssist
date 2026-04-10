@@ -232,7 +232,7 @@ watch(() => props.visible, async (newVal) => {
       <!-- Header -->
       <div class="wizard-header">
         <h2>Project Requirements Wizard</h2>
-        <button @click="close" class="close-btn" title="Close">
+        <button @click="close" class="close-btn" title="Close" aria-label="Close requirements wizard">
           <span class="material-icons">close</span>
         </button>
       </div>

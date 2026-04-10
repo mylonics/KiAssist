@@ -169,6 +169,64 @@ def parse(text: str) -> List[SExpr]:
     return result  # type: ignore[return-value]
 
 
+def parse_lenient(text: str) -> List[SExpr]:
+    """Parse an S-expression string, merging fragments if the root closes early.
+
+    KiCad library files that have been corrupted by extra ``)`̀` characters
+    can end up with the root expression closing prematurely, leaving
+    properties, sub-symbols, or entire symbols as orphaned top-level
+    fragments.  This function parses all such fragments and merges them
+    back into the first (root) expression so that the result is usable.
+
+    Stray ``)`` tokens between fragments are silently skipped.
+
+    Falls back to :func:`parse` behaviour when the file has exactly one
+    top-level S-expression.
+
+    Args:
+        text: Full content of a KiCad file or any S-expression string.
+
+    Returns:
+        A nested list representing the (merged) S-expression tree.
+
+    Raises:
+        ValueError: If the input cannot be parsed at all.
+    """
+    tokens = list(_tokenize(text))
+    pos = [0]
+
+    def _parse_one() -> SExpr:
+        if pos[0] >= len(tokens):
+            raise ValueError("Unexpected end of S-expression input")
+        tok = tokens[pos[0]]
+        if tok == "(":
+            pos[0] += 1
+            result: List[SExpr] = []
+            while pos[0] < len(tokens):
+                if tokens[pos[0]] == ")":
+                    pos[0] += 1
+                    return result
+                result.append(_parse_one())
+            raise ValueError("Missing closing parenthesis in S-expression")
+        if tok == ")":
+            raise ValueError("Unexpected closing parenthesis")
+        pos[0] += 1
+        return tok
+
+    result = _parse_one()
+
+    # If there are remaining tokens, collect fragments and merge them
+    # into the root expression (handles corrupted files).
+    if pos[0] < len(tokens) and isinstance(result, list):
+        while pos[0] < len(tokens):
+            if tokens[pos[0]] == ")":
+                pos[0] += 1  # skip stray close-parens between fragments
+                continue
+            result.append(_parse_one())
+
+    return result  # type: ignore[return-value]
+
+
 # ---------------------------------------------------------------------------
 # Serialiser
 # ---------------------------------------------------------------------------

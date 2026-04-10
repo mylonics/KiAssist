@@ -7,6 +7,18 @@ Provides API key management, Gemini integration, and KiCad IPC detection.
 __version__ = "0.1.0"
 
 from .api_key import ApiKeyStore
+from .exceptions import (
+    KiAssistError,
+    SchematicParseError,
+    FootprintParseError,
+    SymbolLibParseError,
+    PCBParseError,
+    APIKeyError,
+    IPCError,
+    ProviderError,
+    ConfigError,
+    PathValidationError,
+)
 from .gemini import GeminiAPI
 from .kicad_ipc import detect_kicad_instances, KiCadInstance, get_open_project_paths, is_project_open
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path

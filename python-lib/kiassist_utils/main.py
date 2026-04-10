@@ -35,6 +35,7 @@ from .context.history import ConversationStore
 from .context.prompts import SystemPromptBuilder
 from .context.requirements import RequirementsManager, ContextState
 from .ai.llm_logger import llm_logger
+from .config_keys import ConfigKeys
 
 logger = logging.getLogger(__name__)
 
@@ -121,16 +122,15 @@ _PROVIDER_REGISTRY: List[Dict[str, Any]] = [
 class KiAssistAPI:
     """Backend API exposed to the frontend via pywebview."""
 
-    # Config keys for persisted model selections
-    _CFG_LAST_GEMMA_MODEL = "last_gemma_server_model"
-    _CFG_PROVIDER = "last_provider"
-    _CFG_MODEL = "last_model"
-    _CFG_SECONDARY_PROVIDER = "last_secondary_provider"
-    _CFG_SECONDARY_MODEL = "last_secondary_model"
-    # Config keys for persisted library paths
-    _CFG_LAST_SYM_LIB = "last_sym_lib"
-    _CFG_LAST_FP_LIB = "last_fp_lib"
-    _CFG_LAST_MODELS_DIR = "last_models_dir"
+    # Config keys — centralised in config_keys.py, aliased here for brevity.
+    _CFG_LAST_GEMMA_MODEL = ConfigKeys.LAST_GEMMA_MODEL
+    _CFG_PROVIDER = ConfigKeys.PROVIDER
+    _CFG_MODEL = ConfigKeys.MODEL
+    _CFG_SECONDARY_PROVIDER = ConfigKeys.SECONDARY_PROVIDER
+    _CFG_SECONDARY_MODEL = ConfigKeys.SECONDARY_MODEL
+    _CFG_LAST_SYM_LIB = ConfigKeys.LAST_SYM_LIB
+    _CFG_LAST_FP_LIB = ConfigKeys.LAST_FP_LIB
+    _CFG_LAST_MODELS_DIR = ConfigKeys.LAST_MODELS_DIR
 
     def __init__(self):
         """Initialize the backend API."""
@@ -289,7 +289,7 @@ class KiAssistAPI:
     # Symbol field defaults
     # ------------------------------------------------------------------
 
-    _CFG_SYMBOL_FIELD_DEFAULTS = "symbol_field_defaults"
+    _CFG_SYMBOL_FIELD_DEFAULTS = ConfigKeys.SYMBOL_FIELD_DEFAULTS
 
     # The factory defaults if nothing is saved yet.
     _BUILTIN_FIELD_DEFAULTS: List[Dict[str, str]] = [

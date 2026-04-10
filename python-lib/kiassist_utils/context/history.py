@@ -156,6 +156,15 @@ class ConversationStore:
         with open(self._history_path, "a", encoding="utf-8") as fh:
             fh.write(line)
 
+        # Auto-purge when the history file exceeds 10 MB to prevent
+        # unbounded growth.
+        _MAX_HISTORY_BYTES = 10 * 1024 * 1024
+        try:
+            if self._history_path.stat().st_size > _MAX_HISTORY_BYTES:
+                self.purge_old()
+        except OSError:
+            pass
+
     def load_session(self, session_id: str) -> List[AIMessage]:
         """Return all messages for *session_id* in chronological order.
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { getApi } from '../composables/useApi';
 
 const emit = defineEmits<{
   (e: 'context-questions-ready', questions: Array<{ question: string; suggestions: string[] }>): void;
@@ -62,7 +63,7 @@ async function startLifecycle() {
   errorMsg.value = '';
   questionsEmitted.value = false;
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) { errorMsg.value = 'Backend not available'; return; }
     const result = await api.start_context_lifecycle();
     if (result.success) {
@@ -107,7 +108,7 @@ function checkAndEmitQuestions(data: any) {
 
 async function loadCachedState() {
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) return;
     const result = await api.get_context_lifecycle_state();
     if (result.success && result.state !== 'idle') {
@@ -125,7 +126,7 @@ function startPolling() {
   stopPolling();
   pollTimer = setInterval(async () => {
     try {
-      const api = (window as any).pywebview?.api;
+      const api = getApi();
       if (!api) return;
       const result = await api.get_context_lifecycle_state();
       console.log('[ContextLifecycle] Poll result: state=', result.state, 'questions=', (result.questions ?? []).length, 'success=', result.success);

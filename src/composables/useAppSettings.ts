@@ -3,6 +3,7 @@
  * Persists settings to localStorage and syncs field defaults with the Python backend.
  */
 import { ref, watch } from 'vue';
+import { getApi } from './useApi';
 
 // -----------------------------------------------------------------------
 // Types
@@ -91,8 +92,12 @@ function saveToStorage(s: AppSettings) {
 
 const settings = ref<AppSettings>(loadFromStorage());
 
-// Persist on every change
-watch(settings, (v) => saveToStorage(v), { deep: true });
+// Persist on every change (debounced to avoid excessive writes)
+let _saveTimer: ReturnType<typeof setTimeout> | null = null;
+watch(settings, (v) => {
+  if (_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => saveToStorage(v), 500);
+}, { deep: true });
 
 // -----------------------------------------------------------------------
 // Public API
@@ -101,7 +106,7 @@ watch(settings, (v) => saveToStorage(v), { deep: true });
 export function useAppSettings() {
   /** Load field defaults from the Python backend (one-time on app start) */
   async function loadFieldDefaultsFromBackend() {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api?.get_symbol_field_defaults) return;
     try {
       const r = await api.get_symbol_field_defaults();
@@ -117,7 +122,7 @@ export function useAppSettings() {
 
   /** Save field defaults to the Python backend */
   async function saveFieldDefaultsToBackend() {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api?.set_symbol_field_defaults) return { success: false, error: 'No API' };
     try {
       const payload = settings.value.fieldDefaults.map(f => ({
@@ -133,7 +138,7 @@ export function useAppSettings() {
 
   /** Load library defaults from the Python backend */
   async function loadLibraryDefaultsFromBackend() {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api?.importer_get_library_defaults) return;
     try {
       const r = await api.importer_get_library_defaults();

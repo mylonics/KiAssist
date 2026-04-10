@@ -791,8 +791,14 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   cancelAnimationFrame(animFrameId);
   resizeObserver?.disconnect();
+  // Dispose all scene model groups to free GPU memory
+  if (primaryModelGroup) { disposeGroup(primaryModelGroup); primaryModelGroup = null; primaryTransformGroup = null; }
+  if (primaryBoardGroup) { disposeGroup(primaryBoardGroup); primaryBoardGroup = null; }
+  if (compareModelGroup) { disposeGroup(compareModelGroup); compareModelGroup = null; compareTransformGroup = null; }
+  if (compareBoardGroup) { disposeGroup(compareBoardGroup); compareBoardGroup = null; }
   controls?.dispose();
   renderer?.dispose();
+  renderer = null;
   stepWorker?.terminate();
   stepWorker = null;
 });

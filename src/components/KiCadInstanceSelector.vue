@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import type { KiCadInstance, RecentProject } from '../types/pywebview';
+import { getApi } from '../composables/useApi';
 
 const emit = defineEmits<{
   (e: 'context-questions-ready', questions: Array<{ question: string; suggestions: string[] }>): void;
@@ -156,7 +157,8 @@ function selectProject(project: KiCadInstance | RecentProject, isOpen: boolean) 
   switcherOpen.value = false;
   
   if (!isOpen && 'path' in project) {
-    window.pywebview?.api.add_recent_project(project.path);
+    window.pywebview?.api.add_recent_project(project.path)
+      ?.catch((err: unknown) => console.error('[KiCadInstanceSelector] Failed to add recent project:', err));
   }
 }
 
@@ -318,7 +320,7 @@ async function startBuildContext() {
   contextError.value = '';
   contextQuestionsEmitted.value = false;
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) { contextError.value = 'Backend not available'; return; }
     const result = await api.start_context_lifecycle();
     if (result.success) {
@@ -350,7 +352,7 @@ function startContextPolling() {
   stopContextPolling();
   contextPollTimer = setInterval(async () => {
     try {
-      const api = (window as any).pywebview?.api;
+      const api = getApi();
       if (!api) return;
       const result = await api.get_context_lifecycle_state();
       if (result.success) {

@@ -30,6 +30,7 @@ from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
+from .exceptions import PathValidationError
 from .kicad_ipc import detect_kicad_instances, get_open_project_paths
 from .kicad_parser.footprint import Footprint
 from .kicad_parser.library import LibraryDiscovery
@@ -58,6 +59,66 @@ mcp: FastMCP = FastMCP(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+# Allowed KiCad file extensions for path validation.
+_KICAD_EXTENSIONS = frozenset({
+    ".kicad_sch", ".kicad_sym", ".kicad_mod", ".kicad_pcb",
+    ".kicad_pro", ".kicad_dru",
+})
+
+
+def _validate_path(path: str, *, allowed_extensions: frozenset[str] | None = None) -> str | None:
+    """Validate a user-supplied file path for safety.
+
+    Returns an error message string if the path is unsafe, or ``None`` if OK.
+    Rejects paths that:
+    - Contain ``..`` (directory traversal)
+    - Are not absolute after resolution
+    - Have a disallowed extension (when *allowed_extensions* is given)
+    """
+    try:
+        resolved = Path(path).resolve()
+    except (ValueError, OSError):
+        return f"Invalid path: {path}"
+    # Reject traversal: if the user-supplied path contains ".." segments,
+    # it may be an attempt to escape the intended directory.
+    if ".." in Path(path).parts:
+        return f"Path traversal not allowed: {path}"
+    if allowed_extensions is not None:
+        # Check all suffixes (e.g. ".kicad_sch" is a compound suffix)
+        name = resolved.name
+        if not any(name.endswith(ext) for ext in allowed_extensions):
+            return f"Unsupported file extension: {resolved.suffix!r}"
+    return None
+
+
+# Coordinate bounds for KiCad schematics/PCBs (mm). Values beyond these
+# are almost certainly input errors rather than real design intent.
+_MAX_COORD_MM = 10_000.0
+_VALID_ANGLES = None  # accept any float; KiCad normalises internally
+
+
+def _validate_coordinate(value: float, name: str = "coordinate") -> str | None:
+    """Return an error string if *value* is out of the sane range for KiCad."""
+    if not math.isfinite(value):
+        return f"{name} must be a finite number, got {value}"
+    if abs(value) > _MAX_COORD_MM:
+        return f"{name} out of range (±{_MAX_COORD_MM} mm): {value}"
+    return None
+
+
+def _validate_angle(value: float) -> str | None:
+    """Return an error string if *value* is not a valid angle."""
+    if not math.isfinite(value):
+        return f"Angle must be a finite number, got {value}"
+    return None
+
+
+def _validate_reference(ref: str) -> str | None:
+    """Return an error string if *ref* looks invalid."""
+    if not ref or len(ref) > 100:
+        return f"Invalid reference designator: {ref!r}"
+    return None
 
 
 def _ok(data: Any) -> Dict[str, Any]:
@@ -94,8 +155,11 @@ def _safe_save(obj: Any, path: str | os.PathLike) -> None:
         Any exception raised by ``obj.save()`` or ``os.replace()`` is re-raised.
     """
     dest = Path(path)
+    bak_path = str(dest) + ".bak"
     if dest.exists():
-        shutil.copy2(dest, str(dest) + ".bak")
+        shutil.copy2(dest, bak_path)
+    else:
+        logger.debug("No existing file at %s; skipping backup creation.", dest)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
     try:
         try:
@@ -127,6 +191,8 @@ def schematic_open(path: str) -> Dict[str, Any]:
         Summary dict with ``component_count``, ``sheet_count``, ``paper``,
         ``title``, and ``version``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except FileNotFoundError:
@@ -162,6 +228,8 @@ def schematic_list_symbols(path: str) -> Dict[str, Any]:
         List of dicts, each with ``reference``, ``value``, ``footprint``,
         ``lib_id``, and ``position``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -194,6 +262,8 @@ def schematic_get_symbol(path: str, reference: str) -> Dict[str, Any]:
         ``position``, ``properties``, ``pin_positions``, and
         ``connections`` (mapping pin number → net name).
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -261,6 +331,15 @@ def schematic_add_symbol(
     Returns:
         Dict with the added symbol's ``reference`` and ``position``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    for coord_name, coord_val in [("x", x), ("y", y)]:
+        if err := _validate_coordinate(coord_val, coord_name):
+            return _err(err)
+    if err := _validate_angle(angle):
+        return _err(err)
+    if err := _validate_reference(reference):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -286,6 +365,8 @@ def schematic_remove_symbol(path: str, reference: str) -> Dict[str, Any]:
     Returns:
         ``{"removed": true}`` on success or an error.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -322,6 +403,8 @@ def schematic_modify_symbol(
     Returns:
         The updated symbol's basic info on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -383,6 +466,11 @@ def schematic_add_wire(
     Returns:
         ``{"added": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    for name, val in [("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)]:
+        if err := _validate_coordinate(val, name):
+            return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -415,6 +503,8 @@ def schematic_connect_pins(
     Returns:
         Number of wire segments added.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -476,6 +566,8 @@ def schematic_add_label(
     Returns:
         ``{"added": true, "type": "label"|"global_label"}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -510,6 +602,8 @@ def schematic_get_nets(path: str) -> Dict[str, Any]:
     Returns:
         Dict mapping net name → list of ``"RefDes:PinNum"`` strings.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -536,6 +630,8 @@ def schematic_find_pins(
         List of dicts with ``symbol_reference``, ``pin_number``, ``pin_name``,
         and ``position``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -591,6 +687,8 @@ def schematic_get_power_pins(path: str, reference: str) -> Dict[str, Any]:
     Returns:
         List of dicts with ``pin_number``, ``pin_name``, and ``position``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -649,6 +747,8 @@ def schematic_add_junction(path: str, x: float, y: float) -> Dict[str, Any]:
     Returns:
         ``{"added": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -675,6 +775,8 @@ def schematic_add_no_connect(path: str, x: float, y: float) -> Dict[str, Any]:
     Returns:
         ``{"added": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -702,6 +804,8 @@ def schematic_search(
     Returns:
         List of matching symbol dicts.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
     try:
         sch = Schematic.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -744,6 +848,8 @@ def symbol_lib_open(path: str) -> Dict[str, Any]:
     Returns:
         Summary with ``symbol_count`` and a list of symbol names.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except FileNotFoundError:
@@ -766,6 +872,8 @@ def symbol_lib_get_symbol(path: str, name: str) -> Dict[str, Any]:
     Returns:
         Dict with ``name``, ``extends``, ``properties``, and ``pin_count``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -817,6 +925,8 @@ def symbol_lib_create_symbol(
     Returns:
         ``{"created": true, "name": "<name>"}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except FileNotFoundError:
@@ -877,6 +987,8 @@ def symbol_lib_modify_symbol(
     Returns:
         ``{"modified": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -908,6 +1020,8 @@ def symbol_lib_delete_symbol(path: str, name: str) -> Dict[str, Any]:
     Returns:
         ``{"deleted": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -953,6 +1067,8 @@ def symbol_lib_add_pin(
     Returns:
         ``{"added": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -998,6 +1114,8 @@ def symbol_lib_bulk_update(
     Returns:
         ``{"updated_count": N}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sym"})):
+        return _err(err)
     try:
         lib = SymbolLibrary.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -1055,6 +1173,8 @@ def footprint_open(path: str) -> Dict[str, Any]:
         Summary with ``name``, ``description``, ``tags``, ``layer``,
         and ``pad_count``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     try:
         fp = Footprint.load(path)
     except FileNotFoundError:
@@ -1084,6 +1204,8 @@ def footprint_get_details(path: str) -> Dict[str, Any]:
     Returns:
         Full footprint dict with ``pads`` list and ``graphics`` count.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     try:
         fp = Footprint.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -1140,6 +1262,8 @@ def footprint_create(
     Returns:
         ``{"created": true, "name": "<name>"}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     fp = Footprint(name=name, description=description, tags=tags, layer=layer)
 
     if pads:
@@ -1179,6 +1303,8 @@ def footprint_modify(
     Returns:
         ``{"modified": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     try:
         fp = Footprint.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -1229,6 +1355,8 @@ def footprint_add_pad(
     Returns:
         ``{"added": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     try:
         fp = Footprint.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -1270,6 +1398,8 @@ def footprint_remove_pad(path: str, number: str) -> Dict[str, Any]:
     Returns:
         ``{"removed": true}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     try:
         fp = Footprint.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -1298,6 +1428,8 @@ def footprint_renumber_pads(path: str, start: int = 1) -> Dict[str, Any]:
     Returns:
         ``{"renumbered": N}`` where *N* is the total pad count.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_mod"})):
+        return _err(err)
     try:
         fp = Footprint.load(path)
     except Exception as exc:  # noqa: BLE001
@@ -1366,6 +1498,8 @@ def kicad_get_project_info(project_path: str) -> Dict[str, Any]:
     Returns:
         Dict with ``schematics``, ``pcb``, ``libraries``, and ``is_open``.
     """
+    if err := _validate_path(project_path, allowed_extensions=frozenset({".kicad_pro"})):
+        return _err(err)
     project_path_obj = Path(project_path)
     if not project_path_obj.exists():
         return _err(f"Project path not found: {project_path}")
@@ -1408,6 +1542,8 @@ def kicad_save_schematic(file_path: str) -> Dict[str, Any]:
         or an error dict if kipy is unavailable or the file is not currently
         open in any running KiCad instance.
     """
+    if err := _validate_path(file_path, allowed_extensions=frozenset({".kicad_sch", ".kicad_pcb"})):
+        return _err(err)
     from .kicad_ipc import ipc_save_document
 
     try:
@@ -1438,6 +1574,8 @@ def kicad_reload_schematic(file_path: str) -> Dict[str, Any]:
         or an error dict if kipy is unavailable or the file is not currently
         open in any running KiCad instance.
     """
+    if err := _validate_path(file_path, allowed_extensions=frozenset({".kicad_sch", ".kicad_pcb"})):
+        return _err(err)
     from .kicad_ipc import ipc_revert_document
 
     try:
@@ -1461,6 +1599,8 @@ def kicad_get_board_info(path: str) -> Dict[str, Any]:
         Dict with ``net_count``, ``footprint_count``, ``track_count``,
         ``via_count``, and ``layer_stackup``.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1506,6 +1646,8 @@ def kicad_check_file_status(path: str) -> Dict[str, Any]:
           file open.
         * ``bak_exists`` – ``true`` if a ``.bak`` backup is present.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch", ".kicad_pcb"})):
+        return _err(err)
     try:
         from .ipc_workflow import check_file_status
     except ImportError as exc:
@@ -1563,6 +1705,8 @@ async def kicad_edit_file_pipeline(
         * ``save_triggered`` — ``true`` if the IPC save succeeded.
         * ``reload_triggered`` — ``true`` if the IPC reload succeeded.
     """
+    if err := _validate_path(file_path, allowed_extensions=frozenset({".kicad_sch", ".kicad_pcb"})):
+        return _err(err)
     try:
         from .ipc_workflow import SchematicEditPipeline
     except ImportError as exc:
@@ -1602,6 +1746,8 @@ def pcb_open(path: str) -> Dict[str, Any]:
         ``track_count``, ``via_count``, ``layer_stackup``, ``nets``,
         and ``footprints`` (reference + value + layer + position for each).
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1643,6 +1789,8 @@ def pcb_new(path: str) -> Dict[str, Any]:
     Returns:
         ``{"created": true, "path": "<path>"}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     board = PCBBoard.new()
     try:
         _safe_save(board, path)
@@ -1661,6 +1809,8 @@ def pcb_get_layer_stackup(path: str) -> Dict[str, Any]:
     Returns:
         ``{"layers": [...]}`` — ordered list of copper layer name strings.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1680,6 +1830,8 @@ def pcb_list_nets(path: str) -> Dict[str, Any]:
     Returns:
         List of dicts with ``number`` and ``name`` for each net.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1700,6 +1852,8 @@ def pcb_add_net(path: str, name: str) -> Dict[str, Any]:
     Returns:
         ``{"added": true, "number": N, "name": "<name>"}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1734,6 +1888,8 @@ def pcb_list_footprints(path: str) -> Dict[str, Any]:
         List of dicts with ``reference``, ``value``, ``name``, ``layer``,
         and ``position`` for each footprint.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1767,6 +1923,8 @@ def pcb_get_footprint(path: str, reference: str) -> Dict[str, Any]:
         ``position``, ``pad_count``, and ``pads`` (number, type, shape,
         position, size, net for each pad).
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1841,6 +1999,8 @@ def pcb_add_footprint(
     Returns:
         ``{"added": true, "reference": "<ref>"}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1868,6 +2028,8 @@ def pcb_remove_footprint(path: str, reference: str) -> Dict[str, Any]:
     Returns:
         ``{"removed": true}`` on success, or an error if not found.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1910,6 +2072,8 @@ def pcb_move_footprint(
         ``{"moved": true, "reference": "<ref>", "x": x, "y": y, "angle": angle}``
         on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -1953,6 +2117,8 @@ def pcb_list_tracks(path: str) -> Dict[str, Any]:
         List of dicts with ``start``, ``end``, ``layer``, ``width``,
         and ``net`` (net number) for each track segment.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -2005,6 +2171,8 @@ def pcb_add_track(
     Returns:
         ``{"added": true, "net": <net_number>}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -2036,6 +2204,8 @@ def pcb_list_vias(path: str) -> Dict[str, Any]:
         ``layer_from``, ``layer_to``, ``net``, and ``net_name``
         for each via.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -2089,6 +2259,8 @@ def pcb_add_via(
     Returns:
         ``{"added": true, "net": <net_number>}`` on success.
     """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
     try:
         board = PCBBoard.load(path)
     except FileNotFoundError:
@@ -2125,6 +2297,8 @@ def project_get_context(project_path: str) -> Dict[str, Any]:
         Dict with lists of schematic symbols, symbol/footprint library paths,
         design-rule files, and whether a KIASSIST.md memory file exists.
     """
+    if err := _validate_path(project_path):
+        return _err(err)
     path_obj = Path(project_path)
     if path_obj.is_file():
         project_dir = path_obj.parent
@@ -2206,6 +2380,8 @@ def project_read_memory(project_path: str) -> Dict[str, Any]:
         Dict with ``content`` (the Markdown text) or an error if the file
         does not exist.
     """
+    if err := _validate_path(project_path):
+        return _err(err)
     mem = ProjectMemory(project_path)
     try:
         content = mem.read()
@@ -2228,6 +2404,8 @@ def project_write_memory(project_path: str, content: str) -> Dict[str, Any]:
     Returns:
         ``{"written": true, "path": "<path>"}`` on success.
     """
+    if err := _validate_path(project_path):
+        return _err(err)
     mem = ProjectMemory(project_path)
     if not mem.project_dir.exists():
         return _err(f"Project directory not found: {mem.project_dir}")

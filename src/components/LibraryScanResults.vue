@@ -4,7 +4,6 @@ import { useLibraryScanner } from '../composables/useLibraryScanner';
 const {
   scanResults,
   scanError,
-  scanning,
   fixing,
   fixResults,
   expandedLib,
@@ -16,11 +15,9 @@ const {
   fixAll,
   toggleExpand,
   closeResults,
-  resultFor,
   severityIcon,
   severityColor,
   libTypeIcon,
-  statusBadge,
 } = useLibraryScanner();
 </script>
 

@@ -205,6 +205,18 @@ def _advisory_file_lock(path: Path) -> Generator[None, None, None]:
         # Windows: fall back to a best-effort creation-based lock.
         # We try to create the lock file exclusively; if it already exists,
         # we poll briefly and raise if we cannot acquire within the timeout.
+        #
+        # Stale lock recovery: if the lock file is older than 5 minutes it
+        # was almost certainly left behind by a crashed process — remove it.
+        _STALE_LOCK_SECONDS = 300.0
+        try:
+            if lock_path.exists():
+                age = time.time() - lock_path.stat().st_mtime
+                if age > _STALE_LOCK_SECONDS:
+                    lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
         deadline = time.monotonic() + 30.0  # 30-second acquisition timeout
         acquired = False
         while time.monotonic() < deadline:

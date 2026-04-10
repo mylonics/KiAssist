@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import type { ImportedComponent, CadSource } from '../types/importer';
+import { getApi, waitForApi } from '../composables/useApi';
 
 // -----------------------------------------------------------------------
 // Emits
@@ -87,24 +88,10 @@ let _indexPollTimer: ReturnType<typeof setInterval> | null = null;
 // Lifecycle
 // -----------------------------------------------------------------------
 
-/** Wait for pywebview API bridge to be available. */
-function waitForApi(): Promise<boolean> {
-  if ((window as any).pywebview?.api) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const onReady = () => resolve(!!(window as any).pywebview?.api);
-    window.addEventListener('pywebviewready', onReady, { once: true });
-    // Timeout after 5s so we don't hang forever in dev/test
-    setTimeout(() => {
-      window.removeEventListener('pywebviewready', onReady);
-      resolve(!!(window as any).pywebview?.api);
-    }, 5000);
-  });
-}
-
 onMounted(async () => {
   const ready = await waitForApi();
   if (!ready) return;
-  const api = (window as any).pywebview?.api;
+  const api = getApi();
   if (!api) return;
   try {
     const r = await api.importer_lcsc_available();
@@ -160,10 +147,6 @@ async function loadLibraries() {
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
-
-function getApi() {
-  return (window as any).pywebview?.api ?? null;
-}
 
 function clearError() {
   error.value = '';

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
 import { useAppSettings, type FieldDefault, FIELD_DESCRIPTIONS } from '../composables/useAppSettings';
+import { getApi } from '../composables/useApi';
 
 // -----------------------------------------------------------------------
 // Props & Emits
@@ -136,7 +137,7 @@ function loadLibsCopy() {
 }
 
 async function loadLibraries() {
-  const api = (window as any).pywebview?.api;
+  const api = getApi();
   if (!api) return;
   libsLoading.value = true;
   try {
@@ -180,7 +181,7 @@ function saveLibraryDefaults() {
 }
 
 async function browseModelsDir() {
-  const api = (window as any).pywebview?.api;
+  const api = getApi();
   if (!api) return;
   try {
     const r = await api.importer_browse_models_dir();
@@ -284,7 +285,7 @@ function onVariantSearchInput(type: string) {
 }
 
 async function doVariantSymSearch(type: string, query: string) {
-  const api = (window as any).pywebview?.api;
+  const api = getApi();
   if (!api) {
     variantSearchLoading.value = { ...variantSearchLoading.value, [type]: false };
     return;

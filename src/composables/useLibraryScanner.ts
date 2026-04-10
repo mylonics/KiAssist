@@ -6,6 +6,7 @@
  * share the same reactive singletons.
  */
 import { ref, computed } from 'vue';
+import { getApi } from './useApi';
 import type {
   AnalyzerLibInfo,
   AnalyzerBatchResult,
@@ -45,10 +46,6 @@ const filterSeverity = ref<'all' | 'error' | 'warning' | 'info'>('all');
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
-
-function getApi() {
-  return (window as any).pywebview?.api ?? null;
-}
 
 // Combine all libs into selectable entries
 const allLibraries = computed(() => {

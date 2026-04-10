@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import { getApi } from '../composables/useApi';
 
 // -----------------------------------------------------------------------
 // Types
@@ -26,10 +27,6 @@ const newFieldKey = ref('');
 // -----------------------------------------------------------------------
 // API
 // -----------------------------------------------------------------------
-
-function getApi() {
-  return (window as any).pywebview?.api ?? null;
-}
 
 async function loadDefaults() {
   const api = getApi();

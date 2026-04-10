@@ -14,13 +14,15 @@ Typical usage::
 
 from __future__ import annotations
 
+import re
+
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .models import Effects, Position, Property, KiUUID
-from .sexpr import QStr, SExpr, parse, serialize
+from .sexpr import QStr, SExpr, parse, parse_lenient, serialize
 from ._helpers import _find, _find_all, _parse_position, _parse_effects
 
 
@@ -284,8 +286,21 @@ class SymbolLibrary:
         if p.is_dir():
             return cls._load_symdir(p)
         text = p.read_text(encoding="utf-8")
-        tree = parse(text)
-        return cls._from_tree(tree)
+        try:
+            tree = parse(text)
+        except ValueError:
+            # File may be structurally corrupt (e.g. extra close-parens
+            # that cause the root expression to close prematurely).
+            # Fall back to lenient parsing which merges fragments.
+            import logging
+            logging.getLogger(__name__).warning(
+                "Strict parse failed for %s — retrying with lenient parser",
+                path,
+            )
+            tree = parse_lenient(text)
+        lib = cls._from_tree(tree)
+        lib._reassemble_fragments()
+        return lib
 
     @classmethod
     def _load_symdir(cls, dirpath: Path) -> "SymbolLibrary":
@@ -407,3 +422,52 @@ class SymbolLibrary:
         for sym in self.symbols:
             tree.append(sym.to_tree())
         return tree
+
+    def _reassemble_fragments(self) -> None:
+        """Re-attach orphaned sub-symbol units to their parent symbols.
+
+        After lenient parsing of a corrupted file, sub-symbols like
+        ``EVQ-Q2S03W_0_1`` may appear as top-level symbols instead of
+        being children of ``EVQ-Q2S03W``.  This method detects orphaned
+        units (names matching ``<parent>_<int>_<int>``) and moves them
+        back inside their parent as :class:`SymbolUnit` entries.
+        """
+        _UNIT_SUFFIX = re.compile(r'^(.+)_(\d+)_(\d+)$')
+
+        # Build a lookup of parent symbols by name
+        parent_map: dict[str, SymbolDef] = {}
+        for sym in self.symbols:
+            if not _UNIT_SUFFIX.match(sym.name):
+                parent_map[sym.name] = sym
+
+        orphans_to_remove: list[str] = []
+
+        for sym in self.symbols:
+            m = _UNIT_SUFFIX.match(sym.name)
+            if not m:
+                continue
+            parent_name = m.group(1)
+            parent = parent_map.get(parent_name)
+            if parent is None:
+                continue
+            # Check if parent already has this unit
+            already_has = any(
+                u.unit_number == int(m.group(2)) and u.style == int(m.group(3))
+                for u in parent.units
+            )
+            if already_has:
+                continue
+            # Convert orphaned symbol into a SymbolUnit and attach
+            unit = SymbolUnit.from_tree(sym.raw_tree) if sym.raw_tree else SymbolUnit()
+            unit.unit_number = int(m.group(2))
+            unit.style = int(m.group(3))
+            parent.units.append(unit)
+            # Also inject into parent's raw_tree so to_tree() round-trips
+            if parent.raw_tree is not None and sym.raw_tree is not None:
+                parent.raw_tree.append(sym.raw_tree)
+            orphans_to_remove.append(sym.name)
+
+        if orphans_to_remove:
+            self.symbols = [
+                s for s in self.symbols if s.name not in set(orphans_to_remove)
+            ]

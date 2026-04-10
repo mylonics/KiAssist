@@ -417,6 +417,28 @@ export interface PyWebViewAPI {
   analyzer_fix_footprint_library: (inputPath: string, outputPath?: string) => Promise<AnalyzerFixResult>;
   analyzer_batch_scan: (libraries: AnalyzerLibEntry[]) => Promise<AnalyzerBatchScanResult>;
   analyzer_batch_fix: (libraries: AnalyzerLibEntry[]) => Promise<AnalyzerBatchFixResult>;
+  // Symbol field defaults
+  get_symbol_field_defaults: () => Promise<ApiResult & { fields?: Array<{ key: string; enabled: string | boolean; description?: string }> }>;
+  set_symbol_field_defaults: (fields: Array<{ key: string; enabled: string }>) => Promise<ApiResult>;
+  // Importer API
+  importer_lcsc_available: () => Promise<{ available: boolean }>;
+  importer_get_sym_libraries: () => Promise<ApiResult & { libraries?: Array<{ nickname: string; uri: string }> }>;
+  importer_get_fp_libraries: () => Promise<ApiResult & { libraries?: Array<{ nickname: string; uri: string }> }>;
+  importer_get_library_defaults: () => Promise<ApiResult & { sym_lib?: string; fp_lib?: string; models_dir?: string }>;
+  importer_browse_sym_library: () => Promise<ApiResult & { path?: string }>;
+  importer_browse_fp_library: () => Promise<ApiResult & { path?: string }>;
+  importer_browse_models_dir: () => Promise<ApiResult & { path?: string }>;
+  importer_browse_zips: () => Promise<ApiResult & { paths?: string[] }>;
+  importer_reload_libraries: () => Promise<ApiResult & { status?: unknown }>;
+  importer_import_progress: () => Promise<{ status?: string }>;
+  importer_library_index_status: () => Promise<{ ready: boolean; building: boolean; symbol_count: number; footprint_count: number; build_time: number; from_cache: boolean }>;
+  // Project context
+  get_raw_project_context: () => Promise<ApiResult & { context?: string }>;
+  get_synthesized_project_context: () => Promise<ApiResult & { context?: string }>;
+  get_cached_project_context: () => Promise<ApiResult & { raw?: string; synthesized?: string }>;
+  // Allow calling backend methods not yet fully typed above
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [method: string]: (...args: any[]) => Promise<any>;
 }
 
 declare global {

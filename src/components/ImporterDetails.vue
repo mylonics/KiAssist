@@ -4,6 +4,7 @@ import type { ImportedComponent } from '../types/importer';
 import KicadPreview from './KicadPreview.vue';
 import ModelPreview from './ModelPreview.vue';
 import { useAppSettings, FIELD_DESCRIPTIONS } from '../composables/useAppSettings';
+import { getApi } from '../composables/useApi';
 
 const {
   settings: appSettings,
@@ -414,7 +415,7 @@ onMounted(async () => {
   } else {
     // Fall back to backend API
     try {
-      const api = (window as any).pywebview?.api;
+      const api = getApi();
       if (api?.get_symbol_field_defaults) {
         const r = await api.get_symbol_field_defaults();
         if (r?.success && r.fields?.length) {
@@ -467,10 +468,6 @@ function removeField(index: number) {
 // -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
-
-function getApi() {
-  return (window as any).pywebview?.api ?? null;
-}
 
 // -----------------------------------------------------------------------
 // Post-import actions
@@ -1060,7 +1057,7 @@ async function doSaveToLibrary(
             <div v-if="selectedSymName" class="selector-badge">
               <span class="material-icons" style="font-size: 13px; color: var(--accent-color)">check_circle</span>
               <span class="selector-badge-name">{{ selectedSymName }}</span>
-              <button class="fp-btn" title="Clear" @click="resetSymbol"><span class="material-icons">close</span></button>
+              <button class="fp-btn" title="Clear" aria-label="Clear symbol" @click="resetSymbol"><span class="material-icons">close</span></button>
             </div>
             <div class="fp-search-input-row selector-search-row">
               <span class="material-icons fp-search-icon">search</span>
@@ -1099,7 +1096,7 @@ async function doSaveToLibrary(
             <div v-if="selectedFpName" class="selector-badge">
               <span class="material-icons" style="font-size: 13px; color: var(--accent-color)">check_circle</span>
               <span class="selector-badge-name">{{ selectedFpName }}</span>
-              <button class="fp-btn" title="Clear" @click="resetFootprint"><span class="material-icons">close</span></button>
+              <button class="fp-btn" title="Clear" aria-label="Clear footprint" @click="resetFootprint"><span class="material-icons">close</span></button>
             </div>
             <div class="fp-search-input-row selector-search-row">
               <span class="material-icons fp-search-icon">search</span>

@@ -1,15 +1,12 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onBeforeUnmount } from 'vue';
 import type { ImportedComponent } from '../types/importer';
 import { useAppSettings } from '../composables/useAppSettings';
+import { getApi } from '../composables/useApi';
 
 // -----------------------------------------------------------------------
 // API helper
 // -----------------------------------------------------------------------
-
-function getApi() {
-  return (window as any).pywebview?.api ?? null;
-}
 
 // -----------------------------------------------------------------------
 // Emits — same pattern as SymbolImporter
@@ -130,6 +127,10 @@ async function importVariant() {
     if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
   }
 }
+
+onBeforeUnmount(() => {
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+});
 </script>
 
 <template>

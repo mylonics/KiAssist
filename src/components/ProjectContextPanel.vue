@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue';
+import { getApi } from '../composables/useApi';
 
 const activeTab = ref<'raw' | 'synthesized'>('raw');
 const rawContext = ref<string>('');
@@ -13,14 +14,14 @@ async function loadRawContext() {
   loadingRaw.value = true;
   errorRaw.value = '';
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) {
       errorRaw.value = 'Backend not available';
       return;
     }
     const result = await api.get_raw_project_context();
     if (result.success) {
-      rawContext.value = result.context;
+      rawContext.value = result.context ?? '';
     } else {
       errorRaw.value = result.error || 'Failed to load raw context';
     }
@@ -35,14 +36,14 @@ async function loadSynthesizedContext() {
   loadingSynthesized.value = true;
   errorSynthesized.value = '';
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) {
       errorSynthesized.value = 'Backend not available';
       return;
     }
     const result = await api.get_synthesized_project_context();
     if (result.success) {
-      synthesizedContext.value = result.context;
+      synthesizedContext.value = result.context ?? '';
     } else {
       errorSynthesized.value = result.error || 'Failed to synthesize context';
     }
@@ -55,15 +56,15 @@ async function loadSynthesizedContext() {
 
 async function loadCached() {
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) return;
     const result = await api.get_cached_project_context();
     if (result.success) {
       if (result.raw) rawContext.value = result.raw;
       if (result.synthesized) synthesizedContext.value = result.synthesized;
     }
-  } catch {
-    // ignore
+  } catch (err) {
+    console.error('[ProjectContextPanel] Failed to load cached context:', err);
   }
 }
 

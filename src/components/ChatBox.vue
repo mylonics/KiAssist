@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, watch } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
+import DOMPurify from 'dompurify';
 import '../types/pywebview';
 import type { ProviderInfo, SessionInfo, ProviderModel, GemmaModelInfo, GemmaServerStatus, GemmaDownloadProgress } from '../types/pywebview';
 import type ApiActivityPanel from './ApiActivityPanel.vue';
 import type { ApiActivityEntry } from './ApiActivityPanel.vue';
+import { getApi } from '../composables/useApi';
 
 // Props: parent passes the activity panel ref
 const props = defineProps<{
@@ -257,7 +259,8 @@ function renderMarkdown(text: string, isUser: boolean = false): string {
   }
   // Protect math from the markdown parser, render markdown, then restore math
   const { text: protected_text, placeholders } = renderMath(text);
-  const html = marked.parse(protected_text) as string;
+  const rawHtml = marked.parse(protected_text) as string;
+  const html = DOMPurify.sanitize(rawHtml, { ADD_TAGS: ['span'], ADD_ATTR: ['class', 'style', 'aria-hidden'] });
   return restoreMath(html, placeholders);
 }
 
@@ -312,7 +315,7 @@ function clearMessages() {
   if (window.pywebview?.api) {
     trackedApiCall('new_chat_session', [], () =>
       window.pywebview!.api.new_chat_session()
-    ).catch(() => {});
+    ).catch((err) => console.error('[ChatBox] Failed to start new session:', err));
   }
 }
 
@@ -1174,6 +1177,13 @@ onMounted(() => {
   scrollToBottom();
 });
 
+onBeforeUnmount(() => {
+  if (gemmaDownloadPollTimer.value) {
+    clearInterval(gemmaDownloadPollTimer.value);
+    gemmaDownloadPollTimer.value = null;
+  }
+});
+
 /** Insert text into the chat input (called externally, e.g. from ComponentSearch). */
 function insertText(text: string) {
   inputMessage.value = text;
@@ -1257,7 +1267,7 @@ async function handleContextAnswer(overrideAnswer?: string) {
 
   isLoading.value = true;
   try {
-    const api = (window as any).pywebview?.api;
+    const api = getApi();
     if (!api) throw new Error('Backend not available');
 
     const result = await api.submit_context_answer(answer);
@@ -1322,7 +1332,7 @@ async function handleContextAnswer(overrideAnswer?: string) {
 
 /** Poll for the context lifecycle to finish after all answers submitted. */
 async function pollContextFinalization() {
-  const api = (window as any).pywebview?.api;
+  const api = getApi();
   if (!api) return;
 
   // The finalization runs in the background with streaming, so poll until
@@ -1819,16 +1829,16 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
           </span>
         </button>
         <div class="header-spacer"></div>
-        <button v-if="messages.length > 0" @click="copyChatHistory" class="icon-btn" :title="copiedChatHistory ? 'Copied!' : 'Copy chat history'">
+        <button v-if="messages.length > 0" @click="copyChatHistory" class="icon-btn" :title="copiedChatHistory ? 'Copied!' : 'Copy chat history'" :aria-label="copiedChatHistory ? 'Copied!' : 'Copy chat history'">
           <span class="material-icons">{{ copiedChatHistory ? 'check' : 'copy_all' }}</span>
         </button>
-        <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" :disabled="isLoading">
+        <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" aria-label="Clear chat" :disabled="isLoading">
           <span class="material-icons">delete_sweep</span>
         </button>
-        <button @click="openSessionsModal" class="icon-btn" title="Conversation sessions">
+        <button @click="openSessionsModal" class="icon-btn" title="Conversation sessions" aria-label="Conversation sessions">
           <span class="material-icons">history</span>
         </button>
-        <button @click="openSettings()" class="icon-btn" title="Settings">
+        <button @click="openSettings()" class="icon-btn" title="Settings" aria-label="Settings">
           <span class="material-icons">settings</span>
         </button>
       </div>

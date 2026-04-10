@@ -1527,3 +1527,184 @@ class TestAnalyzerWithRawStructure:
         struct = [i for i in report.issues if i.category == IssueCategory.STRUCTURE]
         # Either "unclosed" from raw check or "Parse error" from the parser
         assert len(struct) > 0
+
+
+class TestParseLenient:
+    """Tests for parse_lenient() which handles fragmented files."""
+
+    def test_clean_file_parsed_like_strict(self):
+        """A well-formed file should give the same result as parse()."""
+        from kiassist_utils.kicad_parser.sexpr import parse_lenient
+        text = _minimal_symbol_lib_text()
+        strict = parse(text)
+        lenient = parse_lenient(text)
+        assert strict == lenient
+
+    def test_fragmented_root_merged(self):
+        """Extra ')' mid-file creates fragments; parse_lenient merges them."""
+        from kiassist_utils.kicad_parser.sexpr import parse_lenient
+        # Build a file where the root closes early and properties leak out
+        text = (
+            '(kicad_symbol_lib (version 20231120) (generator "test")\n'
+            '  (symbol "A" (property "Reference" "R" (at 0 0 0)))\n'
+            ')\n'  # premature root close
+            '(symbol "B" (property "Reference" "U" (at 0 0 0)))\n'
+            ')\n'  # stray close
+        )
+        tree = parse_lenient(text)
+        assert tree[0] == "kicad_symbol_lib"
+        # Both symbols should be in the tree
+        syms = [t for t in tree if isinstance(t, list) and t and t[0] == "symbol"]
+        assert len(syms) == 2
+
+    def test_stray_close_parens_skipped(self):
+        """Stray ')' between fragments should be silently skipped."""
+        from kiassist_utils.kicad_parser.sexpr import parse_lenient
+        text = '(root (child "a")) ) ) (extra "b")'
+        tree = parse_lenient(text)
+        assert tree[0] == "root"
+        # The extra expression should be merged in
+        assert any(isinstance(t, list) and t == ["extra", QStr("b")] for t in tree)
+
+
+class TestValidateStructurePrematureClose:
+    """Tests for enhanced validate_structure detecting premature root closures."""
+
+    def test_premature_close_detected(self):
+        """File balanced but root closes mid-file should be flagged."""
+        # Balanced file: 5 opens, 5 closes, but root closes after symbol A
+        text = (
+            '(kicad_symbol_lib (version 20231120) (generator "test")\n'
+            '  (symbol "A")\n'
+            ')\n'  # root closes — premature
+            '(symbol "B")\n'  # orphaned fragment at depth 0
+        )
+        valid, msg = _RawTextAnalysis.validate_structure(text)
+        assert not valid
+        assert "prematurely" in msg.lower()
+
+    def test_clean_file_valid(self):
+        text = _minimal_symbol_lib_text()
+        valid, msg = _RawTextAnalysis.validate_structure(text)
+        assert valid
+
+
+class TestIterativeFixPrematureClose:
+    """Tests for iterative_fix_stray_parens Phase 1.5 (premature root closure)."""
+
+    def test_removes_premature_root_close(self):
+        """Extra ')' causing premature root closure should be removed."""
+        # Balanced file with premature root closure
+        text = (
+            '(kicad_symbol_lib (version 20231120) (generator "test")\n'
+            '  (symbol "A")\n'
+            ')\n'  # premature root close
+            '(symbol "B")\n'
+        )
+        fixed, count = _RawTextAnalysis.iterative_fix_stray_parens(text)
+        assert count >= 1
+        # Result should parse strictly (root closure moved to end)
+        tree = parse(fixed)
+        assert tree[0] == "kicad_symbol_lib"
+        syms = [t for t in tree if isinstance(t, list) and t and t[0] == "symbol"]
+        assert len(syms) == 2
+
+
+class TestReassembleFragments:
+    """Tests for SymbolLibrary._reassemble_fragments()."""
+
+    def test_orphaned_units_reattached(self):
+        """Sub-symbols at root level should be merged back into parent."""
+        from kiassist_utils.kicad_parser.sexpr import parse_lenient
+        text = (
+            '(kicad_symbol_lib (version 20231120) (generator "test")\n'
+            '  (symbol "SW1"\n'
+            '    (property "Reference" "SW" (at 0 0 0))\n'
+            '  )\n'
+            ')\n'  # premature root close
+            '(symbol "SW1_0_1"\n'
+            '  (rectangle (start -1 -2) (end 1 2)\n'
+            '    (stroke (width 0.1) (type default))\n'
+            '    (fill (type none))\n'
+            '  )\n'
+            ')\n'
+            '(symbol "SW1_1_1"\n'
+            '  (pin passive line (at 0 3 270) (length 1)\n'
+            '    (name "~" (effects (font (size 1.27 1.27))))\n'
+            '    (number "1" (effects (font (size 1.27 1.27))))\n'
+            '  )\n'
+            ')\n'
+        )
+        tree = parse_lenient(text)
+        lib = SymbolLibrary._from_tree(tree)
+        lib._reassemble_fragments()
+
+        assert len(lib.symbols) == 1
+        sym = lib.symbols[0]
+        assert sym.name == "SW1"
+        assert len(sym.units) == 2
+
+    def test_no_reassembly_for_clean_lib(self):
+        """A clean library should not be modified by reassembly."""
+        text = _minimal_symbol_lib_text(symbols=_make_symbol_text("R"))
+        tree = parse(text)
+        lib = SymbolLibrary._from_tree(tree)
+        original_count = len(lib.symbols)
+        lib._reassemble_fragments()
+        assert len(lib.symbols) == original_count
+
+    def test_load_with_reassembly(self, tmp_path):
+        """SymbolLibrary.load() should reassemble fragments transparently."""
+        # Write a corrupted file
+        text = (
+            '(kicad_symbol_lib (version 20231120) (generator "test")\n'
+            '  (symbol "IC1"\n'
+            '    (property "Reference" "U" (at 0 0 0))\n'
+            '  )\n'
+            ')\n'  # premature root close
+            '(symbol "IC1_0_1")\n'
+            '(symbol "IC1_1_1"\n'
+            '  (pin input line (at 0 0 0) (length 2.54)\n'
+            '    (name "IN" (effects (font (size 1.27 1.27))))\n'
+            '    (number "1" (effects (font (size 1.27 1.27))))\n'
+            '  )\n'
+            ')\n'
+        )
+        f = tmp_path / "test.kicad_sym"
+        f.write_text(text, encoding="utf-8")
+
+        lib = SymbolLibrary.load(f)
+        assert len(lib.symbols) == 1
+        assert lib.symbols[0].name == "IC1"
+        assert len(lib.symbols[0].units) == 2
+
+
+class TestFixSymbolLibraryFragmented:
+    """Test fix_symbol_library on files with premature root closure."""
+
+    def test_fix_fragmented_library(self, tmp_path):
+        text = (
+            '(kicad_symbol_lib (version 20231120) (generator "test")\n'
+            '  (symbol "SW1"\n'
+            '    (property "Reference" "SW" (at 0 0 0))\n'
+            '  )\n'
+            ')\n'
+            '(symbol "SW1_0_1")\n'
+            '(symbol "SW1_1_1")\n'
+        )
+        src = tmp_path / "broken.kicad_sym"
+        src.write_text(text, encoding="utf-8")
+        out = tmp_path / "fixed.kicad_sym"
+
+        analyzer = LibraryAnalyzer()
+        fixes = analyzer.fix_symbol_library(src, out)
+        assert fixes >= 1
+
+        # Output should be valid and parseable
+        output_text = out.read_text(encoding="utf-8")
+        ok, _ = _RawTextAnalysis.validate_structure(output_text)
+        assert ok
+
+        lib = SymbolLibrary.load(out)
+        assert len(lib.symbols) == 1
+        assert lib.symbols[0].name == "SW1"

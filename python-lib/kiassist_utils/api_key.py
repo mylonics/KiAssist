@@ -22,9 +22,13 @@ sensitive credentials) and persisted only to the config file.
 
 import os
 import json
+import logging
+import warnings
 import keyring
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Provider metadata
@@ -80,7 +84,17 @@ class ApiKeyStore:
 
     @_memory_key.setter
     def _memory_key(self, value: Optional[str]) -> None:
-        """Backward-compatible single-key setter (Gemini)."""
+        """Backward-compatible single-key setter (Gemini).
+
+        .. deprecated::
+            Use ``set_api_key(value, provider="gemini")`` instead.
+        """
+        warnings.warn(
+            "Direct _memory_key assignment is deprecated. "
+            "Use set_api_key(value, provider='gemini') instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._memory_keys["gemini"] = value
     
     def _get_config_path(self) -> Path:
@@ -376,6 +390,21 @@ class ApiKeyStore:
         if not persisted:
             if self._save_to_file(api_key, p):
                 persisted = True
+                if p not in _FILE_ONLY_PROVIDERS:
+                    logger.warning(
+                        "OS keyring unavailable for provider %r; API key stored "
+                        "in plaintext config file at %s. Consider setting the "
+                        "%s environment variable instead for better security.",
+                        p,
+                        self._get_config_path(),
+                        self._get_env_var(p),
+                    )
+                    warning = (
+                        "OS keyring unavailable. API key stored in config file "
+                        f"(~/{self.CONFIG_DIR_NAME}/{self.CONFIG_FILE_NAME}). "
+                        f"For better security, set the {self._get_env_var(p)} "
+                        "environment variable instead."
+                    )
             else:
                 warning = "Value saved to memory only. It will not persist after restart."
 

@@ -30,7 +30,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from .sexpr import QStr, SExpr, parse, serialize
+from .sexpr import QStr, SExpr, parse, parse_lenient, serialize
 from .models import Effects, Position, Property, KiUUID
 from .symbol_lib import Pin, SymbolDef, SymbolLibrary, SymbolUnit
 from .footprint import Footprint, Pad, FootprintGraphic
@@ -401,23 +401,63 @@ class _RawTextAnalysis:
 
     @staticmethod
     def validate_structure(text: str) -> Tuple[bool, str]:
-        """Quick validation: balanced and no negative depth.
+        """Quick validation: balanced, no negative depth, single root.
+
+        A valid KiCad file has exactly one top-level S-expression, so depth
+        should reach zero only at the very end of meaningful content.
 
         Returns:
             (is_valid, message)
         """
         r = _RawTextAnalysis.analyze_depth_per_line(text)
-        if r.is_structurally_sound:
-            return True, "Structure is valid"
         problems = []
-        if r.imbalance > 0:
-            problems.append(f"{r.imbalance} unclosed parenthesis(es)")
-        elif r.imbalance < 0:
-            problems.append(f"{abs(r.imbalance)} extra closing parenthesis(es)")
-        if r.negative_depth_lines:
-            nl = r.negative_depth_lines[:5]
-            problems.append(f"Negative depth at line(s): {nl}")
+        if not r.is_structurally_sound:
+            if r.imbalance > 0:
+                problems.append(f"{r.imbalance} unclosed parenthesis(es)")
+            elif r.imbalance < 0:
+                problems.append(f"{abs(r.imbalance)} extra closing parenthesis(es)")
+            if r.negative_depth_lines:
+                nl = r.negative_depth_lines[:5]
+                problems.append(f"Negative depth at line(s): {nl}")
+
+        # Check for premature root closure (depth reaches 0 mid-file).
+        # This detects files where extra ')' cause the root expression to
+        # close early, leaving orphaned fragments.
+        if r.is_balanced and not problems:
+            premature = _RawTextAnalysis._find_premature_root_closures(r)
+            if premature:
+                problems.append(
+                    f"Root expression closes prematurely {len(premature)} time(s) "
+                    f"(first at line {premature[0]})"
+                )
+
+        if not problems:
+            return True, "Structure is valid"
         return False, "; ".join(problems)
+
+    @staticmethod
+    def _find_premature_root_closures(report: "_RawTextReport") -> List[int]:
+        """Return line numbers where depth reaches 0 before the last content line.
+
+        A well-formed KiCad file has exactly one root S-expression, so depth
+        should only touch 0 on the very last meaningful line.  If it touches
+        0 earlier, an extra ``)`̀` closed the root prematurely.
+        """
+        # Find the last line with actual content (non-whitespace)
+        last_content_line = 0
+        for info in reversed(report.line_depths):
+            if info.text.strip():
+                last_content_line = info.line_number
+                break
+
+        premature: List[int] = []
+        for info in report.line_depths:
+            if info.line_number >= last_content_line:
+                break
+            # Depth reached 0 on this line and there is more content after
+            if info.depth_after == 0 and info.depth_before > 0:
+                premature.append(info.line_number)
+        return premature
 
     @staticmethod
     def find_stray_close_candidates(text: str) -> List[Tuple[int, str]]:
@@ -505,6 +545,76 @@ class _RawTextAnalysis:
             if not lines[target_line].strip():
                 lines.pop(target_line)
 
+            removals += 1
+
+        # Pass 1.5: fix premature root closures.
+        # When extra ')' chars cause the root expression to close before
+        # the end of content, we iteratively remove the ')' that brings
+        # depth to 0 mid-file.  Each removal may shift depth for all
+        # subsequent lines, so we re-scan from scratch each time.
+        # After each removal we append a ')' at the very end to keep
+        # the file balanced (the removed ')' was structural, so we need
+        # a replacement at the correct position — i.e. the file's end).
+        premature_fixes = 0
+        for _ in range(max_iterations):
+            # Scan through lines to find the first premature root closure.
+            depth = 0
+            in_string = False
+            prev_backslash = False
+            target_line_idx = -1
+            target_char_pos = -1
+            last_content_line = -1
+
+            # First find the last line with content
+            for li in range(len(lines) - 1, -1, -1):
+                if lines[li].strip():
+                    last_content_line = li
+                    break
+
+            if last_content_line < 0:
+                break
+
+            for line_idx, line in enumerate(lines):
+                found = False
+                in_string = False
+                prev_backslash = False
+                for char_idx, ch in enumerate(line):
+                    if in_string:
+                        if prev_backslash:
+                            prev_backslash = False
+                            continue
+                        if ch == '\\':
+                            prev_backslash = True
+                        elif ch == '"':
+                            in_string = False
+                    else:
+                        if ch == '"':
+                            in_string = True
+                        elif ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                            if depth == 0 and line_idx < last_content_line:
+                                target_line_idx = line_idx
+                                target_char_pos = char_idx
+                                found = True
+                                break
+                if found:
+                    break
+
+            if target_line_idx < 0:
+                break  # No premature root closure found
+
+            old_line = lines[target_line_idx]
+            lines[target_line_idx] = (
+                old_line[:target_char_pos]
+                + old_line[target_char_pos + 1:]
+            )
+            if not lines[target_line_idx].strip():
+                lines.pop(target_line_idx)
+            # Append a compensating ')' at the end so balance is preserved.
+            lines.append(")")
+            premature_fixes += 1
             removals += 1
 
         # Pass 2: handle unclosed parens (more opens than closes).
@@ -1849,6 +1959,17 @@ class LibraryAnalyzer:
         try:
             tree = parse(text)
             lib = SymbolLibrary._from_tree(tree)
+        except ValueError:
+            # Fall back to lenient parsing for fragmented files
+            try:
+                tree = parse_lenient(text)
+                lib = SymbolLibrary._from_tree(tree)
+            except Exception as exc:
+                report.issues.append(Issue(
+                    Severity.ERROR, IssueCategory.STRUCTURE, name,
+                    f"Parse error: {exc}",
+                ))
+                return report
         except Exception as exc:
             report.issues.append(Issue(
                 Severity.ERROR, IssueCategory.STRUCTURE, name,
@@ -1918,15 +2039,27 @@ class LibraryAnalyzer:
 
         # If raw-text fixes were applied, re-read from the fixed text
         if raw_fix_count > 0:
-            # Validate the raw-fixed text before proceeding
+            # Validate the raw-fixed text before proceeding.
+            # Note: premature-root-closure removal may leave the file
+            # unbalanced (more opens than closes).  In that case fall
+            # through to lenient parsing which merges fragments.
             valid, msg = _RawTextAnalysis.validate_structure(raw_fixed)
-            if not valid:
-                raise StructuralValidationError(
-                    f"Raw-text repair did not produce a valid structure: {msg}"
-                )
-            lib = SymbolLibrary._from_tree(parse(raw_fixed))
+            if valid:
+                lib = SymbolLibrary._from_tree(parse(raw_fixed))
+            else:
+                # Try lenient parsing on the partially-repaired text
+                try:
+                    lib = SymbolLibrary._from_tree(parse_lenient(raw_fixed))
+                except Exception:
+                    raise StructuralValidationError(
+                        f"Raw-text repair did not produce a valid structure: {msg}"
+                    )
         else:
-            lib = SymbolLibrary.load(input_path)
+            # No raw-text fixes — try strict parse, fall back to lenient
+            try:
+                lib = SymbolLibrary.load(input_path)
+            except ValueError:
+                lib = SymbolLibrary._from_tree(parse_lenient(raw_text))
 
         # Phase 2: semantic fixes
         semantic_fixed = self._apply_symbol_fixes(lib)
