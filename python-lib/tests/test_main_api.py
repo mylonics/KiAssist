@@ -819,3 +819,110 @@ class TestMCPToolSchemaCache:
         second = api._get_mcp_tool_schemas(focused_agent=None)
         # Must return the same cached list object on second call.
         assert first is second
+
+
+# ===========================================================================
+# Tests: ContextWindowManager wiring (Phase 3)
+# ===========================================================================
+
+class TestContextWindowManagerWiring:
+    def test_returns_none_for_provider_without_window(self, api):
+        # _FakeProvider doesn't implement get_context_window
+        fake = _FakeProvider("hi")
+        mgr = api._get_context_window_manager(fake)
+        assert mgr is None
+
+    def test_caches_manager_per_model(self, api):
+        from kiassist_utils.ai.base import AIProvider
+
+        class _SizedProvider:
+            def get_context_window(self): return 32_768
+
+        api.current_provider_name = "x"
+        api.current_model = "y"
+        m1 = api._get_context_window_manager(_SizedProvider())
+        m2 = api._get_context_window_manager(_SizedProvider())
+        assert m1 is m2
+        assert m1.context_window == 32_768
+
+    def test_rebuilds_manager_when_window_changes(self, api):
+        api.current_provider_name = "x"
+        api.current_model = "y"
+
+        class _Provider1:
+            def get_context_window(self): return 8000
+        class _Provider2:
+            def get_context_window(self): return 32_000
+
+        m1 = api._get_context_window_manager(_Provider1())
+        m2 = api._get_context_window_manager(_Provider2())
+        assert m1 is not m2
+        assert m2.context_window == 32_000
+
+
+class TestConversationHistoryTokenAware:
+    def test_history_replays_tool_calls_and_results(self, api, tmp_path):
+        """`_build_conversation_messages` must NOT drop tool turns —
+        Phase 3 critical regression test."""
+        from kiassist_utils.context.history import ConversationStore
+        from kiassist_utils.ai.base import AIMessage, AIToolCall, AIToolResult
+
+        api._current_project_path = str(tmp_path)
+        store = ConversationStore(tmp_path)
+        sid = store.new_session()
+        store.append(sid, AIMessage(role="user", content="add a resistor"))
+        store.append(sid, AIMessage(
+            role="assistant", content="",
+            tool_calls=[AIToolCall(id="c1", name="schematic_add_symbol",
+                                   arguments={"path": "x"})],
+        ))
+        store.append(sid, AIMessage(
+            role="tool",
+            tool_results=[AIToolResult(
+                tool_call_id="c1", content='{"status":"ok"}', is_error=False,
+            )],
+        ))
+        store.append(sid, AIMessage(role="assistant", content="Done."))
+
+        msgs = api._build_conversation_messages(store, sid)
+        roles = [m.role for m in msgs]
+        # All four messages must replay, including the tool turn.
+        assert roles == ["user", "assistant", "tool", "assistant"]
+        # Tool calls and results round-trip intact.
+        assert msgs[1].tool_calls and msgs[1].tool_calls[0].name == "schematic_add_symbol"
+        assert msgs[2].tool_results and msgs[2].tool_results[0].tool_call_id == "c1"
+
+    def test_token_aware_trim_drops_high_token_tool_results_first(
+        self, api, tmp_path,
+    ):
+        from kiassist_utils.context.history import ConversationStore
+        from kiassist_utils.context.tokens import ContextWindowManager
+        from kiassist_utils.ai.base import AIMessage, AIToolCall, AIToolResult
+
+        store = ConversationStore(tmp_path)
+        sid = store.new_session()
+        # Three tool turns with very different token costs.
+        store.append(sid, AIMessage(role="user", content="hi"), token_count=10)
+        for cid, big_tokens in [("c1", 9000), ("c2", 100), ("c3", 9000)]:
+            store.append(sid, AIMessage(
+                role="assistant",
+                tool_calls=[AIToolCall(id=cid, name="t", arguments={})],
+            ), token_count=5)
+            store.append(sid, AIMessage(
+                role="tool",
+                tool_results=[AIToolResult(
+                    tool_call_id=cid, content="x", is_error=False,
+                )],
+            ), token_count=big_tokens)
+        store.append(sid, AIMessage(role="assistant", content="ok"), token_count=20)
+
+        # Tiny window forces aggressive trim.
+        ctx_mgr = ContextWindowManager(
+            context_window=10_000, summarize_threshold=0.8,
+        )
+        result = api._build_conversation_messages(store, sid, ctx_mgr=ctx_mgr)
+        # The two 9000-token tool results must be dropped first.  The
+        # 100-token one and the assistant turns should remain.
+        tool_turns = [m for m in result if m.role == "tool"]
+        assert len(tool_turns) == 1
+        assert tool_turns[0].tool_results[0].tool_call_id == "c2"

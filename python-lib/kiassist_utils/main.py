@@ -34,6 +34,7 @@ from .kicad_schematic import inject_test_note, is_schematic_api_available
 from .context.history import ConversationStore
 from .context.prompts import SystemPromptBuilder
 from .context.requirements import RequirementsManager, ContextState
+from .context.tokens import ContextWindowManager, usage_to_tokens
 from .ai.llm_logger import llm_logger
 from .config_keys import ConfigKeys
 
@@ -157,6 +158,9 @@ class KiAssistAPI:
         # Keyed by focused-agent name; a single ``__all__`` entry holds
         # the full unfiltered list.
         self._mcp_tool_schemas_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # ContextWindowManager is provider-specific; cache one per
+        # provider name so we don't pay for re-instantiation each turn.
+        self._ctx_managers: Dict[str, "ContextWindowManager"] = {}
         # Project context caches (cleared on project switch / new session)
         self._raw_context_cache: Optional[str] = None
         self._synthesized_context_cache: Optional[str] = None
@@ -763,10 +767,36 @@ class KiAssistAPI:
         self._mcp_tool_schemas_cache[cache_key] = filtered
         return filtered
 
+    def _get_context_window_manager(
+        self, provider: AIProvider
+    ) -> Optional[ContextWindowManager]:
+        """Return a cached :class:`ContextWindowManager` sized to *provider*.
+
+        Falls back to ``None`` if the provider doesn't expose a context
+        window (very old providers or stubbed test fakes).  In that case
+        the caller skips token-aware trimming and relies on the simple
+        ``MAX_HISTORY_TURNS`` fallback in ``_build_conversation_messages``.
+        """
+        try:
+            window = provider.get_context_window()
+        except Exception:
+            return None
+        if not window or window <= 0:
+            return None
+        # Cache key includes the model so model switches build a fresh
+        # manager for the new window size.
+        key = f"{self.current_provider_name}:{self.current_model}"
+        mgr = self._ctx_managers.get(key)
+        if mgr is None or mgr.context_window != window:
+            mgr = ContextWindowManager.from_provider(provider)
+            self._ctx_managers[key] = mgr
+        return mgr
+
     def _build_conversation_messages(
         self,
         store: "ConversationStore",
         session_id: str,
+        ctx_mgr: Optional["ContextWindowManager"] = None,
     ) -> List[AIMessage]:
         """Build the full message list from conversation history in the session store.
 
@@ -774,38 +804,75 @@ class KiAssistAPI:
         calling this method—it will be included in the loaded messages.
         Returns the full structured history (including assistant tool_calls and
         tool result messages) so the agent retains its working memory across
-        turns.  When no :class:`ContextWindowManager` is wired in, falls back
-        to a hard cap of the last ``MAX_HISTORY_TURNS`` turns to avoid blowing
-        the context window.
+        turns.
+
+        When *ctx_mgr* is provided, persisted ``token_count`` values from the
+        history file drive smarter trimming: the oldest *tool* messages with
+        the highest token cost are dropped first (instead of a naïve oldest-N
+        slice), and the trim only fires once the budget is exceeded.  When
+        *ctx_mgr* is ``None``, falls back to a hard cap of the last
+        ``MAX_HISTORY_TURNS`` turns.
 
         Args:
             store: The conversation store instance.
             session_id: Current session ID.
+            ctx_mgr: Optional :class:`ContextWindowManager` for token-aware trimming.
 
         Returns:
             Ordered list of :class:`AIMessage` for the AI provider.
         """
         history: List[AIMessage] = []
+        # Parallel list of per-message token counts (0 when unknown).
+        token_counts: List[int] = []
         try:
-            stored_messages = store.load_session(session_id)
-            for m in stored_messages:
-                # Keep every role.  Skip empty user/assistant text-only
-                # messages (these can occur from cancelled streams) but
-                # always keep messages that carry tool_calls / tool_results.
-                if m.role in ("user", "assistant") and not m.content and not m.tool_calls:
+            # Load raw entries so we can read the persisted token_count.
+            from .context.history import _entry_to_message  # type: ignore
+            entries = [
+                e for e in store._iter_entries()  # noqa: SLF001
+                if e.get("session_id") == session_id
+            ]
+            for entry in entries:
+                msg = _entry_to_message(entry)
+                if msg.role in ("user", "assistant") and not msg.content and not msg.tool_calls:
                     continue
-                history.append(m)
+                history.append(msg)
+                token_counts.append(int(entry.get("token_count", 0) or 0))
         except Exception as exc:
             logger.debug("Failed to load session history: %s", exc)
 
-        # Fallback hard cap: keep the most recent N turns.  When a
-        # ContextWindowManager is wired in (Phase 3), it will replace this
-        # crude trim with token-aware summarisation; until then this stops
-        # the prompt from growing unbounded.
+        if not history:
+            return history
+
+        # Token-aware trim path.  We drop oldest *tool* messages with the
+        # highest token counts first, since they are usually cheap to
+        # regenerate and the most context-bloating part of the history.
+        if ctx_mgr is not None:
+            budget = int(ctx_mgr.context_window * ctx_mgr._summarize_threshold)  # noqa: SLF001
+            total = sum(token_counts)
+            if total > budget:
+                # Build (idx, tokens) pairs for tool turns only, sorted by
+                # tokens descending then by index ascending (oldest first).
+                tool_idx = sorted(
+                    (
+                        (i, token_counts[i])
+                        for i, m in enumerate(history)
+                        if m.role == "tool" and token_counts[i] > 0
+                    ),
+                    key=lambda p: (-p[1], p[0]),
+                )
+                drop: set = set()
+                for idx, tokens in tool_idx:
+                    if total <= budget:
+                        break
+                    drop.add(idx)
+                    total -= tokens
+                if drop:
+                    history = [m for i, m in enumerate(history) if i not in drop]
+
+        # Fallback hard cap: keep the most recent N turns.  Always applied
+        # as a defence-in-depth even when ctx_mgr trimmed above.
         MAX_HISTORY_TURNS = 40
         if len(history) > MAX_HISTORY_TURNS:
-            # Walk back from the end keeping intact assistant→tool pairs so
-            # the model never sees a tool result without its tool_call.
             history = history[-MAX_HISTORY_TURNS:]
             # If the trimmed window starts with an orphaned tool message,
             # drop it so the conversation begins on a clean boundary.
@@ -1369,8 +1436,13 @@ class KiAssistAPI:
                 system_prompt = None
             else:
                 # Build full conversation history (the new user message is
-                # already persisted above and will be included)
-                msgs = self._build_conversation_messages(store, session_id)
+                # already persisted above and will be included).  The
+                # ContextWindowManager (when available) drives smarter
+                # token-aware trimming inside _build_conversation_messages.
+                ctx_mgr_for_history = self._get_context_window_manager(provider)
+                msgs = self._build_conversation_messages(
+                    store, session_id, ctx_mgr=ctx_mgr_for_history,
+                )
                 system_prompt = self._build_system_prompt()
             cancel_event = self._stream_cancel
 
@@ -1399,6 +1471,11 @@ class KiAssistAPI:
                 system_prompt=system_prompt,
                 is_stream=True,
             )
+
+            # Token-aware context manager (Phase 3): trims oversized tool
+            # results and summarises the conversation when token usage
+            # crosses ~80 % of the provider window.  ``None`` for fakes.
+            ctx_mgr = self._get_context_window_manager(provider)
 
             # Maximum number of tool-call round-trips before giving up.
             # Increased from 5 (web_search-only loop) to 20 because real
@@ -1486,6 +1563,11 @@ class KiAssistAPI:
                                 content, is_error = await self._execute_mcp_tool(
                                     tc.name, tc.arguments,
                                 )
+                                # Token-aware trim: large tool results
+                                # (e.g. a full schematic dump) are clipped
+                                # so they don't blow the context window.
+                                if ctx_mgr is not None:
+                                    content = ctx_mgr.trim_tool_result(content)
                                 tool_results.append(AIToolResult(
                                     tool_call_id=tc.id,
                                     content=content,
@@ -1515,6 +1597,23 @@ class KiAssistAPI:
                             with self._stream_lock:
                                 self._stream_buffer = ""
 
+                            # Record token usage for this round and
+                            # opportunistically summarise older history
+                            # when we cross the ~80 % threshold.
+                            if ctx_mgr is not None:
+                                if last_usage:
+                                    ctx_mgr.track_usage(last_usage)
+                                if ctx_mgr.is_near_limit():
+                                    try:
+                                        msgs = ctx_mgr.maybe_summarize(
+                                            msgs, provider, system_prompt,
+                                        )
+                                    except Exception as sum_exc:
+                                        logger.debug(
+                                            "Auto-summarise failed: %s",
+                                            sum_exc,
+                                        )
+
                     except Exception as exc:
                         with self._stream_lock:
                             self._stream_error = str(exc)
@@ -1528,9 +1627,14 @@ class KiAssistAPI:
                         # Persist the assembled assistant response
                         if final_text:
                             try:
+                                tokens = (
+                                    usage_to_tokens(last_usage)
+                                    if last_usage else 0
+                                )
                                 store.append(
                                     session_id,
                                     AIMessage(role="assistant", content=final_text),
+                                    token_count=tokens,
                                 )
                             except Exception as persist_exc:
                                 logger.warning(
