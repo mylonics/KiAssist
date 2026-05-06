@@ -578,6 +578,27 @@ class KiAssistAPI:
             self.current_model = effective_model
         return provider
 
+    def _get_or_create_secondary_provider(self) -> Optional[AIProvider]:
+        """Return the cheap "secondary" provider, creating it on first use.
+
+        The secondary provider is intended for low-priority background work
+        (project-context synthesis, summarisation, classification) where the
+        cost / latency of the primary model would be wasteful.  Falls back
+        to the primary provider when no secondary is configured.
+        """
+        if self.secondary_provider is not None:
+            return self.secondary_provider
+        try:
+            provider = self._create_provider(
+                self.secondary_provider_name, self.secondary_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to create secondary provider: %s", exc)
+            provider = None
+        if provider is not None:
+            self.secondary_provider = provider
+        return provider
+
     def _send_to_ai(self, prompt: str, model: Optional[str] = None) -> str:
         """Send a single-turn prompt to the current AI provider.
 
@@ -615,6 +636,27 @@ class KiAssistAPI:
         except Exception as exc:
             llm_logger.finish(log_id, error=str(exc))
             raise
+
+    def _get_pending_requirements_questions(self) -> List[str]:
+        """Return any RequirementsManager questions awaiting a user reply.
+
+        When the manager is in ``QUERYING_USER`` state, returns the list
+        of pending questions; otherwise returns ``[]``.  Errors are
+        swallowed so the caller can use this from the system-prompt build
+        path safely.
+        """
+        if not self._current_project_path:
+            return []
+        try:
+            mgr = self._requirements_manager
+            if mgr is None:
+                return []
+            req = mgr.load_or_create()
+            if req.state == ContextState.QUERYING_USER and req.pending_questions:
+                return list(req.pending_questions)
+        except Exception:  # noqa: BLE001
+            return []
+        return []
 
     def _build_system_prompt(self) -> Optional[str]:
         """Build a system prompt including project/PCB context.
@@ -664,6 +706,21 @@ class KiAssistAPI:
             dynamic_parts.append(
                 "## Synthesized Project Context\n\n" + self._synthesized_context_cache
             )
+
+        # Phase 4 — when the RequirementsManager is in QUERYING_USER state,
+        # surface its pending questions inline in the system prompt so the
+        # agent asks them in chat instead of relying on the side-panel UI.
+        try:
+            req = self._get_pending_requirements_questions()
+            if req:
+                dynamic_parts.append(
+                    "## Pending project clarification questions\n"
+                    "Before suggesting design decisions, please ask the user "
+                    "the following questions and incorporate their answers:\n"
+                    + "\n".join(f"- {q}" for q in req)
+                )
+        except Exception:
+            pass
 
         dynamic_context = "\n\n".join(dynamic_parts) if dynamic_parts else None
 
@@ -1849,6 +1906,7 @@ class KiAssistAPI:
             # Clear cached project context
             self._raw_context_cache = None
             self._synthesized_context_cache = None
+            self._project_header_cache = None
             # Reset context lifecycle state for the new project
             self._context_lifecycle = self._default_lifecycle_state()
             self._requirements_manager = None
@@ -1858,9 +1916,169 @@ class KiAssistAPI:
             project_dir = str(Path(new_path).parent) if new_path else None
             self._library_index.set_project_dir(project_dir)
             self._library_index.rebuild_async()
+
+            # Phase 4 — auto-build the tiny project header *and* lazily
+            # warm the raw-context cache (with disk persistence keyed by
+            # file mtimes).  The header is cheap (~milliseconds) so we
+            # build it synchronously; the heavier raw-context build runs
+            # in the background.
+            try:
+                self._project_header_cache = self._build_project_header(new_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to build project header: %s", exc)
+
+            try:
+                threading.Thread(
+                    target=self._warm_raw_context_cache,
+                    args=(new_path,),
+                    daemon=True,
+                ).start()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to warm raw context cache: %s", exc)
             return {"success": True}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Project context helpers (Phase 4 — two-tier strategy)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_project_header(project_path: str) -> str:
+        """Build the always-injected, tiny project header.
+
+        Includes only headline data: project name, sheet count, BOM size,
+        and the first 1500 chars of any ``KIASSIST.md`` memory file.  The
+        full synthesized blob remains available via the
+        ``project_get_context`` MCP tool that the agent can call on demand.
+        Total budget: <2000 chars.
+
+        Args:
+            project_path: Path to ``.kicad_pro`` or project directory.
+
+        Returns:
+            Markdown header string.
+        """
+        p = Path(project_path)
+        project_dir = p.parent if p.is_file() else p
+        name = (
+            p.stem if p.suffix == ".kicad_pro"
+            else project_dir.name
+        )
+        # Best-effort sheet & BOM counts.  Errors fall through to "?".
+        sheet_count = 0
+        bom_size = 0
+        try:
+            schematics = list(project_dir.rglob("*.kicad_sch"))
+            sheet_count = len(schematics)
+            for sch_path in schematics:
+                try:
+                    from .kicad_parser.schematic import Schematic
+                    sch = Schematic.load(sch_path)
+                    bom_size += len(sch.symbols)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        lines = [
+            "## Active Project",
+            f"- **Name:** {name}",
+            f"- **Path:** `{project_dir}`",
+            f"- **Sheet count:** {sheet_count}",
+            f"- **BOM size:** {bom_size} component instance(s)",
+            "",
+            "_Call the `project_get_context` MCP tool for the full project "
+            "summary, or `schematic_query` to ask specific questions._",
+        ]
+
+        # Inject KIASSIST.md memory file if present.
+        memory_file = project_dir / "KIASSIST.md"
+        if memory_file.is_file():
+            try:
+                memory_text = memory_file.read_text(encoding="utf-8")
+                if len(memory_text) > 1500:
+                    memory_text = memory_text[:1500] + "\n_…(truncated)_"
+                lines.append("")
+                lines.append("### Project Memory (KIASSIST.md)")
+                lines.append(memory_text)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _project_mtime_signature(project_path: str) -> str:
+        """Return a deterministic signature of all project file mtimes.
+
+        Used as the cache key for the on-disk raw-context cache so the
+        cache is invalidated whenever any tracked file changes.
+        """
+        p = Path(project_path)
+        project_dir = p.parent if p.is_file() else p
+        parts: List[str] = []
+        for pattern in ("*.kicad_pro", "*.kicad_sch", "*.kicad_pcb",
+                        "*.kicad_dru"):
+            for f in sorted(project_dir.rglob(pattern)):
+                try:
+                    parts.append(f"{f.relative_to(project_dir)}:{f.stat().st_mtime_ns}")
+                except (OSError, ValueError):
+                    continue
+        import hashlib as _hashlib
+        return _hashlib.sha256(
+            "\n".join(parts).encode("utf-8")
+        ).hexdigest()
+
+    def _warm_raw_context_cache(self, project_path: str) -> None:
+        """Background helper: build (or load) the raw project context.
+
+        Persists to ``<project>/.kiassist/context.json`` keyed by an
+        mtime-based signature so subsequent app launches reuse the cache
+        when the project hasn't changed.  Silent on failure — the cache
+        is purely an optimisation.
+        """
+        try:
+            p = Path(project_path)
+            project_dir = p.parent if p.is_file() else p
+            cache_dir = project_dir / ".kiassist"
+            cache_file = cache_dir / "context.json"
+            sig = self._project_mtime_signature(project_path)
+
+            # Load disk cache when signature matches.
+            if cache_file.is_file():
+                try:
+                    import json as _json
+                    cached = _json.loads(cache_file.read_text(encoding="utf-8"))
+                    if cached.get("signature") == sig and cached.get("raw"):
+                        self._raw_context_cache = cached["raw"]
+                        if cached.get("synthesized"):
+                            self._synthesized_context_cache = cached["synthesized"]
+                        logger.debug(
+                            "Loaded raw project context from disk cache."
+                        )
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Cache miss — build and persist.
+            from .context.project_context import get_raw_context
+            raw = get_raw_context(project_path)
+            self._raw_context_cache = raw
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                import json as _json
+                cache_file.write_text(
+                    _json.dumps(
+                        {"signature": sig, "raw": raw,
+                         "synthesized": self._synthesized_context_cache},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.debug("Failed to persist context cache: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Background context warm failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Project context (raw + LLM-synthesized)
@@ -1905,8 +2123,17 @@ class KiAssistAPI:
                 from .context.project_context import get_raw_context
                 self._raw_context_cache = get_raw_context(self._current_project_path)
 
-            # Get a provider for synthesis
-            provider = self._get_or_create_provider()
+            # Phase 4 — prefer the cheap "secondary" provider for synthesis;
+            # fall back to the primary when no secondary is configured.
+            # This is the single most impactful change for cost & latency
+            # on this workload.
+            provider = self._get_or_create_secondary_provider()
+            provider_label = self.secondary_provider_name
+            provider_model = self.secondary_model
+            if not provider:
+                provider = self._get_or_create_provider()
+                provider_label = self.current_provider_name
+                provider_model = self.current_model
             if not provider:
                 return {
                     "success": False,
@@ -1918,8 +2145,8 @@ class KiAssistAPI:
             from .ai.base import AIMessage
 
             log_id = llm_logger.start(
-                provider=self.current_provider_name,
-                model=self.current_model,
+                provider=provider_label,
+                model=provider_model,
                 messages=[AIMessage(role="user", content="[Context synthesis request]")],
                 system_prompt="[Context synthesis]",
                 is_stream=False,

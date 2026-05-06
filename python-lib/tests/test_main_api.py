@@ -926,3 +926,102 @@ class TestConversationHistoryTokenAware:
         tool_turns = [m for m in result if m.role == "tool"]
         assert len(tool_turns) == 1
         assert tool_turns[0].tool_results[0].tool_call_id == "c2"
+
+
+# ===========================================================================
+# Tests: Phase 4 — project header + raw-context disk cache
+# ===========================================================================
+
+class TestProjectHeader:
+    def test_header_includes_basic_fields(self, tmp_path, api):
+        # Make a tiny mock project: a .kicad_pro and one schematic file.
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        from kiassist_utils.kicad_parser.schematic import Schematic
+        sch = Schematic()
+        sch.version = 20231120
+        sch.generator = "eeschema"
+        sch.paper = "A4"
+        sch.save(tmp_path / "demo.kicad_sch")
+
+        header = api._build_project_header(str(pro))
+        assert "Active Project" in header
+        assert "demo" in header
+        assert "**Sheet count:** 1" in header
+        assert "**BOM size:** 0" in header
+
+    def test_header_includes_kiassist_md(self, tmp_path, api):
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        memory_path = tmp_path / "KIASSIST.md"
+        memory_path.write_text("# Custom project notes\nUse JLC parts.",
+                               encoding="utf-8")
+        header = api._build_project_header(str(pro))
+        assert "Project Memory" in header
+        assert "Custom project notes" in header
+
+    def test_header_truncates_huge_kiassist_md(self, tmp_path, api):
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        (tmp_path / "KIASSIST.md").write_text("x" * 10_000, encoding="utf-8")
+        header = api._build_project_header(str(pro))
+        # Hard cap: never larger than ~3500 chars including everything
+        # (1500 cap + framing).
+        assert len(header) < 3500
+        assert "truncated" in header.lower()
+
+
+class TestProjectMtimeSignature:
+    def test_signature_changes_when_file_changes(self, tmp_path, api):
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        sig1 = api._project_mtime_signature(str(pro))
+        # Write again with a fresh mtime.
+        import time
+        time.sleep(0.02)
+        pro.write_text("{}\n", encoding="utf-8")
+        os = __import__("os")
+        # Force a distinct mtime even on coarse-grained filesystems.
+        st = pro.stat()
+        os.utime(pro, (st.st_atime, st.st_mtime + 1))
+        sig2 = api._project_mtime_signature(str(pro))
+        assert sig1 != sig2
+
+    def test_signature_stable_when_unchanged(self, tmp_path, api):
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        assert (
+            api._project_mtime_signature(str(pro))
+            == api._project_mtime_signature(str(pro))
+        )
+
+
+class TestRawContextDiskCache:
+    def test_warm_writes_disk_cache(self, tmp_path, api):
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        api._warm_raw_context_cache(str(pro))
+        cache_file = tmp_path / ".kiassist" / "context.json"
+        assert cache_file.exists()
+        import json
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        assert "signature" in cached and "raw" in cached
+        assert api._raw_context_cache is not None
+
+    def test_warm_reuses_disk_cache_on_match(self, tmp_path, api):
+        pro = tmp_path / "demo.kicad_pro"
+        pro.write_text("{}", encoding="utf-8")
+        api._warm_raw_context_cache(str(pro))
+        first_raw = api._raw_context_cache
+        # Reset in-memory cache; the disk cache must repopulate it.
+        api._raw_context_cache = None
+        api._warm_raw_context_cache(str(pro))
+        assert api._raw_context_cache == first_raw
+
+
+class TestSecondaryProvider:
+    def test_secondary_provider_lazy(self, api):
+        # No-op: just verify the helper exists and returns None when
+        # nothing is configured (or some provider when defaults work).
+        result = api._get_or_create_secondary_provider()
+        assert result is None or hasattr(result, "chat_stream")
