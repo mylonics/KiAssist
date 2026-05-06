@@ -975,3 +975,66 @@ class TestPCBBackupOnSave:
         assert not bak.exists()
         _call("pcb_add_net", path=str(tmp_pcb), name="BACKUP_TEST_NET")
         assert bak.exists(), ".bak file should be created by _safe_save"
+
+
+# ---------------------------------------------------------------------------
+# Wiring contract — guards the Phase 1 agent loop against MCP regressions.
+# Bumping the `mcp` package's upper bound in pyproject.toml without these
+# tests passing means the chat agent will silently lose its tools.
+# ---------------------------------------------------------------------------
+
+
+class TestMCPWiringContract:
+    """End-to-end checks that the MCP integration surface KiAssistAPI
+    relies on (mcp.list_tools(), in_process_call) keeps the same shape.
+    """
+
+    def test_list_tools_returns_schemas_with_expected_keys(self):
+        """``mcp.list_tools()`` must return objects with name / description /
+        inputSchema attributes — that is the schema shape KiAssistAPI's
+        ``_fetch_mcp_tool_schemas_async`` reads."""
+        from kiassist_utils.mcp_server import mcp
+
+        tools = asyncio.run(mcp.list_tools())
+        assert tools, "MCP server exposes no tools"
+        names = [t.name for t in tools]
+        # Sample a handful of tools the agent loop depends on.
+        for required in (
+            "schematic_open",
+            "schematic_add_symbol",
+            "schematic_add_wire",
+            "kicad_save_schematic",
+            "web_search",
+        ):
+            assert required in names, f"missing MCP tool {required!r}"
+        # Every tool exposes the trio the agent loop needs to forward to
+        # the LLM.  ``inputSchema`` may be None for zero-arg tools but
+        # the attribute itself must exist.
+        sample = next(t for t in tools if t.name == "schematic_open")
+        assert isinstance(sample.name, str) and sample.name
+        assert isinstance(sample.description, str)
+        assert hasattr(sample, "inputSchema")
+
+    def test_in_process_call_schematic_open_end_to_end(self):
+        """Smoke test: full ``in_process_call('schematic_open', …)``
+        round-trip returns the canonical ``{status: ok, data: {...}}``
+        envelope KiAssistAPI parses."""
+        result = _call("schematic_open", path=str(FIXTURE_SCH))
+        assert result["status"] == "ok"
+        # The envelope's ``data`` field is what the agent loop forwards
+        # back to the LLM.  Check it has at least the documented keys.
+        data = result["data"]
+        assert "component_count" in data
+        assert "sheet_count" in data
+        assert "version" in data
+
+    def test_in_process_call_web_search_tool_registered(self):
+        """The web_search MCP tool moved out of main.py must be callable
+        through the same dispatcher used by the streaming chat loop.
+        """
+        from kiassist_utils.mcp_server import mcp
+
+        tools = asyncio.run(mcp.list_tools())
+        web = next((t for t in tools if t.name == "web_search"), None)
+        assert web is not None, "web_search MCP tool not registered"
+        assert "search" in (web.description or "").lower()

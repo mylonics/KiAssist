@@ -2417,6 +2417,37 @@ def project_write_memory(project_path: str, content: str) -> Dict[str, Any]:
 
 
 # ===========================================================================
+# Web search tool
+# ===========================================================================
+
+
+@mcp.tool()
+def web_search(query: str) -> Dict[str, Any]:
+    """Search the web for technical information.
+
+    Use this tool when the user asks about specific electronic components,
+    datasheets, PCB design techniques, product comparisons, or any other
+    technical topic that requires up-to-date information from the internet.
+
+    Args:
+        query: Search query.  Be specific and include relevant technical
+               terms (e.g. ``"TXS0108E 8-channel level shifter datasheet"``).
+
+    Returns:
+        Dict with a ``data`` list of result entries (``title``, ``url``,
+        ``snippet``).
+    """
+    if not query or not query.strip():
+        return _err("Empty search query.")
+    try:
+        from .web_search import web_search as _web_search
+        results = _web_search(query)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Web search failed: {exc}")
+    return _ok(results)
+
+
+# ===========================================================================
 # In-process call entry point
 # ===========================================================================
 

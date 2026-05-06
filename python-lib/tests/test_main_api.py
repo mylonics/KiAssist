@@ -764,3 +764,58 @@ class TestShutdown:
         api.shutdown()
         thread.join(timeout=2)
         assert not thread.is_alive()
+
+
+# ===========================================================================
+# Tests: focused agent + MCP tool wiring (Phase 1)
+# ===========================================================================
+
+class TestFocusedAgent:
+    def test_default_focused_agent_is_none(self, api):
+        result = api.get_focused_agent()
+        assert result["success"] is True
+        assert result["focused_agent"] is None
+
+    def test_set_focused_agent(self, api):
+        result = api.set_focused_agent("schematic-agent")
+        assert result["success"] is True
+        assert result["focused_agent"] == "schematic-agent"
+        assert api.get_focused_agent()["focused_agent"] == "schematic-agent"
+
+    def test_clear_focused_agent(self, api):
+        api.set_focused_agent("pcb-agent")
+        result = api.set_focused_agent(None)
+        assert result["success"] is True
+        assert result["focused_agent"] is None
+
+    def test_set_focused_agent_rejects_non_string(self, api):
+        result = api.set_focused_agent(42)
+        assert result["success"] is False
+
+
+class TestMCPToolSchemaCache:
+    def test_unfiltered_schema_list_includes_schematic_tools(self, api):
+        schemas = api._get_mcp_tool_schemas(focused_agent=None)
+        names = [s["name"] for s in schemas]
+        assert "schematic_open" in names
+        assert "web_search" in names
+        assert "pcb_add_track" in names
+
+    def test_schematic_agent_filter_drops_pcb_tools(self, api):
+        schemas = api._get_mcp_tool_schemas(focused_agent="schematic-agent")
+        names = {s["name"] for s in schemas}
+        assert "schematic_open" in names
+        # pcb_* tools must be filtered out for the schematic agent
+        assert not any(n.startswith("pcb_") for n in names)
+
+    def test_pcb_agent_filter_drops_schematic_tools(self, api):
+        schemas = api._get_mcp_tool_schemas(focused_agent="pcb-agent")
+        names = {s["name"] for s in schemas}
+        assert "pcb_add_track" in names
+        assert not any(n.startswith("schematic_") for n in names)
+
+    def test_schemas_are_cached(self, api):
+        first = api._get_mcp_tool_schemas(focused_agent=None)
+        second = api._get_mcp_tool_schemas(focused_agent=None)
+        # Must return the same cached list object on second call.
+        assert first is second

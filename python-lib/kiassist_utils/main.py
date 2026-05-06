@@ -148,9 +148,20 @@ class KiAssistAPI:
         self._current_project_path: Optional[str] = None
         # System prompt builder for injecting project/PCB context
         self._prompt_builder = SystemPromptBuilder()
+        # Currently focused agent persona (e.g. "schematic-agent").
+        # Drives both the system-prompt layer 2 file and the MCP tool
+        # filter applied to the model.  None = general assistant with
+        # all tools available.
+        self._focused_agent: Optional[str] = None
+        # Cached MCP tool schemas (populated lazily on first chat call).
+        # Keyed by focused-agent name; a single ``__all__`` entry holds
+        # the full unfiltered list.
+        self._mcp_tool_schemas_cache: Dict[str, List[Dict[str, Any]]] = {}
         # Project context caches (cleared on project switch / new session)
         self._raw_context_cache: Optional[str] = None
         self._synthesized_context_cache: Optional[str] = None
+        # Tiny "always-on" project header (small enough to inject every turn)
+        self._project_header_cache: Optional[str] = None
         # Context lifecycle state (RequirementsManager-backed)
         self._requirements_manager: Optional[RequirementsManager] = None
         self._context_lifecycle: Dict[str, Any] = self._default_lifecycle_state()
@@ -636,8 +647,16 @@ class KiAssistAPI:
                 f"**Active project:** `{self._current_project_path}`"
             )
 
-        # Include synthesized context if available (more compact than raw)
-        if self._synthesized_context_cache:
+        # Two-tier context strategy:
+        # - Always inject the small project header (a few hundred chars)
+        #   so the model knows what project is loaded.
+        # - Only inject the full synthesized context when the caller has
+        #   explicitly requested it; otherwise the agent should call the
+        #   ``project_get_context`` tool on demand.
+        if self._project_header_cache:
+            dynamic_parts.append(self._project_header_cache)
+        elif self._synthesized_context_cache:
+            # Fall back to the synthesized blob when no header is built yet.
             dynamic_parts.append(
                 "## Synthesized Project Context\n\n" + self._synthesized_context_cache
             )
@@ -647,7 +666,102 @@ class KiAssistAPI:
         return self._prompt_builder.build(
             project_path=self._current_project_path,
             dynamic_context=dynamic_context,
+            focused_agent=self._focused_agent,
         ) or None
+
+    # ------------------------------------------------------------------
+    # Focused-agent management (drives both system prompt + tool filter)
+    # ------------------------------------------------------------------
+
+    # Tool-name prefixes allowed for each focused agent.  When set, only
+    # tools whose names start with one of these prefixes are forwarded to
+    # the model.  ``None`` (or unknown agent) means "expose every tool".
+    _AGENT_TOOL_PREFIXES: Dict[str, tuple] = {
+        "schematic-agent": ("schematic_", "project_", "kicad_", "library_", "web_search"),
+        "symbol-library-agent": ("symbol_lib_", "library_", "web_search"),
+        "footprint-agent": ("footprint_", "library_", "web_search"),
+        "pcb-agent": ("pcb_", "project_", "kicad_", "library_", "web_search"),
+        "requirements-agent": ("project_", "schematic_", "web_search"),
+    }
+
+    def set_focused_agent(self, agent: Optional[str]) -> Dict[str, Any]:
+        """Select a focused agent persona for the chat.
+
+        The choice affects two things:
+
+        1. Which agent Markdown file is appended as Layer 2 of the system
+           prompt (see :class:`SystemPromptBuilder`).
+        2. Which subset of MCP tools is forwarded to the model.  Smaller
+           tool sets greatly improve tool-selection accuracy, especially on
+           local / quantised models.
+
+        Args:
+            agent: One of ``"schematic-agent"``, ``"symbol-library-agent"``,
+                   ``"footprint-agent"``, ``"pcb-agent"``,
+                   ``"requirements-agent"``, or ``None`` to clear the
+                   selection (general assistant with all tools).
+
+        Returns:
+            ``{"success": True, "focused_agent": <name or None>}``.
+        """
+        if agent is not None and not isinstance(agent, str):
+            return {"success": False, "error": "agent must be a string or None."}
+        if agent is not None and not agent:
+            agent = None
+        self._focused_agent = agent
+        return {"success": True, "focused_agent": agent}
+
+    def get_focused_agent(self) -> Dict[str, Any]:
+        """Return the currently selected focused agent (or ``None``)."""
+        return {"success": True, "focused_agent": self._focused_agent}
+
+    # ------------------------------------------------------------------
+    # MCP tool schema cache & filter
+    # ------------------------------------------------------------------
+
+    async def _fetch_mcp_tool_schemas_async(self) -> List[Dict[str, Any]]:
+        """Fetch the full MCP tool list once (async)."""
+        from .mcp_server import mcp as _mcp
+        tools = await _mcp.list_tools()
+        schemas: List[Dict[str, Any]] = []
+        for t in tools:
+            schemas.append({
+                "name": t.name,
+                "description": t.description or "",
+                "inputSchema": t.inputSchema if isinstance(t.inputSchema, dict) else {},
+            })
+        return schemas
+
+    def _get_mcp_tool_schemas(self, focused_agent: Optional[str]) -> List[Dict[str, Any]]:
+        """Return the cached MCP tool schemas filtered by *focused_agent*.
+
+        Schemas are fetched from the MCP server on first call (blocking via
+        the persistent async loop so synchronous callers work too) and
+        cached per focused-agent key for the lifetime of the API instance.
+        """
+        cache_key = focused_agent or "__all__"
+        if cache_key in self._mcp_tool_schemas_cache:
+            return self._mcp_tool_schemas_cache[cache_key]
+
+        # Ensure the unfiltered list is populated first (one MCP round-trip).
+        if "__all__" not in self._mcp_tool_schemas_cache:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._fetch_mcp_tool_schemas_async(), self._async_loop
+                )
+                self._mcp_tool_schemas_cache["__all__"] = future.result(timeout=10)
+            except Exception as exc:
+                logger.warning("Failed to fetch MCP tool schemas: %s", exc)
+                self._mcp_tool_schemas_cache["__all__"] = []
+
+        all_schemas = self._mcp_tool_schemas_cache["__all__"]
+        prefixes = self._AGENT_TOOL_PREFIXES.get(focused_agent or "")
+        if prefixes is None:
+            filtered = list(all_schemas)
+        else:
+            filtered = [s for s in all_schemas if s["name"].startswith(prefixes)]
+        self._mcp_tool_schemas_cache[cache_key] = filtered
+        return filtered
 
     def _build_conversation_messages(
         self,
@@ -658,7 +772,11 @@ class KiAssistAPI:
 
         The caller should already have persisted the latest user message before
         calling this method—it will be included in the loaded messages.
-        Limits history to the last 40 turns to avoid exceeding context windows.
+        Returns the full structured history (including assistant tool_calls and
+        tool result messages) so the agent retains its working memory across
+        turns.  When no :class:`ContextWindowManager` is wired in, falls back
+        to a hard cap of the last ``MAX_HISTORY_TURNS`` turns to avoid blowing
+        the context window.
 
         Args:
             store: The conversation store instance.
@@ -670,18 +788,29 @@ class KiAssistAPI:
         history: List[AIMessage] = []
         try:
             stored_messages = store.load_session(session_id)
-            # Only include user and assistant messages (skip tool messages
-            # that the simple chat flow doesn't need)
             for m in stored_messages:
-                if m.role in ("user", "assistant") and m.content:
-                    history.append(m)
+                # Keep every role.  Skip empty user/assistant text-only
+                # messages (these can occur from cancelled streams) but
+                # always keep messages that carry tool_calls / tool_results.
+                if m.role in ("user", "assistant") and not m.content and not m.tool_calls:
+                    continue
+                history.append(m)
         except Exception as exc:
             logger.debug("Failed to load session history: %s", exc)
 
-        # Limit to last N turns to stay within context budget
+        # Fallback hard cap: keep the most recent N turns.  When a
+        # ContextWindowManager is wired in (Phase 3), it will replace this
+        # crude trim with token-aware summarisation; until then this stops
+        # the prompt from growing unbounded.
         MAX_HISTORY_TURNS = 40
         if len(history) > MAX_HISTORY_TURNS:
+            # Walk back from the end keeping intact assistant→tool pairs so
+            # the model never sees a tool result without its tool_call.
             history = history[-MAX_HISTORY_TURNS:]
+            # If the trimmed window starts with an orphaned tool message,
+            # drop it so the conversation begins on a clean boundary.
+            while history and history[0].role == "tool":
+                history = history[1:]
 
         return history
 
@@ -1119,64 +1248,70 @@ class KiAssistAPI:
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
-    # Built-in tool schemas for the chat stream
+    # Tool dispatch (MCP-backed)
     # ------------------------------------------------------------------
 
-    _WEB_SEARCH_TOOL_SCHEMA = {
-        "name": "web_search",
-        "description": (
-            "Search the web for information about electronic components, "
-            "datasheets, PCB design techniques, or any other technical topic. "
-            "Use this tool when the user asks about specific components, needs "
-            "product recommendations, wants to compare parts, or asks questions "
-            "that require up-to-date information from the internet."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "The search query. Be specific and include relevant "
-                        "technical terms (e.g. 'TXS0108E 8-channel bidirectional "
-                        "level shifter datasheet')."
-                    ),
-                },
-            },
-            "required": ["query"],
-        },
+    # User-friendly labels for the streaming "tool activity" indicator.
+    # Falls back to "Running <name>…" for tools not listed here.
+    _TOOL_ACTIVITY_LABELS: Dict[str, str] = {
+        "web_search": "Searching the web\u2026",
+        "schematic_open": "Reading schematic\u2026",
+        "schematic_list_symbols": "Listing components\u2026",
+        "schematic_get_symbol": "Inspecting component\u2026",
+        "schematic_add_symbol": "Adding component\u2026",
+        "schematic_remove_symbol": "Removing component\u2026",
+        "schematic_modify_symbol": "Modifying component\u2026",
+        "schematic_add_wire": "Routing wire\u2026",
+        "schematic_connect_pins": "Connecting pins\u2026",
+        "schematic_add_label": "Adding label\u2026",
+        "schematic_add_junction": "Adding junction\u2026",
+        "schematic_add_no_connect": "Adding no-connect\u2026",
+        "schematic_get_nets": "Reading nets\u2026",
+        "schematic_find_pins": "Finding pins\u2026",
+        "schematic_create": "Creating schematic\u2026",
+        "schematic_save": "Saving schematic\u2026",
+        "schematic_query": "Analysing schematic\u2026",
+        "project_create": "Scaffolding project\u2026",
+        "project_get_context": "Loading project context\u2026",
+        "library_search": "Searching libraries\u2026",
+        "kicad_save_schematic": "Saving in KiCad\u2026",
+        "kicad_reload_schematic": "Reloading KiCad\u2026",
+        "kicad_list_instances": "Detecting KiCad\u2026",
     }
 
-    _BUILTIN_TOOL_SCHEMAS = [_WEB_SEARCH_TOOL_SCHEMA]
-
-    def _execute_builtin_tool(self, name: str, arguments: Dict[str, Any]) -> str:
-        """Execute a built-in tool and return the result as a string.
+    async def _execute_mcp_tool(
+        self, name: str, arguments: Dict[str, Any]
+    ) -> tuple[str, bool]:
+        """Dispatch a tool call to the in-process MCP server.
 
         Args:
-            name: Tool name (e.g. ``"web_search"``).
-            arguments: Parsed arguments dict.
+            name: Tool name as registered with FastMCP.
+            arguments: Parsed JSON arguments dict.
 
         Returns:
-            String result to feed back to the model.
+            Tuple of ``(content_string, is_error)``.  ``content_string`` is
+            always JSON-encoded when the result is a dict / list, so the AI
+            sees a stable, machine-parseable payload.
         """
-        if name == "web_search":
-            from .web_search import web_search
-            query = arguments.get("query", "")
-            if not query:
-                return "Error: empty search query."
-            results = web_search(query)
-            if not results:
-                return f"No web search results found for: {query}"
-            # Format results for the model
-            lines = [f"Web search results for: {query}\n"]
-            for i, r in enumerate(results, 1):
-                lines.append(
-                    f"[{i}] {r.get('title', 'Untitled')}\n"
-                    f"    URL: {r.get('url', '')}\n"
-                    f"    {r.get('snippet', '').strip()}"
-                )
-            return "\n".join(lines)
-        return f"Error: unknown tool '{name}'."
+        try:
+            from .mcp_server import in_process_call
+            result = await in_process_call(name, arguments)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MCP tool %r failed: %s", name, exc, exc_info=True)
+            return f"Tool execution error: {exc}", True
+
+        # Detect MCP-style {status: error} payloads as failures so the
+        # is_error flag is propagated to the model.
+        is_error = False
+        if isinstance(result, dict) and result.get("status") == "error":
+            is_error = True
+
+        if isinstance(result, str):
+            return result, is_error
+        try:
+            return json.dumps(result, ensure_ascii=False), is_error
+        except (TypeError, ValueError):
+            return str(result), is_error
 
     def start_stream_message(self, message: str, model: Optional[str] = None, raw_mode: bool = False) -> dict:
         """Start streaming a response from the active AI provider in a background thread.
@@ -1187,13 +1322,13 @@ class KiAssistAPI:
         AI provider so it has context from prior turns, along with a system
         prompt containing project/PCB environment information.
 
-        When the provider supports tool calling, a ``web_search`` tool is
-        made available so the model can search the web for component data,
-        datasheets, and other technical information without requiring a
-        separate UI panel.
+        When the provider supports tool calling, the full set of MCP tools
+        (filtered by the active focused agent — see :meth:`set_focused_agent`)
+        is forwarded to the model.  Tool calls emitted by the model are
+        executed via :func:`kiassist_utils.mcp_server.in_process_call`.
 
         When *raw_mode* is ``True``, only the user message is sent to the
-        provider—no system prompt or conversation history is included.
+        provider—no system prompt, history, or tools.
 
         Args:
             message: The message to send.
@@ -1239,12 +1374,23 @@ class KiAssistAPI:
                 system_prompt = self._build_system_prompt()
             cancel_event = self._stream_cancel
 
-            # Determine whether to offer built-in tools to the model
-            use_tools = (
-                not raw_mode
-                and provider.supports_tool_calling()
-            )
-            tool_schemas = self._BUILTIN_TOOL_SCHEMAS if use_tools else None
+            # Determine whether to offer MCP tools to the model.  We test
+            # supports_tool_calling() defensively because the test suite
+            # uses fakes that may not implement it.
+            try:
+                use_tools = (
+                    not raw_mode
+                    and bool(provider.supports_tool_calling())
+                )
+            except Exception:
+                use_tools = False
+            if use_tools:
+                tool_schemas = self._get_mcp_tool_schemas(self._focused_agent)
+                if not tool_schemas:
+                    use_tools = False
+                    tool_schemas = None
+            else:
+                tool_schemas = None
 
             log_id = llm_logger.start(
                 provider=self.current_provider_name,
@@ -1254,8 +1400,10 @@ class KiAssistAPI:
                 is_stream=True,
             )
 
-            # Maximum number of tool-call round-trips before giving up
-            max_tool_rounds = 5
+            # Maximum number of tool-call round-trips before giving up.
+            # Increased from 5 (web_search-only loop) to 20 because real
+            # schematic edits often require many sequential tool calls.
+            max_tool_rounds = 20
 
             def _run_stream():
                 async def _async_stream():
@@ -1266,6 +1414,7 @@ class KiAssistAPI:
 
                         while True:
                             accumulated_tool_calls = []
+                            text_this_round = ""
                             async for chunk in provider.chat_stream(
                                 msgs,
                                 tools=tool_schemas,
@@ -1274,6 +1423,7 @@ class KiAssistAPI:
                                 if cancel_event.is_set():
                                     break
                                 if chunk.text:
+                                    text_this_round += chunk.text
                                     with self._stream_lock:
                                         self._process_stream_chunk(chunk.text)
                                 if chunk.tool_calls:
@@ -1298,56 +1448,72 @@ class KiAssistAPI:
                                 break
 
                             # Execute tool calls and feed results back
-                            from .ai.base import AIToolCall, AIToolResult
+                            from .ai.base import AIToolResult
 
-                            # Append assistant message with tool calls
-                            with self._stream_lock:
-                                assistant_text = self._stream_buffer
-
-                            msgs.append(AIMessage(
+                            assistant_msg = AIMessage(
                                 role="assistant",
-                                content=assistant_text,
+                                content=text_this_round,
                                 tool_calls=accumulated_tool_calls,
-                            ))
+                            )
+                            msgs.append(assistant_msg)
+                            # Persist assistant tool-call turn so /resume
+                            # can replay the full structured conversation.
+                            try:
+                                store.append(session_id, assistant_msg)
+                            except Exception as persist_exc:
+                                logger.debug(
+                                    "Failed to persist assistant tool-call turn: %s",
+                                    persist_exc,
+                                )
 
-                            # Execute each tool call
+                            # Execute each tool call via the in-process MCP
+                            # dispatcher.  Tools within one round are run
+                            # sequentially here (parallel execution would
+                            # require ToolExecutor's gather, but we want
+                            # the per-tool activity label visible to the UI).
                             tool_results = []
                             for tc in accumulated_tool_calls:
-                                # Notify the frontend about the tool activity
-                                activity_label = {
-                                    "web_search": "Searching the web\u2026",
-                                }.get(tc.name, f"Running {tc.name}\u2026")
+                                activity_label = self._TOOL_ACTIVITY_LABELS.get(
+                                    tc.name, f"Running {tc.name}\u2026"
+                                )
                                 with self._stream_lock:
                                     self._stream_tool_activity = activity_label
 
                                 logger.info(
-                                    "Executing built-in tool: %s(%s)",
+                                    "Dispatching MCP tool: %s(%s)",
                                     tc.name, tc.arguments,
                                 )
-                                result_text = self._execute_builtin_tool(
+                                content, is_error = await self._execute_mcp_tool(
                                     tc.name, tc.arguments,
                                 )
                                 tool_results.append(AIToolResult(
                                     tool_call_id=tc.id,
-                                    content=result_text,
-                                    is_error=result_text.startswith("Error:"),
+                                    content=content,
+                                    is_error=is_error,
                                 ))
 
                             # Clear tool activity before re-streaming
                             with self._stream_lock:
                                 self._stream_tool_activity = None
 
-                            # Append tool results to conversation
-                            msgs.append(AIMessage(
+                            tool_msg = AIMessage(
                                 role="tool",
                                 tool_results=tool_results,
-                            ))
+                            )
+                            msgs.append(tool_msg)
+                            try:
+                                store.append(session_id, tool_msg)
+                            except Exception as persist_exc:
+                                logger.debug(
+                                    "Failed to persist tool-result turn: %s",
+                                    persist_exc,
+                                )
 
-                            # The model will now re-stream with the search
-                            # results available.  The existing stream buffer
-                            # already contains any text the model produced
-                            # before deciding to call a tool — the next
-                            # stream iteration will append to it.
+                            # The model will now re-stream with the tool
+                            # results available.  Reset the visible buffer
+                            # so the next round's text starts cleanly.
+                            with self._stream_lock:
+                                self._stream_buffer = ""
 
                     except Exception as exc:
                         with self._stream_lock:
