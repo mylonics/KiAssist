@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onBeforeUnmount } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import type { ImportedComponent } from '../types/importer';
 import { useAppSettings } from '../composables/useAppSettings';
 import { getApi } from '../composables/useApi';
@@ -111,6 +111,8 @@ async function importVariant() {
     );
 
     if (r?.success && r.component) {
+      // Save MPN to history for autocomplete
+      saveMpnToHistory(mpnInput.value.trim());
       // Emit to parent — renders in ImporterDetails (same as SymbolImporter)
       const comp: ImportedComponent = r.component;
       const warns: string[] = r.warnings ?? [];
@@ -128,10 +130,37 @@ async function importVariant() {
   }
 }
 
+// -----------------------------------------------------------------------
+// MPN history (persisted in localStorage for autocomplete)
+// -----------------------------------------------------------------------
+
+const MPN_HISTORY_KEY = 'kiassist-mpn-history';
+const MPN_HISTORY_LIMIT = 20;
+
+const mpnHistory = ref<string[]>([]);
+
+function loadMpnHistory() {
+  try {
+    const raw = localStorage.getItem(MPN_HISTORY_KEY);
+    mpnHistory.value = raw ? JSON.parse(raw) : [];
+  } catch {
+    mpnHistory.value = [];
+  }
+}
+
+function saveMpnToHistory(mpn: string) {
+  const trimmed = mpn.trim();
+  if (!trimmed) return;
+  const history = Array.from(new Set([trimmed, ...mpnHistory.value])).slice(0, MPN_HISTORY_LIMIT);
+  mpnHistory.value = history;
+  try { localStorage.setItem(MPN_HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
+}
+
+onMounted(() => { loadMpnHistory(); });
+
 onBeforeUnmount(() => {
   if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
-});
-</script>
+});</script>
 
 <template>
   <div class="variant-panel">
@@ -162,10 +191,14 @@ onBeforeUnmount(() => {
           <input
             v-model="mpnInput"
             class="text-input"
+            list="mpn-history-list"
             placeholder="e.g. RC0603FR-074K7L"
             :disabled="importing"
             @keydown.enter="importVariant"
           />
+          <datalist id="mpn-history-list">
+            <option v-for="mpn in mpnHistory" :key="mpn" :value="mpn" />
+          </datalist>
         </div>
 
         <button
@@ -173,7 +206,7 @@ onBeforeUnmount(() => {
           @click="importVariant"
           :disabled="!canImport || importing"
         >
-          <span class="material-icons">{{ importing ? 'sync' : 'search' }}</span>
+          <span class="material-icons" :class="{ spinning: importing }">{{ importing ? 'sync' : 'search' }}</span>
           {{ importing ? (importStatus || 'Importing…') : 'Import Variant' }}
         </button>
 

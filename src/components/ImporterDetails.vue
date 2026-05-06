@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, computed } from 'vue';
+import { ref, watch, onMounted, onBeforeUnmount, computed } from 'vue';
 import type { ImportedComponent } from '../types/importer';
 import KicadPreview from './KicadPreview.vue';
 import ModelPreview from './ModelPreview.vue';
@@ -29,10 +29,6 @@ const emit = defineEmits<{
 }>();
 
 const error = ref('');
-
-// -----------------------------------------------------------------------
-// Footprint search (autocomplete for the Footprint field)
-// -----------------------------------------------------------------------
 
 interface FpSearchResult {
   library: string;
@@ -221,6 +217,14 @@ const hasAnythingToSave = computed(() => {
 const hasSym = computed(() => !!props.component.symbol_sexpr);
 const hasFp = computed(() => !!props.component.footprint_sexpr);
 const hasModel = computed(() => !!props.component.step_data);
+
+/** Tooltip text explaining why the Save button may be disabled */
+const saveButtonTooltip = computed(() => {
+  if (!hasAnythingToSave.value) return 'No assets loaded to save';
+  if (hasSym.value && saveSymLib.value === '') return 'Select a symbol library first';
+  if (fpSaveEnabled.value && saveFpLib.value === '') return 'Select a footprint library first';
+  return 'Save symbol, footprint and 3D model to library';
+});
 
 /** True when this component came from the variant importer. */
 const isVariant = computed(() => (props.component.source_info || '').startsWith('Variant:'));
@@ -434,7 +438,23 @@ onMounted(async () => {
 
   // Auto-load save-to-library data
   await initSaveToLib();
+  document.addEventListener('keydown', handleDetailsKeydown);
 });
+
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', handleDetailsKeydown);
+});
+
+function handleDetailsKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return;
+  if (showOverwriteDialog.value) {
+    cancelOverwrite();
+    e.preventDefault();
+  } else if (showVariantFpConfirm.value) {
+    cancelVariantSaveFp();
+    e.preventDefault();
+  }
+}
 
 // Rebuild if the component prop changes
 watch(() => props.component, (c) => {
@@ -1174,6 +1194,7 @@ async function doSaveToLibrary(
                       <span
                         v-else
                         :class="['field-key-text', { 'editable-key': !row.mandatory && row.enabled }]"
+                        :title="!row.mandatory && row.enabled ? 'Double-click to rename this field' : ''"
                         @dblclick="!row.mandatory && row.enabled ? row.editingKey = true : null"
                       >{{ row.key }}</span>
                       <span v-if="row.description" class="field-desc-badge" :title="row.description">{{ row.description }}</span>
@@ -1349,6 +1370,7 @@ async function doSaveToLibrary(
                   class="action-btn primary"
                   @click="saveToLibrary"
                   :disabled="saveLoading || !hasAnythingToSave"
+                  :title="saveButtonTooltip"
                 >
                   <span class="material-icons">{{ saveLoading ? 'sync' : 'save' }}</span>
                   {{ saveLoading ? 'Saving…' : 'Save to Library' }}
@@ -1357,14 +1379,20 @@ async function doSaveToLibrary(
 
               <div v-if="saveSuccess" class="notice success" style="margin-top: 0.5rem">
                 <span class="material-icons">check_circle</span>
-                {{ saveSuccess }}
+                <span class="notice-text">{{ saveSuccess }}</span>
                 <button class="close-part-btn" @click="emit('close')" title="Close this part and reset the importer">
                   <span class="material-icons">close</span> Close Part
+                </button>
+                <button class="notice-dismiss" @click="saveSuccess = ''" title="Dismiss">
+                  <span class="material-icons">close</span>
                 </button>
               </div>
               <div v-if="saveError" class="notice error" style="margin-top: 0.5rem">
                 <span class="material-icons">error_outline</span>
-                {{ saveError }}
+                <span class="notice-text">{{ saveError }}</span>
+                <button class="notice-dismiss" @click="saveError = ''" title="Dismiss">
+                  <span class="material-icons">close</span>
+                </button>
               </div>
             </div>
           </div>
@@ -1410,7 +1438,10 @@ async function doSaveToLibrary(
           </div>
           <div v-if="error" class="notice error">
             <span class="material-icons">error_outline</span>
-            {{ error }}
+            <span class="notice-text">{{ error }}</span>
+            <button class="notice-dismiss" @click="error = ''" title="Dismiss">
+              <span class="material-icons">close</span>
+            </button>
           </div>
         </div>
 
@@ -2155,6 +2186,32 @@ async function doSaveToLibrary(
   margin-top: 0.05rem;
 }
 
+.notice-text {
+  flex: 1;
+}
+
+.notice-dismiss {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  padding: 0;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+
+.notice-dismiss:hover {
+  opacity: 1;
+}
+
+.notice-dismiss .material-icons {
+  font-size: 0.9rem;
+  margin-top: 0;
+}
+
 .notice.error {
   background-color: color-mix(in srgb, #e74c3c 15%, transparent);
   color: #e74c3c;
@@ -2475,15 +2532,15 @@ async function doSaveToLibrary(
 }
 
 .overwrite-modal {
-  background: #ffffff;
-  color: #1a1a1a;
+  background: var(--bg-primary);
+  color: var(--text-primary);
   border: 1px solid #f39c12;
   border-radius: 10px;
   padding: 1.2rem 1.4rem;
   min-width: 380px;
   max-width: 520px;
   width: 90vw;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
   animation: modal-enter 0.2s ease-out;
 }
 
@@ -2498,7 +2555,7 @@ async function doSaveToLibrary(
   gap: 0.5rem;
   font-size: 1rem;
   font-weight: 600;
-  color: #1a1a1a;
+  color: var(--text-primary);
   margin-bottom: 0.75rem;
 }
 
@@ -2515,7 +2572,7 @@ async function doSaveToLibrary(
 
 .overwrite-hint {
   font-size: 0.78rem;
-  color: #555;
+  color: var(--text-secondary);
   margin: 0 0 0.2rem 0;
 }
 
@@ -2525,16 +2582,16 @@ async function doSaveToLibrary(
   align-items: center;
   gap: 0.5rem;
   font-size: 0.82rem;
-  color: #1a1a1a;
+  color: var(--text-primary);
   padding: 0.45rem 0.55rem;
   border-radius: 6px;
-  background: #f7f7f8;
-  border: 1px solid #e0e0e0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
 }
 
 .overwrite-item-icon {
   font-size: 1rem;
-  color: #666;
+  color: var(--text-secondary);
 }
 
 .overwrite-item-name {
@@ -2553,18 +2610,18 @@ async function doSaveToLibrary(
   align-items: center;
   gap: 0.25rem;
   font-size: 0.76rem;
-  color: #555;
+  color: var(--text-secondary);
   cursor: pointer;
   white-space: nowrap;
 }
 
 .overwrite-radio:hover {
-  color: #1a1a1a;
+  color: var(--text-primary);
 }
 
 .overwrite-radio input[type="radio"] {
   margin: 0;
-  accent-color: #2196f3;
+  accent-color: var(--accent-color);
 }
 
 .overwrite-modal-actions {
@@ -2573,7 +2630,7 @@ async function doSaveToLibrary(
   gap: 0.5rem;
   margin-top: 0.75rem;
   padding-top: 0.6rem;
-  border-top: 1px solid #e0e0e0;
+  border-top: 1px solid var(--border-color);
 }
 
 /* Modal transition */

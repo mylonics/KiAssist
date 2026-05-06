@@ -100,6 +100,8 @@ const PROVIDER_KEY = 'kiassist-provider';
 const MODEL_KEY = 'kiassist-model';
 const SECONDARY_PROVIDER_KEY = 'kiassist-secondary-provider';
 const SECONDARY_MODEL_KEY = 'kiassist-secondary-model';
+const SCROLL_BOTTOM_THRESHOLD = 120; // px from bottom before the scroll-to-bottom button appears
+const MAX_TEXTAREA_HEIGHT = 160; // px cap for the auto-resizing chat input
 
 const rawMode = ref(false);
 const copiedMessageId = ref<string | null>(null);
@@ -107,6 +109,8 @@ const copiedChatHistory = ref(false);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
 const queuedMessage = ref<string | null>(null);
+const isConfirmingClear = ref(false);
+const isScrolledUp = ref(false);
 const selectedProvider = ref('gemma4');
 const selectedModel = ref('gemma4-e2b-q4_k_m');
 // Quick (lightweight/cheap) model
@@ -268,7 +272,51 @@ function scrollToBottom() {
   nextTick(() => {
     if (messagesContainer.value) {
       messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+      isScrolledUp.value = false;
     }
+  });
+}
+
+let scrollThrottleScheduled = false;
+
+function handleScroll() {
+  if (!messagesContainer.value) return;
+  if (scrollThrottleScheduled) return;
+  scrollThrottleScheduled = true;
+  requestAnimationFrame(() => {
+    scrollThrottleScheduled = false;
+    if (!messagesContainer.value) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainer.value;
+    isScrolledUp.value = scrollHeight - scrollTop - clientHeight > SCROLL_BOTTOM_THRESHOLD;
+  });
+}
+
+function autoResizeTextarea() {
+  nextTick(() => {
+    if (!chatInputRef.value) return;
+    chatInputRef.value.style.height = 'auto';
+    chatInputRef.value.style.height = Math.min(chatInputRef.value.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
+  });
+}
+
+/** Clear the input and reset textarea height. */
+function clearInput() {
+  inputMessage.value = '';
+  autoResizeTextarea();
+}
+
+const examplePrompts = [
+  'Explain the schematic symbols for my current project',
+  'Help me find a suitable footprint for a 0402 resistor',
+  'Review my BOM for any missing components',
+  'What are the DRC errors in my PCB?',
+];
+
+function insertExamplePrompt(prompt: string) {
+  inputMessage.value = prompt;
+  nextTick(() => {
+    chatInputRef.value?.focus();
+    autoResizeTextarea();
   });
 }
 
@@ -309,6 +357,11 @@ function loadMessages() {
 
 function clearMessages() {
   if (isLoading.value) return;
+  if (!isConfirmingClear.value) {
+    isConfirmingClear.value = true;
+    return;
+  }
+  isConfirmingClear.value = false;
   messages.value = [];
   localStorage.removeItem(STORAGE_KEY);
   // Start a fresh backend session so history isn't carried over
@@ -317,6 +370,10 @@ function clearMessages() {
       window.pywebview!.api.new_chat_session()
     ).catch((err) => console.error('[ChatBox] Failed to start new session:', err));
   }
+}
+
+function cancelClearConfirm() {
+  isConfirmingClear.value = false;
 }
 
 // Provider switching
@@ -893,7 +950,7 @@ async function sendMessage() {
   };
   messages.value.push(userMessage);
   const messageText = inputMessage.value;
-  inputMessage.value = '';
+  clearInput();
   await sendMessageWithText(messageText);
 }
 
@@ -903,7 +960,7 @@ async function steerMessage() {
   if (!window.pywebview?.api) return;
 
   const steerText = inputMessage.value;
-  inputMessage.value = '';
+  clearInput();
 
   // Show the steer message as a user message in the chat
   messages.value.push({
@@ -994,7 +1051,7 @@ async function steerMessage() {
 function queueMessage() {
   if (!inputMessage.value.trim()) return;
   queuedMessage.value = inputMessage.value;
-  inputMessage.value = '';
+  clearInput();
 }
 
 // Process queued messages after a stream finishes
@@ -1063,6 +1120,20 @@ function handleKeyPress(event: KeyboardEvent) {
     } else {
       sendMessage();
     }
+  }
+}
+
+function handleGlobalKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return;
+  if (showApiKeyPrompt.value) {
+    showApiKeyPrompt.value = false;
+    e.preventDefault();
+  } else if (showSessionsModal.value) {
+    showSessionsModal.value = false;
+    e.preventDefault();
+  } else if (isConfirmingClear.value) {
+    cancelClearConfirm();
+    e.preventDefault();
   }
 }
 
@@ -1175,6 +1246,13 @@ onMounted(() => {
   loadMessages();
   waitForPywebviewAndCheckApiKey();
   scrollToBottom();
+  nextTick(() => {
+    chatInputRef.value?.focus();
+    if (messagesContainer.value) {
+      messagesContainer.value.addEventListener('scroll', handleScroll, { passive: true });
+    }
+  });
+  document.addEventListener('keydown', handleGlobalKeydown);
 });
 
 onBeforeUnmount(() => {
@@ -1182,6 +1260,10 @@ onBeforeUnmount(() => {
     clearInterval(gemmaDownloadPollTimer.value);
     gemmaDownloadPollTimer.value = null;
   }
+  if (messagesContainer.value) {
+    messagesContainer.value.removeEventListener('scroll', handleScroll);
+  }
+  document.removeEventListener('keydown', handleGlobalKeydown);
 });
 
 /** Insert text into the chat input (called externally, e.g. from ComponentSearch). */
@@ -1260,9 +1342,7 @@ async function handleContextAnswer(overrideAnswer?: string) {
     sender: 'user',
     timestamp: new Date(),
   });
-  inputMessage.value = '';
-
-  // Send the raw answer to the backend — __SKIP__ tells it to drop this Q
+  clearInput();
   const answer = answerText;
 
   isLoading.value = true;
@@ -1426,7 +1506,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
   <div class="chat-container">
     <!-- Settings Modal -->
     <div v-if="showApiKeyPrompt" class="modal-overlay" @click.self="showApiKeyPrompt = false">
-      <div class="modal-content modal-wide settings-modal">
+      <div class="modal-content modal-wide settings-modal" role="dialog" aria-label="Settings">
         <div class="modal-header-row">
           <h3>Settings</h3>
           <button class="modal-close-btn" @click="showApiKeyPrompt = false" title="Close">
@@ -1784,9 +1864,14 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
     </div>
 
     <!-- Sessions Modal -->
-    <div v-if="showSessionsModal" class="modal-overlay">
-      <div class="modal-content modal-wide">
-        <h3>Conversation Sessions</h3>
+    <div v-if="showSessionsModal" class="modal-overlay" @click.self="showSessionsModal = false">
+      <div class="modal-content modal-wide" role="dialog" aria-label="Conversation Sessions">
+        <div class="modal-header-row">
+          <h3>Conversation Sessions</h3>
+          <button class="modal-close-btn" @click="showSessionsModal = false" title="Close">
+            <span class="material-icons">close</span>
+          </button>
+        </div>
         <div v-if="sessions.length === 0" class="sessions-empty">
           No saved sessions found.
         </div>
@@ -1832,9 +1917,20 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
         <button v-if="messages.length > 0" @click="copyChatHistory" class="icon-btn" :title="copiedChatHistory ? 'Copied!' : 'Copy chat history'" :aria-label="copiedChatHistory ? 'Copied!' : 'Copy chat history'">
           <span class="material-icons">{{ copiedChatHistory ? 'check' : 'copy_all' }}</span>
         </button>
-        <button v-if="messages.length > 0" @click="clearMessages" class="icon-btn" title="Clear chat" aria-label="Clear chat" :disabled="isLoading">
-          <span class="material-icons">delete_sweep</span>
-        </button>
+        <template v-if="messages.length > 0 && !isLoading">
+          <template v-if="isConfirmingClear">
+            <span class="clear-confirm-label">Clear chat?</span>
+            <button @click="clearMessages" class="icon-btn icon-btn-danger" title="Confirm clear" aria-label="Confirm clear chat">
+              <span class="material-icons">check</span>
+            </button>
+            <button @click="cancelClearConfirm" class="icon-btn" title="Cancel" aria-label="Cancel clear">
+              <span class="material-icons">close</span>
+            </button>
+          </template>
+          <button v-else @click="clearMessages" class="icon-btn" title="Clear chat" aria-label="Clear chat">
+            <span class="material-icons">delete_sweep</span>
+          </button>
+        </template>
         <button @click="openSessionsModal" class="icon-btn" title="Conversation sessions" aria-label="Conversation sessions">
           <span class="material-icons">history</span>
         </button>
@@ -1844,11 +1940,21 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
       </div>
     </div>
 
-    <div class="chat-messages" ref="messagesContainer">
+    <div class="messages-wrapper">
+      <div class="chat-messages" ref="messagesContainer">
       <div v-if="messages.length === 0" class="welcome-message">
         <span class="material-icons welcome-icon">smart_toy</span>
         <p>Welcome to KiAssist!</p>
         <p class="hint">Ask me anything about KiCAD or PCB design. Powered by {{ currentProviderInfo?.name ?? 'AI' }}.</p>
+        <div class="example-prompts">
+          <p class="example-prompts-label">Try asking:</p>
+          <button
+            v-for="prompt in examplePrompts"
+            :key="prompt"
+            class="example-prompt-btn"
+            @click="insertExamplePrompt(prompt)"
+          >{{ prompt }}</button>
+        </div>
       </div>
 
       <div
@@ -1933,6 +2039,17 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
       </div>
     </div>
 
+    <button
+      v-if="isScrolledUp"
+      class="scroll-to-bottom-btn"
+      @click="scrollToBottom"
+      title="Scroll to bottom"
+      aria-label="Scroll to latest message"
+    >
+      <span class="material-icons">arrow_downward</span>
+    </button>
+    </div>
+
     <div v-if="queuedMessage" class="queued-banner">
       <span class="material-icons queued-icon">schedule</span>
       <span class="queued-text">Queued: {{ queuedMessage.length > 60 ? queuedMessage.substring(0, 60) + '…' : queuedMessage }}</span>
@@ -1959,6 +2076,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
             ref="chatInputRef"
             v-model="inputMessage"
             @keypress="handleKeyPress"
+            @input="autoResizeTextarea"
             placeholder="Type your own answer..."
             rows="2"
           />
@@ -1976,6 +2094,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
           ref="chatInputRef"
           v-model="inputMessage"
           @keypress="handleKeyPress"
+          @input="autoResizeTextarea"
           :placeholder="isLoading ? 'Enter to queue · Ctrl+Enter to steer' : 'Type your message here... (Press Enter to send)'"
           rows="2"
         />
@@ -2157,6 +2276,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 .icon-btn {
   padding: 0.375rem;
   background: transparent;
+  border: none;
   border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
@@ -2188,6 +2308,15 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
   padding: 1.25rem;
   background-color: var(--bg-primary);
   min-height: 0;
+}
+
+/* ---- Messages wrapper (relative container for scroll button) ---- */
+.messages-wrapper {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .welcome-message {
@@ -3517,5 +3646,87 @@ code {
 
 .gemma-empty-state .btn-primary {
   margin-top: 0.75rem;
+}
+
+/* ---- Clear confirmation ---- */
+.clear-confirm-label {
+  font-size: 0.75rem;
+  color: #ef4444;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.icon-btn-danger .material-icons {
+  color: #ef4444;
+}
+
+.icon-btn-danger:hover {
+  background-color: rgba(239, 68, 68, 0.1);
+}
+
+/* ---- Scroll-to-bottom button ---- */
+.scroll-to-bottom-btn {
+  position: absolute;
+  bottom: 12px;
+  right: 1.25rem;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background-color: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow-md);
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  z-index: 10;
+}
+
+.scroll-to-bottom-btn:hover {
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+  color: white;
+  box-shadow: var(--shadow-md);
+}
+
+.scroll-to-bottom-btn .material-icons {
+  font-size: 1.125rem;
+}
+
+/* ---- Welcome screen example prompts ---- */
+.example-prompts {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.example-prompts-label {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.25rem;
+}
+
+.example-prompt-btn {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 0.4375rem 0.875rem;
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-align: left;
+  max-width: 380px;
+  width: 100%;
+}
+
+.example-prompt-btn:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+  background-color: rgba(88, 101, 242, 0.05);
 }
 </style>
