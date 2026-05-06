@@ -1236,3 +1236,31 @@ class TestSchematicQuery:
     def test_empty_question_rejected(self, tmp_sch: Path):
         result = _call("schematic_query", path=str(tmp_sch), question="   ")
         assert result["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — .bak rotation retention
+# ---------------------------------------------------------------------------
+
+
+class TestBakRotationRetention:
+    def test_creates_canonical_and_rotated_bak(self, tmp_sch: Path):
+        # Each save should emit BOTH the canonical .bak AND a timestamped .bak.<ms>
+        result = _call("schematic_save", path=str(tmp_sch))
+        assert result["status"] == "ok"
+        bak = Path(str(tmp_sch) + ".bak")
+        rotated = list(tmp_sch.parent.glob(tmp_sch.name + ".bak.*"))
+        assert bak.exists()
+        assert len(rotated) == 1
+
+    def test_rotation_count_capped(self, tmp_sch: Path):
+        from kiassist_utils.mcp_server import _BAK_RETENTION_COUNT
+        # Save more times than the retention count.
+        for _ in range(_BAK_RETENTION_COUNT + 5):
+            _call("schematic_save", path=str(tmp_sch))
+            # Some FS have second-resolution mtimes; sleep a touch so each
+            # rotation gets a distinct timestamp.
+            import time
+            time.sleep(0.005)
+        rotated = list(tmp_sch.parent.glob(tmp_sch.name + ".bak.*"))
+        assert len(rotated) <= _BAK_RETENTION_COUNT

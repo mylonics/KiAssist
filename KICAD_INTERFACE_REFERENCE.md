@@ -191,3 +191,113 @@ AI Client (Claude Desktop, Cursor, etc.)
    .kicad_mod / .kicad_pcb    via kicad-python
    files on disk              (kipy / kicad-api)
 ```
+
+---
+
+## Agent Contract — How the AI uses these tools
+
+This section documents the **contract** the streaming chat agent expects every
+MCP tool to honour, plus the canonical "tool flows" for the most common user
+intents.  When you add or modify an `@mcp.tool()`, update this section so
+future agents (and reviewers) understand the expected behaviour.
+
+### Tool envelope
+
+Every MCP tool returns a JSON dict:
+
+```json
+{ "status": "ok",    "data": { ... } }
+{ "status": "error", "message": "human-readable reason" }
+```
+
+The streaming dispatch (`KiAssistAPI._execute_mcp_tool`) JSON-encodes this
+envelope and forwards it back to the model with the `is_error` flag set when
+`status == "error"`.
+
+### Focused-agent tool filtering
+
+The `set_focused_agent("schematic-agent" | "pcb-agent" | …)` API filters which
+tools the model sees on each turn:
+
+| `focused_agent`        | Tool prefixes exposed                                 |
+| ---------------------- | ----------------------------------------------------- |
+| `None` / unspecified   | All tools                                             |
+| `schematic-agent`      | `schematic_*`, `kicad_*`, `library_*`, `web_search`   |
+| `symbol-agent`         | `symbol_*`, `library_*`                               |
+| `footprint-agent`      | `footprint_*`, `library_*`                            |
+| `pcb-agent`            | `pcb_*`, `kicad_*`, `library_*`                       |
+| `requirements-agent`   | `project_*`, `web_search`                             |
+
+Smaller tool surfaces dramatically improve tool-selection accuracy on smaller
+models.
+
+### Mutating-tool round-trip
+
+Tools in `KiAssistAPI._MUTATING_SCHEMATIC_TOOLS` (e.g. `schematic_add_symbol`,
+`schematic_add_wire`, `schematic_save`) are wrapped in
+`SchematicEditPipeline` when called with a `path` argument:
+
+1. If the file is open in KiCad, `kicad_save_schematic` is invoked first.
+2. An advisory file lock is acquired.
+3. The MCP tool runs.
+4. On error, the `.bak` backup is restored.
+5. The lock is released.
+6. If the file is still open in KiCad, `kicad_reload_schematic` triggers a UI refresh.
+
+`_safe_save` writes both a canonical `<file>.bak` and a timestamped
+`<file>.bak.<unix-ms>` rotation; only the most recent
+`_BAK_RETENTION_COUNT` (5) rotations are kept.
+
+### Canonical agent flows
+
+#### "Add a 100 nF decoupling cap on U1's VCC pin"
+
+```
+schematic_open(path)
+  → schematic_get_power_pins(path, reference="U1")
+  → library_search(query="cap", kind="symbol")
+  → schematic_add_symbol(path, lib_id="Device:C", reference="C?", value="100nF", at=...)
+  → schematic_connect_pins(path, ref_a="U1", pin_a="VCC", ref_b="C?", pin_b="1")
+  → kicad_save_schematic(path)   # auto-injected by SchematicEditPipeline
+```
+
+#### "Build a blank schematic for an STM32 dev board"
+
+```
+project_create(directory="…", name="stm32-devboard")
+  → library_search(query="stm32", kind="symbol")
+  → schematic_add_symbol(path, lib_id="MCU_ST_STM32F4:STM32F407VETx", …)
+  → schematic_add_symbol(path, lib_id="Device:C", …)            # decoupling caps
+  → schematic_add_symbol(path, lib_id="Connector:USB_C_Receptacle_USB2.0", …)
+  → schematic_save(path)
+```
+
+#### "Tell me about U1"
+
+```
+schematic_query(path, question="U1 pinout")     # one tool, not five
+```
+
+#### "What's in this project?"
+
+The streaming chat injects the tiny project header automatically (project
+name, sheet count, BOM size, KIASSIST.md memory).  For deeper detail:
+
+```
+project_get_context(project_path)               # full synthesized blob
+schematic_query(path, question="summary")       # per-sheet stats
+```
+
+### Adding a new MCP tool — checklist
+
+1. Decorate the function with `@mcp.tool()` so FastMCP exports its schema.
+2. Validate the file path with `_validate_path(...)` before reading.
+3. Return the standard envelope via `_ok(data)` or `_err(msg)`.
+4. If the tool **mutates** a `.kicad_sch`, add it to
+   `KiAssistAPI._MUTATING_SCHEMATIC_TOOLS` so the live KiCad save/reload
+   round-trip is automatic.
+5. If the tool is agent-specific, add its prefix to
+   `KiAssistAPI._AGENT_TOOL_PREFIXES`.
+6. Add a unit test in `tests/test_mcp_server.py` that calls it via the
+   `_call(...)` helper (which exercises `in_process_call`).
+7. Document the canonical flow above when it unlocks a new user intent.

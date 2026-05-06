@@ -149,6 +149,11 @@ class ContextWindowManager:
         """Model's maximum context size in tokens."""
         return self._context_window
 
+    @property
+    def summarize_threshold(self) -> float:
+        """Fraction of the context window at which auto-summary fires."""
+        return self._summarize_threshold
+
     def track_usage(self, usage: Dict[str, int]) -> None:
         """Record token usage reported by the provider for a single turn.
 

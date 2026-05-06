@@ -528,15 +528,33 @@ class KiAssistAPI:
             return None
 
         if provider_name == "gemini":
-            from .ai.gemini import GeminiProvider  # optional dep
+            try:
+                from .ai.gemini import GeminiProvider  # optional dep
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'google-genai' package is required for Gemini. "
+                    "Install with: pip install kiassist-utils[ai]"
+                ) from exc
             return GeminiProvider(api_key, model)
 
         if provider_name == "claude":
-            from .ai.claude import ClaudeProvider  # optional dep
+            try:
+                from .ai.claude import ClaudeProvider  # optional dep
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'anthropic' package is required for Claude. "
+                    "Install with: pip install kiassist-utils[ai]"
+                ) from exc
             return ClaudeProvider(api_key, model)
 
         if provider_name == "openai":
-            from .ai.openai import OpenAIProvider  # optional dep
+            try:
+                from .ai.openai import OpenAIProvider  # optional dep
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'openai' package is required for OpenAI. "
+                    "Install with: pip install kiassist-utils[ai]"
+                ) from exc
             return OpenAIProvider(api_key, model)
 
         return None
@@ -904,7 +922,7 @@ class KiAssistAPI:
         # highest token counts first, since they are usually cheap to
         # regenerate and the most context-bloating part of the history.
         if ctx_mgr is not None:
-            budget = int(ctx_mgr.context_window * ctx_mgr._summarize_threshold)  # noqa: SLF001
+            budget = int(ctx_mgr.context_window * ctx_mgr.summarize_threshold)
             total = sum(token_counts)
             if total > budget:
                 # Build (idx, tokens) pairs for tool turns only, sorted by
@@ -1403,10 +1421,37 @@ class KiAssistAPI:
         "kicad_list_instances": "Detecting KiCad\u2026",
     }
 
+    # Tools that mutate a ``.kicad_sch`` file.  When dispatched, they are
+    # wrapped in :class:`SchematicEditPipeline` so KiCad is asked to save
+    # before the edit and reload after it.  Only schematic-side tools are
+    # routed through the pipeline today; PCB tools have separate handling.
+    _MUTATING_SCHEMATIC_TOOLS: frozenset = frozenset({
+        "schematic_add_symbol",
+        "schematic_remove_symbol",
+        "schematic_modify_symbol",
+        "schematic_add_wire",
+        "schematic_remove_wire",
+        "schematic_connect_pins",
+        "schematic_add_label",
+        "schematic_add_global_label",
+        "schematic_add_hierarchical_label",
+        "schematic_add_junction",
+        "schematic_add_no_connect",
+        "schematic_add_text",
+        "schematic_remove_text",
+        "schematic_set_property",
+        "schematic_save",
+    })
+
     async def _execute_mcp_tool(
         self, name: str, arguments: Dict[str, Any]
     ) -> tuple[str, bool]:
         """Dispatch a tool call to the in-process MCP server.
+
+        Schematic-mutating tools are wrapped in
+        :class:`~kiassist_utils.ipc_workflow.SchematicEditPipeline` so the
+        KiCad GUI is asked to save before the edit and reload after it.
+        Non-mutating and PCB tools dispatch directly via ``in_process_call``.
 
         Args:
             name: Tool name as registered with FastMCP.
@@ -1418,8 +1463,20 @@ class KiAssistAPI:
             sees a stable, machine-parseable payload.
         """
         try:
-            from .mcp_server import in_process_call
-            result = await in_process_call(name, arguments)
+            # Mutating-schematic tools route through the live KiCad
+            # save/edit/reload pipeline when a file path is supplied.
+            file_path = arguments.get("path") if isinstance(arguments, dict) else None
+            if (
+                name in self._MUTATING_SCHEMATIC_TOOLS
+                and isinstance(file_path, str)
+                and file_path.endswith(".kicad_sch")
+            ):
+                from .ipc_workflow import SchematicEditPipeline
+                pipeline = SchematicEditPipeline(file_path)
+                result = await pipeline.run(name, arguments)
+            else:
+                from .mcp_server import in_process_call
+                result = await in_process_call(name, arguments)
         except Exception as exc:  # noqa: BLE001
             logger.warning("MCP tool %r failed: %s", name, exc, exc_info=True)
             return f"Tool execution error: {exc}", True

@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import shutil
+import time
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -135,11 +136,49 @@ def _pos_dict(pos: Position) -> Dict[str, float]:
     return {"x": pos.x, "y": pos.y, "angle": pos.angle}
 
 
+# Maximum number of timestamped ``.bak.N`` rotations kept per file.
+# Older rotations are pruned by ``_safe_save`` so the project directory
+# does not accumulate dozens of backups during a long agent session.
+_BAK_RETENTION_COUNT = 5
+
+
+def _prune_bak_rotations(dest: Path, retention: int = _BAK_RETENTION_COUNT) -> None:
+    """Delete the oldest ``<file>.bak.N`` rotations once *retention* is exceeded.
+
+    Args:
+        dest:      The original (live) file path; siblings ``<dest>.bak.*`` are
+                   considered for pruning.
+        retention: Maximum number of timestamped rotations to keep.  Set to 0
+                   to delete every rotation (only the canonical ``.bak`` is
+                   kept).  Defaults to :data:`_BAK_RETENTION_COUNT`.
+    """
+    parent = dest.parent
+    base = dest.name + ".bak."
+    rotations: List[Path] = []
+    try:
+        for entry in parent.iterdir():
+            if entry.name.startswith(base):
+                rotations.append(entry)
+    except OSError:
+        return
+    # Newest first by mtime; drop everything past the retention count.
+    rotations.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in rotations[max(retention, 0):]:
+        try:
+            old.unlink()
+        except OSError as exc:
+            logger.debug("Failed to prune backup %s: %s", old, exc)
+
+
 def _safe_save(obj: Any, path: str | os.PathLike) -> None:
     """Save *obj* to *path* with a ``.bak`` backup and an atomic rename.
 
     The sequence is:
-    1. If *path* already exists, copy it to ``<path>.bak`` (backup).
+    1. If *path* already exists, copy it to ``<path>.bak`` (canonical
+       latest backup) and to ``<path>.bak.<unix-ms>`` (timestamped
+       rotation).  Older rotations beyond :data:`_BAK_RETENTION_COUNT`
+       are pruned so the project folder doesn't accumulate dozens of
+       backups during a long agent session.
     2. Write the new content to a sibling temporary file in the same directory.
     3. Atomically replace *path* with the temp file via ``os.replace()``.
 
@@ -157,7 +196,18 @@ def _safe_save(obj: Any, path: str | os.PathLike) -> None:
     dest = Path(path)
     bak_path = str(dest) + ".bak"
     if dest.exists():
+        # Always-current backup (legacy contract — many other tools look
+        # for the bare ``.bak`` file).
         shutil.copy2(dest, bak_path)
+        # Timestamped rotation so a long edit session keeps a few
+        # historical revisions instead of overwriting the only backup.
+        try:
+            ts = int(time.time() * 1000)
+            rot_path = f"{dest}.bak.{ts}"
+            shutil.copy2(dest, rot_path)
+        except OSError as exc:
+            logger.debug("Failed to write backup rotation: %s", exc)
+        _prune_bak_rotations(dest)
     else:
         logger.debug("No existing file at %s; skipping backup creation.", dest)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=dest.parent, suffix=".tmp")
