@@ -153,7 +153,6 @@ function dismissError() {
   error.value = '';
 }
 
-const clearError = dismissError;
 
 /** Clear the part-lookup input fields */
 function clearPartLookup() {
@@ -200,7 +199,7 @@ async function importByPart() {
   const l = partLcsc.value.trim();
   if (!m && !s && !l) { error.value = 'Please enter at least one part identifier'; return; }
 
-  clearError();
+  dismissError();
   cadSources.value = [];
   lookupStatus.value = 'Starting lookup…';
   loading.value = true;
@@ -329,7 +328,7 @@ async function importZips() {
   if (!api) { error.value = 'Backend not available'; return; }
   if (!zipPaths.value.length) { error.value = 'Please select at least one file'; return; }
 
-  clearError();
+  dismissError();
   zipsLoading.value = true;
   loading.value = true;
   try {
@@ -422,7 +421,7 @@ async function importFromKicad() {
   const api = getApi();
   if (!api) { error.value = 'Backend not available'; return; }
 
-  clearError();
+  dismissError();
   loading.value = true;
   try {
     const r = await api.importer_import_from_kicad(
@@ -707,7 +706,7 @@ function handleResult(r: any) {
             :class="['search-row', { selected: selectedResult === r }]"
             @click="selectedResult = r"
             @dblclick="selectedResult = r; importFromKicad()"
-            :title="r.description ? r.description : r.library + ':' + r.name"
+            :title="r.description || r.library + ':' + r.name"
           >
             <span class="result-lib">{{ r.library }}</span>
             <span class="result-name">{{ r.name }}</span>

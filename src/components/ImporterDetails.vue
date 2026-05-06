@@ -218,6 +218,14 @@ const hasSym = computed(() => !!props.component.symbol_sexpr);
 const hasFp = computed(() => !!props.component.footprint_sexpr);
 const hasModel = computed(() => !!props.component.step_data);
 
+/** Tooltip text explaining why the Save button may be disabled */
+const saveButtonTooltip = computed(() => {
+  if (!hasAnythingToSave.value) return 'No assets loaded to save';
+  if (hasSym.value && saveSymLib.value === '') return 'Select a symbol library first';
+  if (fpSaveEnabled.value && saveFpLib.value === '') return 'Select a footprint library first';
+  return 'Save symbol, footprint and 3D model to library';
+});
+
 /** True when this component came from the variant importer. */
 const isVariant = computed(() => (props.component.source_info || '').startsWith('Variant:'));
 
@@ -1362,7 +1370,7 @@ async function doSaveToLibrary(
                   class="action-btn primary"
                   @click="saveToLibrary"
                   :disabled="saveLoading || !hasAnythingToSave"
-                  :title="!hasAnythingToSave ? 'No assets loaded to save' : saveSymLib === '' && hasSym ? 'Select a symbol library first' : saveFpLib === '' && fpSaveEnabled ? 'Select a footprint library first' : 'Save symbol, footprint and 3D model to library'"
+                  :title="saveButtonTooltip"
                 >
                   <span class="material-icons">{{ saveLoading ? 'sync' : 'save' }}</span>
                   {{ saveLoading ? 'Saving…' : 'Save to Library' }}

@@ -1505,8 +1505,8 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 <template>
   <div class="chat-container">
     <!-- Settings Modal -->
-    <div v-if="showApiKeyPrompt" class="modal-overlay" role="dialog" aria-label="Settings" @click.self="showApiKeyPrompt = false">
-      <div class="modal-content modal-wide settings-modal">
+    <div v-if="showApiKeyPrompt" class="modal-overlay" @click.self="showApiKeyPrompt = false">
+      <div class="modal-content modal-wide settings-modal" role="dialog" aria-label="Settings">
         <div class="modal-header-row">
           <h3>Settings</h3>
           <button class="modal-close-btn" @click="showApiKeyPrompt = false" title="Close">
@@ -1864,8 +1864,8 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
     </div>
 
     <!-- Sessions Modal -->
-    <div v-if="showSessionsModal" class="modal-overlay" role="dialog" aria-label="Conversation Sessions" @click.self="showSessionsModal = false">
-      <div class="modal-content modal-wide">
+    <div v-if="showSessionsModal" class="modal-overlay" @click.self="showSessionsModal = false">
+      <div class="modal-content modal-wide" role="dialog" aria-label="Conversation Sessions">
         <div class="modal-header-row">
           <h3>Conversation Sessions</h3>
           <button class="modal-close-btn" @click="showSessionsModal = false" title="Close">
