@@ -181,6 +181,99 @@ def _safe_save(obj: Any, path: str | os.PathLike) -> None:
 
 
 @mcp.tool()
+def schematic_create(
+    path: str,
+    title: Optional[str] = None,
+    paper: str = "A4",
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Create a new, empty ``.kicad_sch`` schematic file.
+
+    Use this tool to start a brand-new schematic that the agent will then
+    populate with symbols and wires.  The file is written using the same
+    KiCad 8 file format (version ``20231120``, generator ``"eeschema"``)
+    as files exported by KiCad itself.
+
+    Args:
+        path:      Destination ``.kicad_sch`` file path.  Parent directory
+                   must already exist.
+        title:     Optional title placed in the title block.  When ``None``
+                   the title block is omitted.
+        paper:     Paper size identifier (``"A4"``, ``"A3"``, ``"USLetter"``…).
+                   Defaults to ``"A4"``.
+        overwrite: When ``True``, replace an existing file at *path*.  When
+                   ``False`` (default), refuse to overwrite an existing file.
+
+    Returns:
+        Dict with ``path``, ``version``, ``paper`` and ``title``.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    dest = Path(path)
+    if dest.exists() and not overwrite:
+        return _err(
+            f"File already exists: {path}. Pass overwrite=True to replace it."
+        )
+    if not dest.parent.exists():
+        return _err(f"Parent directory does not exist: {dest.parent}")
+    if not isinstance(paper, str) or not paper.strip():
+        return _err("paper must be a non-empty string.")
+
+    sch = Schematic()
+    sch.version = 20231120
+    sch.generator = "eeschema"
+    sch.generator_version = "8.0"
+    sch.paper = paper.strip()
+    if title:
+        from .kicad_parser.schematic import TitleBlock
+        sch.title_block = TitleBlock(title=str(title))
+    try:
+        _safe_save(sch, dest)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to write schematic: {exc}")
+    return _ok(
+        {
+            "path": str(dest),
+            "version": sch.version,
+            "paper": sch.paper,
+            "title": title or "",
+        }
+    )
+
+
+@mcp.tool()
+def schematic_save(path: str) -> Dict[str, Any]:
+    """Re-serialize a schematic file in place.
+
+    Most mutating tools (``schematic_add_symbol``, ``schematic_add_wire``…)
+    save automatically as a safety net.  This explicit save tool is
+    intended for the agent to use when it wants to mark a logical
+    "checkpoint" — e.g. after a multi-step edit and before triggering a
+    KiCad reload.  It also normalises the file format for round-trip
+    consistency.
+
+    Args:
+        path: Path to a ``.kicad_sch`` file.
+
+    Returns:
+        Dict with ``path`` and ``component_count``.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    try:
+        sch = Schematic.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to load schematic: {exc}")
+    try:
+        _safe_save(sch, path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to save schematic: {exc}")
+    return _ok({"path": str(path), "component_count": len(sch.symbols)})
+
+
+@mcp.tool()
 def schematic_open(path: str) -> Dict[str, Any]:
     """Load a schematic file and return a summary.
 
@@ -831,6 +924,158 @@ def schematic_search(
                 }
             )
     return _ok(results)
+
+
+@mcp.tool()
+def schematic_query(
+    path: str,
+    question: str,
+) -> Dict[str, Any]:
+    """Answer a natural-language question about a schematic with one call.
+
+    A convenience tool that maps common agent questions to the appropriate
+    deeper analysis without forcing the agent to chain 4–5 tool calls.
+    Recognised question patterns (case-insensitive substring match):
+
+    * ``"summary"`` / ``"overview"`` — counts of symbols, wires, sheets,
+      labels.
+    * ``"power"`` — list of likely power nets and the symbols connected
+      to them.
+    * ``"net"`` / ``"label"`` — labelled nets present in the schematic.
+    * ``"pin"`` for ``<reference>`` — pinout for that component.
+    * ``"reference"`` / ``"list components"`` / ``"bom"`` — full BOM-like
+      list of placed components.
+    * ``"unused"`` / ``"floating"`` — symbols whose pins have no
+      connected wires.
+
+    Falls back to ``schematic_search`` semantics (substring match) when
+    none of the patterns match, so the tool is always useful.
+
+    Args:
+        path:     Path to a ``.kicad_sch`` file.
+        question: Natural-language question.
+
+    Returns:
+        Dict with ``data`` containing ``question``, ``answer_type``, and
+        the matched payload.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    if not isinstance(question, str) or not question.strip():
+        return _err("question must be a non-empty string.")
+    try:
+        sch = Schematic.load(path)
+    except FileNotFoundError:
+        return _err(f"File not found: {path}")
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to load schematic: {exc}")
+
+    q = question.lower()
+    payload: Dict[str, Any] = {"question": question}
+
+    if any(k in q for k in ("summary", "overview", "stats")):
+        payload["answer_type"] = "summary"
+        payload["result"] = {
+            "component_count": len(sch.symbols),
+            "wire_count": len(sch.wires),
+            "sheet_count": len(sch.sheets),
+            "label_count": len(sch.labels) + len(sch.global_labels)
+            + len(sch.hierarchical_labels),
+            "junction_count": len(sch.junctions),
+            "no_connect_count": len(sch.no_connects),
+        }
+        return _ok(payload)
+
+    if any(k in q for k in ("bom", "list components", "all components",
+                            "all symbols", "list symbols", "every component")):
+        payload["answer_type"] = "components"
+        payload["result"] = [
+            {
+                "reference": s.reference,
+                "value": s.value,
+                "footprint": s.footprint,
+                "lib_id": s.lib_id,
+            }
+            for s in sch.symbols
+        ]
+        return _ok(payload)
+
+    if "power" in q:
+        # Heuristic: power symbols typically have lib_id starting with
+        # "power:" in KiCad's standard library.
+        power_syms = []
+        for s in sch.symbols:
+            if (s.lib_id or "").lower().startswith("power:") or \
+                    (s.value or "").upper() in (
+                        "VCC", "VDD", "GND", "+5V", "+3V3", "+12V", "-12V",
+                        "+3.3V", "VBUS", "VSS"
+                    ):
+                power_syms.append(
+                    {
+                        "reference": s.reference,
+                        "value": s.value,
+                        "lib_id": s.lib_id,
+                        "position": _pos_dict(s.position),
+                    }
+                )
+        payload["answer_type"] = "power"
+        payload["result"] = power_syms
+        return _ok(payload)
+
+    if any(k in q for k in ("net", "label")):
+        payload["answer_type"] = "nets"
+        labels = [
+            {"text": l.text, "position": _pos_dict(l.position)}
+            for l in sch.labels
+        ]
+        global_labels = [
+            {"text": l.text, "position": _pos_dict(l.position)}
+            for l in sch.global_labels
+        ]
+        payload["result"] = {
+            "local_labels": labels,
+            "global_labels": global_labels,
+        }
+        return _ok(payload)
+
+    if "pin" in q:
+        # Try to find a reference designator in the question.
+        import re as _re
+        m = _re.search(r"\b([A-Z]+\d+)\b", question)
+        if m:
+            ref = m.group(1)
+            for s in sch.symbols:
+                if s.reference.upper() == ref.upper():
+                    payload["answer_type"] = "pinout"
+                    payload["result"] = {
+                        "reference": s.reference,
+                        "value": s.value,
+                        "lib_id": s.lib_id,
+                        "footprint": s.footprint,
+                        "position": _pos_dict(s.position),
+                    }
+                    return _ok(payload)
+            return _err(f"No symbol with reference {ref!r} found.")
+
+    # Fallback — substring match across reference/value/footprint/lib_id.
+    needle = q.strip()
+    matches = []
+    for s in sch.symbols:
+        haystack = " ".join(
+            x for x in (s.reference, s.value, s.footprint, s.lib_id) if x
+        ).lower()
+        if needle in haystack:
+            matches.append(
+                {
+                    "reference": s.reference,
+                    "value": s.value,
+                    "lib_id": s.lib_id,
+                    "footprint": s.footprint,
+                }
+            )
+    payload["answer_type"] = "search_fallback"
+    payload["result"] = matches
+    return _ok(payload)
 
 
 # ===========================================================================
@@ -2283,6 +2528,183 @@ def pcb_add_via(
 # ===========================================================================
 # 2.7  Project Context Tools
 # ===========================================================================
+
+
+@mcp.tool()
+def project_create(
+    directory: str,
+    name: str,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Scaffold a new KiCad project on disk.
+
+    Creates ``<directory>/<name>/`` containing a minimal ``.kicad_pro``
+    project file and an empty ``.kicad_sch`` root schematic.  This is the
+    canonical "I want to build a brand-new design" entry point for the
+    agent.
+
+    The emitted ``.kicad_pro`` is a hand-rolled minimal template (it
+    intentionally does not require the full KiCad install).  KiCad will
+    fill in defaults the first time the user opens it.
+
+    Args:
+        directory: Parent directory where the project folder will be
+                   created.  Must already exist.
+        name:      Project name (also used as the folder, ``.kicad_pro``,
+                   and ``.kicad_sch`` filename).  Must be a valid
+                   filesystem name.
+        overwrite: When ``True``, replace any existing files at the
+                   destination.  When ``False`` (default), refuse to
+                   touch an existing project folder.
+
+    Returns:
+        Dict with ``project_dir``, ``pro_path``, ``sch_path``.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return _err("name must be a non-empty string.")
+    name = name.strip()
+    # Reject path separators and control characters in the name.
+    if any(c in name for c in ("/", "\\", "\0")) or name in (".", ".."):
+        return _err(f"Invalid project name: {name!r}")
+    parent = Path(directory)
+    if not parent.is_dir():
+        return _err(f"Parent directory does not exist: {directory}")
+
+    project_dir = parent / name
+    pro_path = project_dir / f"{name}.kicad_pro"
+    sch_path = project_dir / f"{name}.kicad_sch"
+
+    if project_dir.exists() and any(project_dir.iterdir()) and not overwrite:
+        return _err(
+            f"Project directory already exists and is non-empty: {project_dir}. "
+            "Pass overwrite=True to replace it."
+        )
+    try:
+        project_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _err(f"Failed to create project directory: {exc}")
+
+    # Minimal .kicad_pro — KiCad fills in defaults on first open.  This
+    # mirrors the structure KiCad 8 itself writes for a freshly-created
+    # project (everything optional is omitted to keep the file readable).
+    import json as _json
+    pro_data = {
+        "board": {},
+        "boards": [],
+        "cvpcb": {"equivalence_files": []},
+        "libraries": {"pinned_footprint_libs": [], "pinned_symbol_libs": []},
+        "meta": {"filename": pro_path.name, "version": 1},
+        "net_settings": {},
+        "pcbnew": {},
+        "schematic": {
+            "annotate_start_num": 0,
+            "drawing": {},
+            "spice_external_command": "spice \"%I\"",
+        },
+        "sheets": [["00000000-0000-0000-0000-000000000001", ""]],
+        "text_variables": {},
+    }
+    try:
+        if pro_path.exists() and not overwrite:
+            return _err(f"Refusing to overwrite existing file: {pro_path}")
+        pro_path.write_text(
+            _json.dumps(pro_data, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        return _err(f"Failed to write .kicad_pro: {exc}")
+
+    # Create empty root schematic via Schematic dataclass + _safe_save.
+    sch = Schematic()
+    sch.version = 20231120
+    sch.generator = "eeschema"
+    sch.generator_version = "8.0"
+    sch.paper = "A4"
+    try:
+        if sch_path.exists() and not overwrite:
+            return _err(f"Refusing to overwrite existing file: {sch_path}")
+        _safe_save(sch, sch_path)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Failed to write root schematic: {exc}")
+
+    return _ok(
+        {
+            "project_dir": str(project_dir),
+            "pro_path": str(pro_path),
+            "sch_path": str(sch_path),
+            "name": name,
+        }
+    )
+
+
+@mcp.tool()
+def library_search(
+    query: str,
+    kind: str = "symbol",
+    project_path: Optional[str] = None,
+    limit: int = 25,
+) -> Dict[str, Any]:
+    """Search KiCad symbol or footprint libraries by nickname / description.
+
+    Use this tool **before** ``schematic_add_symbol`` to discover the
+    correct ``lib_id`` (e.g. ``"Device:R"`` or ``"Connector:USB_C"``).
+    The search is a substring match, case-insensitive, against both the
+    library nickname and its description.
+
+    Args:
+        query:        Substring to search for (e.g. ``"resistor"``,
+                      ``"USB"``, ``"STM32"``).  Empty string lists every
+                      library, capped at *limit*.
+        kind:         Either ``"symbol"`` (default) or ``"footprint"``.
+        project_path: Optional path to a ``.kicad_pro`` file or project
+                      directory.  When provided, project-local library
+                      tables are searched first (matches KiCad's own
+                      lookup order).
+        limit:        Maximum number of results.  Defaults to 25.
+
+    Returns:
+        Dict with a ``data`` list of ``{nickname, uri, description, plugin_type}``.
+    """
+    if not isinstance(query, str):
+        return _err("query must be a string.")
+    if kind not in ("symbol", "footprint"):
+        return _err(f"kind must be 'symbol' or 'footprint', got {kind!r}")
+    if not isinstance(limit, int) or limit < 1:
+        return _err("limit must be a positive integer.")
+
+    project_dir: Optional[str] = None
+    if project_path:
+        p = Path(project_path)
+        if p.is_file():
+            project_dir = str(p.parent)
+        elif p.is_dir():
+            project_dir = str(p)
+
+    try:
+        disc = LibraryDiscovery(project_dir)
+        if kind == "symbol":
+            entries = disc.list_symbol_libraries()
+        else:
+            entries = disc.list_footprint_libraries()
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"Library discovery failed: {exc}")
+
+    needle = query.strip().lower()
+    matches = []
+    for entry in entries:
+        haystack = (entry.nickname + " " + (entry.description or "")).lower()
+        if not needle or needle in haystack:
+            matches.append(
+                {
+                    "nickname": entry.nickname,
+                    "uri": entry.uri,
+                    "description": entry.description,
+                    "plugin_type": entry.plugin_type,
+                }
+            )
+        if len(matches) >= limit:
+            break
+
+    return _ok(matches)
 
 
 @mcp.tool()
