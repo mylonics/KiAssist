@@ -277,8 +277,15 @@ function scrollToBottom() {
 
 function handleScroll() {
   if (!messagesContainer.value) return;
-  const { scrollTop, scrollHeight, clientHeight } = messagesContainer.value;
-  isScrolledUp.value = scrollHeight - scrollTop - clientHeight > 120;
+  // Throttle: skip if a frame is already scheduled
+  if ((handleScroll as any)._scheduled) return;
+  (handleScroll as any)._scheduled = true;
+  requestAnimationFrame(() => {
+    (handleScroll as any)._scheduled = false;
+    if (!messagesContainer.value) return;
+    const { scrollTop, scrollHeight, clientHeight } = messagesContainer.value;
+    isScrolledUp.value = scrollHeight - scrollTop - clientHeight > 120;
+  });
 }
 
 function autoResizeTextarea() {
@@ -288,6 +295,12 @@ function autoResizeTextarea() {
     const maxH = 160;
     chatInputRef.value.style.height = Math.min(chatInputRef.value.scrollHeight, maxH) + 'px';
   });
+}
+
+/** Clear the input and reset textarea height. */
+function clearInput() {
+  inputMessage.value = '';
+  autoResizeTextarea();
 }
 
 const examplePrompts = [
@@ -935,7 +948,7 @@ async function sendMessage() {
   };
   messages.value.push(userMessage);
   const messageText = inputMessage.value;
-  inputMessage.value = '';
+  clearInput();
   await sendMessageWithText(messageText);
 }
 
@@ -945,7 +958,7 @@ async function steerMessage() {
   if (!window.pywebview?.api) return;
 
   const steerText = inputMessage.value;
-  inputMessage.value = '';
+  clearInput();
 
   // Show the steer message as a user message in the chat
   messages.value.push({
@@ -1036,7 +1049,7 @@ async function steerMessage() {
 function queueMessage() {
   if (!inputMessage.value.trim()) return;
   queuedMessage.value = inputMessage.value;
-  inputMessage.value = '';
+  clearInput();
 }
 
 // Process queued messages after a stream finishes
@@ -1212,7 +1225,6 @@ watch(messages, () => {
     saveMessages();
   }
 }, { deep: true });
-watch(inputMessage, () => { autoResizeTextarea(); });
 
 onMounted(() => {
   loadMessages();
@@ -1312,9 +1324,7 @@ async function handleContextAnswer(overrideAnswer?: string) {
     sender: 'user',
     timestamp: new Date(),
   });
-  inputMessage.value = '';
-
-  // Send the raw answer to the backend — __SKIP__ tells it to drop this Q
+  clearInput();
   const answer = answerText;
 
   isLoading.value = true;
@@ -1478,7 +1488,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
   <div class="chat-container">
     <!-- Settings Modal -->
     <div v-if="showApiKeyPrompt" class="modal-overlay" @click.self="showApiKeyPrompt = false">
-      <div class="modal-content modal-wide settings-modal">
+      <div class="modal-content modal-wide settings-modal" @keydown.escape="showApiKeyPrompt = false">
         <div class="modal-header-row">
           <h3>Settings</h3>
           <button class="modal-close-btn" @click="showApiKeyPrompt = false" title="Close">
@@ -1837,7 +1847,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 
     <!-- Sessions Modal -->
     <div v-if="showSessionsModal" class="modal-overlay" @click.self="showSessionsModal = false">
-      <div class="modal-content modal-wide">
+      <div class="modal-content modal-wide" @keydown.escape="showSessionsModal = false">
         <div class="modal-header-row">
           <h3>Conversation Sessions</h3>
           <button class="modal-close-btn" @click="showSessionsModal = false" title="Close">
