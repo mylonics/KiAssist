@@ -706,7 +706,7 @@ function handleResult(r: any) {
             :class="['search-row', { selected: selectedResult === r }]"
             @click="selectedResult = r"
             @dblclick="selectedResult = r; importFromKicad()"
-            :title="r.description || r.library + ':' + r.name"
+            :title="r.description || `${r.library}:${r.name}`"
           >
             <span class="result-lib">{{ r.library }}</span>
             <span class="result-name">{{ r.name }}</span>

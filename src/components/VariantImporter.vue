@@ -151,7 +151,7 @@ function loadMpnHistory() {
 function saveMpnToHistory(mpn: string) {
   const trimmed = mpn.trim();
   if (!trimmed) return;
-  const history = [trimmed, ...mpnHistory.value.filter(m => m !== trimmed)].slice(0, MPN_HISTORY_LIMIT);
+  const history = Array.from(new Set([trimmed, ...mpnHistory.value])).slice(0, MPN_HISTORY_LIMIT);
   mpnHistory.value = history;
   try { localStorage.setItem(MPN_HISTORY_KEY, JSON.stringify(history)); } catch { /* ignore */ }
 }
