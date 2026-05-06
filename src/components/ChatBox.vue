@@ -275,13 +275,14 @@ function scrollToBottom() {
   });
 }
 
+let _scrollThrottleScheduled = false;
+
 function handleScroll() {
   if (!messagesContainer.value) return;
-  // Throttle: skip if a frame is already scheduled
-  if ((handleScroll as any)._scheduled) return;
-  (handleScroll as any)._scheduled = true;
+  if (_scrollThrottleScheduled) return;
+  _scrollThrottleScheduled = true;
   requestAnimationFrame(() => {
-    (handleScroll as any)._scheduled = false;
+    _scrollThrottleScheduled = false;
     if (!messagesContainer.value) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesContainer.value;
     isScrolledUp.value = scrollHeight - scrollTop - clientHeight > 120;
@@ -1121,6 +1122,20 @@ function handleKeyPress(event: KeyboardEvent) {
   }
 }
 
+function handleGlobalKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return;
+  if (showApiKeyPrompt.value) {
+    showApiKeyPrompt.value = false;
+    e.preventDefault();
+  } else if (showSessionsModal.value) {
+    showSessionsModal.value = false;
+    e.preventDefault();
+  } else if (confirmingClear.value) {
+    cancelClearConfirm();
+    e.preventDefault();
+  }
+}
+
 async function copyMessage(messageId: string, text: string, timestamp: Date, sender: 'user' | 'assistant') {
   try {
     const timeStr = timestamp.toLocaleString();
@@ -1236,6 +1251,7 @@ onMounted(() => {
       messagesContainer.value.addEventListener('scroll', handleScroll, { passive: true });
     }
   });
+  document.addEventListener('keydown', handleGlobalKeydown);
 });
 
 onBeforeUnmount(() => {
@@ -1246,6 +1262,7 @@ onBeforeUnmount(() => {
   if (messagesContainer.value) {
     messagesContainer.value.removeEventListener('scroll', handleScroll);
   }
+  document.removeEventListener('keydown', handleGlobalKeydown);
 });
 
 /** Insert text into the chat input (called externally, e.g. from ComponentSearch). */
@@ -1488,7 +1505,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
   <div class="chat-container">
     <!-- Settings Modal -->
     <div v-if="showApiKeyPrompt" class="modal-overlay" @click.self="showApiKeyPrompt = false">
-      <div class="modal-content modal-wide settings-modal" @keydown.escape="showApiKeyPrompt = false">
+      <div class="modal-content modal-wide settings-modal">
         <div class="modal-header-row">
           <h3>Settings</h3>
           <button class="modal-close-btn" @click="showApiKeyPrompt = false" title="Close">
@@ -1847,7 +1864,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 
     <!-- Sessions Modal -->
     <div v-if="showSessionsModal" class="modal-overlay" @click.self="showSessionsModal = false">
-      <div class="modal-content modal-wide" @keydown.escape="showSessionsModal = false">
+      <div class="modal-content modal-wide">
         <div class="modal-header-row">
           <h3>Conversation Sessions</h3>
           <button class="modal-close-btn" @click="showSessionsModal = false" title="Close">
