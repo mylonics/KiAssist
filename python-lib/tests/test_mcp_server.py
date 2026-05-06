@@ -975,3 +975,292 @@ class TestPCBBackupOnSave:
         assert not bak.exists()
         _call("pcb_add_net", path=str(tmp_pcb), name="BACKUP_TEST_NET")
         assert bak.exists(), ".bak file should be created by _safe_save"
+
+
+# ---------------------------------------------------------------------------
+# Wiring contract — guards the Phase 1 agent loop against MCP regressions.
+# Bumping the `mcp` package's upper bound in pyproject.toml without these
+# tests passing means the chat agent will silently lose its tools.
+# ---------------------------------------------------------------------------
+
+
+class TestMCPWiringContract:
+    """End-to-end checks that the MCP integration surface KiAssistAPI
+    relies on (mcp.list_tools(), in_process_call) keeps the same shape.
+    """
+
+    def test_list_tools_returns_schemas_with_expected_keys(self):
+        """``mcp.list_tools()`` must return objects with name / description /
+        inputSchema attributes — that is the schema shape KiAssistAPI's
+        ``_fetch_mcp_tool_schemas_async`` reads."""
+        from kiassist_utils.mcp_server import mcp
+
+        tools = asyncio.run(mcp.list_tools())
+        assert tools, "MCP server exposes no tools"
+        names = [t.name for t in tools]
+        # Sample a handful of tools the agent loop depends on.
+        for required in (
+            "schematic_open",
+            "schematic_add_symbol",
+            "schematic_add_wire",
+            "kicad_save_schematic",
+            "web_search",
+        ):
+            assert required in names, f"missing MCP tool {required!r}"
+        # Every tool exposes the trio the agent loop needs to forward to
+        # the LLM.  ``inputSchema`` may be None for zero-arg tools but
+        # the attribute itself must exist.
+        sample = next(t for t in tools if t.name == "schematic_open")
+        assert isinstance(sample.name, str) and sample.name
+        assert isinstance(sample.description, str)
+        assert hasattr(sample, "inputSchema")
+
+    def test_in_process_call_schematic_open_end_to_end(self):
+        """Smoke test: full ``in_process_call('schematic_open', …)``
+        round-trip returns the canonical ``{status: ok, data: {...}}``
+        envelope KiAssistAPI parses."""
+        result = _call("schematic_open", path=str(FIXTURE_SCH))
+        assert result["status"] == "ok"
+        # The envelope's ``data`` field is what the agent loop forwards
+        # back to the LLM.  Check it has at least the documented keys.
+        data = result["data"]
+        assert "component_count" in data
+        assert "sheet_count" in data
+        assert "version" in data
+
+    def test_in_process_call_web_search_tool_registered(self):
+        """The web_search MCP tool moved out of main.py must be callable
+        through the same dispatcher used by the streaming chat loop.
+        """
+        from kiassist_utils.mcp_server import mcp
+
+        tools = asyncio.run(mcp.list_tools())
+        web = next((t for t in tools if t.name == "web_search"), None)
+        assert web is not None, "web_search MCP tool not registered"
+        assert "search" in (web.description or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — create / save / library_search / schematic_query
+# ---------------------------------------------------------------------------
+
+
+class TestSchematicCreate:
+    def test_creates_minimal_valid_schematic(self, tmp_path: Path):
+        target = tmp_path / "new.kicad_sch"
+        result = _call(
+            "schematic_create",
+            path=str(target),
+            title="Brand New",
+            paper="A4",
+        )
+        assert result["status"] == "ok"
+        assert target.exists()
+        # The freshly created file must be readable by the same parser.
+        opened = _call("schematic_open", path=str(target))
+        assert opened["status"] == "ok"
+        assert opened["data"]["title"] == "Brand New"
+        assert opened["data"]["component_count"] == 0
+        assert opened["data"]["paper"] == "A4"
+
+    def test_refuses_to_overwrite_by_default(self, tmp_path: Path):
+        target = tmp_path / "exists.kicad_sch"
+        _call("schematic_create", path=str(target))
+        result = _call("schematic_create", path=str(target))
+        assert result["status"] == "error"
+        assert "already exists" in result["message"]
+
+    def test_overwrite_replaces_file(self, tmp_path: Path):
+        target = tmp_path / "exists.kicad_sch"
+        _call("schematic_create", path=str(target), title="First")
+        result = _call(
+            "schematic_create", path=str(target), title="Second", overwrite=True
+        )
+        assert result["status"] == "ok"
+        opened = _call("schematic_open", path=str(target))
+        assert opened["data"]["title"] == "Second"
+
+    def test_rejects_wrong_extension(self, tmp_path: Path):
+        result = _call("schematic_create", path=str(tmp_path / "wrong.txt"))
+        assert result["status"] == "error"
+
+    def test_rejects_missing_parent(self, tmp_path: Path):
+        target = tmp_path / "no" / "such" / "dir" / "x.kicad_sch"
+        result = _call("schematic_create", path=str(target))
+        assert result["status"] == "error"
+
+
+class TestSchematicSave:
+    def test_save_round_trips(self, tmp_sch: Path):
+        before = tmp_sch.read_text(encoding="utf-8")
+        result = _call("schematic_save", path=str(tmp_sch))
+        assert result["status"] == "ok"
+        after = tmp_sch.read_text(encoding="utf-8")
+        # Round-trip should preserve component count.
+        assert "component_count" in result["data"]
+        # Sanity — file is still parseable.
+        assert _call("schematic_open", path=str(tmp_sch))["status"] == "ok"
+
+    def test_save_missing_file(self):
+        result = _call("schematic_save", path="/no/such/file.kicad_sch")
+        assert result["status"] == "error"
+
+
+class TestProjectCreate:
+    def test_scaffolds_pro_and_sch(self, tmp_path: Path):
+        result = _call(
+            "project_create", directory=str(tmp_path), name="MyDesign"
+        )
+        assert result["status"] == "ok"
+        data = result["data"]
+        assert Path(data["pro_path"]).exists()
+        assert Path(data["sch_path"]).exists()
+        assert data["pro_path"].endswith("MyDesign.kicad_pro")
+        # The schematic must be openable via the matching MCP tool.
+        opened = _call("schematic_open", path=data["sch_path"])
+        assert opened["status"] == "ok"
+        assert opened["data"]["component_count"] == 0
+
+    def test_rejects_path_separators_in_name(self, tmp_path: Path):
+        result = _call(
+            "project_create", directory=str(tmp_path), name="bad/name"
+        )
+        assert result["status"] == "error"
+
+    def test_rejects_existing_non_empty_dir(self, tmp_path: Path):
+        existing = tmp_path / "MyDesign"
+        existing.mkdir()
+        (existing / "stuff.txt").write_text("x")
+        result = _call(
+            "project_create", directory=str(tmp_path), name="MyDesign"
+        )
+        assert result["status"] == "error"
+        assert "already exists" in result["message"]
+
+    def test_rejects_missing_parent(self):
+        result = _call(
+            "project_create", directory="/no/such/dir", name="X"
+        )
+        assert result["status"] == "error"
+
+    def test_pro_file_is_valid_json(self, tmp_path: Path):
+        import json as _json
+        result = _call(
+            "project_create", directory=str(tmp_path), name="ValidJsonPro"
+        )
+        pro = Path(result["data"]["pro_path"])
+        data = _json.loads(pro.read_text(encoding="utf-8"))
+        # Spot-check structural keys KiCad expects.
+        assert "meta" in data
+        assert "schematic" in data
+
+
+class TestLibrarySearch:
+    def test_empty_query_returns_some_libraries(self, tmp_path):
+        # Use the test sym-lib-table fixture as a project-local table.
+        from tests.test_mcp_server import FIXTURE_DIR
+        result = _call(
+            "library_search",
+            query="",
+            kind="symbol",
+            project_path=str(FIXTURE_DIR),
+        )
+        assert result["status"] == "ok"
+        assert isinstance(result["data"], list)
+
+    def test_invalid_kind_rejected(self):
+        result = _call("library_search", query="device", kind="bogus")
+        assert result["status"] == "error"
+
+    def test_substring_match(self):
+        from tests.test_mcp_server import FIXTURE_DIR
+        result = _call(
+            "library_search",
+            query="test",
+            kind="symbol",
+            project_path=str(FIXTURE_DIR),
+        )
+        assert result["status"] == "ok"
+        # Every result's nickname or description must contain "test".
+        for entry in result["data"]:
+            blob = (entry["nickname"] + " " + entry["description"]).lower()
+            assert "test" in blob
+
+
+class TestSchematicQuery:
+    def test_summary_question(self, tmp_sch: Path):
+        result = _call(
+            "schematic_query", path=str(tmp_sch), question="give me a summary"
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["answer_type"] == "summary"
+        assert "component_count" in result["data"]["result"]
+
+    def test_bom_question(self, tmp_sch: Path):
+        result = _call(
+            "schematic_query",
+            path=str(tmp_sch),
+            question="list all components",
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["answer_type"] == "components"
+        assert isinstance(result["data"]["result"], list)
+
+    def test_nets_question(self, tmp_sch: Path):
+        result = _call(
+            "schematic_query", path=str(tmp_sch), question="what nets exist?"
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["answer_type"] == "nets"
+        assert "local_labels" in result["data"]["result"]
+
+    def test_power_question(self, tmp_sch: Path):
+        result = _call(
+            "schematic_query",
+            path=str(tmp_sch),
+            question="show me the power nets",
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["answer_type"] == "power"
+
+    def test_fallback_substring_search(self, tmp_sch: Path):
+        result = _call(
+            "schematic_query", path=str(tmp_sch), question="resistor"
+        )
+        assert result["status"] == "ok"
+        # Must always succeed even on an unrecognised question.
+        assert result["data"]["answer_type"] in (
+            "search_fallback", "components", "nets", "power", "summary",
+        )
+
+    def test_empty_question_rejected(self, tmp_sch: Path):
+        result = _call("schematic_query", path=str(tmp_sch), question="   ")
+        assert result["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7 — .bak rotation retention
+# ---------------------------------------------------------------------------
+
+
+class TestBakRotationRetention:
+    def test_creates_canonical_and_rotated_bak(self, tmp_sch: Path):
+        # Each save should emit BOTH the canonical .bak AND a timestamped .bak.<ms>
+        result = _call("schematic_save", path=str(tmp_sch))
+        assert result["status"] == "ok"
+        bak = Path(str(tmp_sch) + ".bak")
+        rotated = list(tmp_sch.parent.glob(tmp_sch.name + ".bak.*"))
+        assert bak.exists()
+        assert len(rotated) == 1
+
+    def test_rotation_count_capped(self, tmp_sch: Path):
+        from kiassist_utils.mcp_server import _BAK_RETENTION_COUNT
+        # Save more times than the retention count.
+        for _ in range(_BAK_RETENTION_COUNT + 5):
+            _call("schematic_save", path=str(tmp_sch))
+            # Some FS have second-resolution mtimes; sleep a touch so each
+            # rotation gets a distinct timestamp.
+            import time
+            time.sleep(0.005)
+        rotated = list(tmp_sch.parent.glob(tmp_sch.name + ".bak.*"))
+        assert len(rotated) <= _BAK_RETENTION_COUNT

@@ -34,6 +34,7 @@ from .kicad_schematic import inject_test_note, is_schematic_api_available
 from .context.history import ConversationStore
 from .context.prompts import SystemPromptBuilder
 from .context.requirements import RequirementsManager, ContextState
+from .context.tokens import ContextWindowManager, usage_to_tokens
 from .ai.llm_logger import llm_logger
 from .config_keys import ConfigKeys
 
@@ -148,9 +149,23 @@ class KiAssistAPI:
         self._current_project_path: Optional[str] = None
         # System prompt builder for injecting project/PCB context
         self._prompt_builder = SystemPromptBuilder()
+        # Currently focused agent persona (e.g. "schematic-agent").
+        # Drives both the system-prompt layer 2 file and the MCP tool
+        # filter applied to the model.  None = general assistant with
+        # all tools available.
+        self._focused_agent: Optional[str] = None
+        # Cached MCP tool schemas (populated lazily on first chat call).
+        # Keyed by focused-agent name; a single ``__all__`` entry holds
+        # the full unfiltered list.
+        self._mcp_tool_schemas_cache: Dict[str, List[Dict[str, Any]]] = {}
+        # ContextWindowManager is provider-specific; cache one per
+        # provider name so we don't pay for re-instantiation each turn.
+        self._ctx_managers: Dict[str, "ContextWindowManager"] = {}
         # Project context caches (cleared on project switch / new session)
         self._raw_context_cache: Optional[str] = None
         self._synthesized_context_cache: Optional[str] = None
+        # Tiny "always-on" project header (small enough to inject every turn)
+        self._project_header_cache: Optional[str] = None
         # Context lifecycle state (RequirementsManager-backed)
         self._requirements_manager: Optional[RequirementsManager] = None
         self._context_lifecycle: Dict[str, Any] = self._default_lifecycle_state()
@@ -513,15 +528,33 @@ class KiAssistAPI:
             return None
 
         if provider_name == "gemini":
-            from .ai.gemini import GeminiProvider  # optional dep
+            try:
+                from .ai.gemini import GeminiProvider  # optional dep
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'google-genai' package is required for Gemini. "
+                    "Install with: pip install kiassist-utils[ai]"
+                ) from exc
             return GeminiProvider(api_key, model)
 
         if provider_name == "claude":
-            from .ai.claude import ClaudeProvider  # optional dep
+            try:
+                from .ai.claude import ClaudeProvider  # optional dep
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'anthropic' package is required for Claude. "
+                    "Install with: pip install kiassist-utils[ai]"
+                ) from exc
             return ClaudeProvider(api_key, model)
 
         if provider_name == "openai":
-            from .ai.openai import OpenAIProvider  # optional dep
+            try:
+                from .ai.openai import OpenAIProvider  # optional dep
+            except ImportError as exc:
+                raise ImportError(
+                    "The 'openai' package is required for OpenAI. "
+                    "Install with: pip install kiassist-utils[ai]"
+                ) from exc
             return OpenAIProvider(api_key, model)
 
         return None
@@ -563,6 +596,27 @@ class KiAssistAPI:
             self.current_model = effective_model
         return provider
 
+    def _get_or_create_secondary_provider(self) -> Optional[AIProvider]:
+        """Return the cheap "secondary" provider, creating it on first use.
+
+        The secondary provider is intended for low-priority background work
+        (project-context synthesis, summarisation, classification) where the
+        cost / latency of the primary model would be wasteful.  Falls back
+        to the primary provider when no secondary is configured.
+        """
+        if self.secondary_provider is not None:
+            return self.secondary_provider
+        try:
+            provider = self._create_provider(
+                self.secondary_provider_name, self.secondary_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to create secondary provider: %s", exc)
+            provider = None
+        if provider is not None:
+            self.secondary_provider = provider
+        return provider
+
     def _send_to_ai(self, prompt: str, model: Optional[str] = None) -> str:
         """Send a single-turn prompt to the current AI provider.
 
@@ -601,6 +655,27 @@ class KiAssistAPI:
             llm_logger.finish(log_id, error=str(exc))
             raise
 
+    def _get_pending_requirements_questions(self) -> List[str]:
+        """Return any RequirementsManager questions awaiting a user reply.
+
+        When the manager is in ``QUERYING_USER`` state, returns the list
+        of pending questions; otherwise returns ``[]``.  Errors are
+        swallowed so the caller can use this from the system-prompt build
+        path safely.
+        """
+        if not self._current_project_path:
+            return []
+        try:
+            mgr = self._requirements_manager
+            if mgr is None:
+                return []
+            req = mgr.load_or_create()
+            if req.state == ContextState.QUERYING_USER and req.pending_questions:
+                return list(req.pending_questions)
+        except Exception:  # noqa: BLE001
+            return []
+        return []
+
     def _build_system_prompt(self) -> Optional[str]:
         """Build a system prompt including project/PCB context.
 
@@ -636,52 +711,248 @@ class KiAssistAPI:
                 f"**Active project:** `{self._current_project_path}`"
             )
 
-        # Include synthesized context if available (more compact than raw)
-        if self._synthesized_context_cache:
+        # Two-tier context strategy:
+        # - Always inject the small project header (a few hundred chars)
+        #   so the model knows what project is loaded.
+        # - Only inject the full synthesized context when the caller has
+        #   explicitly requested it; otherwise the agent should call the
+        #   ``project_get_context`` tool on demand.
+        if self._project_header_cache:
+            dynamic_parts.append(self._project_header_cache)
+        elif self._synthesized_context_cache:
+            # Fall back to the synthesized blob when no header is built yet.
             dynamic_parts.append(
                 "## Synthesized Project Context\n\n" + self._synthesized_context_cache
             )
+
+        # Phase 4 — when the RequirementsManager is in QUERYING_USER state,
+        # surface its pending questions inline in the system prompt so the
+        # agent asks them in chat instead of relying on the side-panel UI.
+        try:
+            req = self._get_pending_requirements_questions()
+            if req:
+                dynamic_parts.append(
+                    "## Pending project clarification questions\n"
+                    "Before suggesting design decisions, please ask the user "
+                    "the following questions and incorporate their answers:\n"
+                    + "\n".join(f"- {q}" for q in req)
+                )
+        except Exception:
+            pass
 
         dynamic_context = "\n\n".join(dynamic_parts) if dynamic_parts else None
 
         return self._prompt_builder.build(
             project_path=self._current_project_path,
             dynamic_context=dynamic_context,
+            focused_agent=self._focused_agent,
         ) or None
+
+    # ------------------------------------------------------------------
+    # Focused-agent management (drives both system prompt + tool filter)
+    # ------------------------------------------------------------------
+
+    # Tool-name prefixes allowed for each focused agent.  When set, only
+    # tools whose names start with one of these prefixes are forwarded to
+    # the model.  ``None`` (or unknown agent) means "expose every tool".
+    _AGENT_TOOL_PREFIXES: Dict[str, tuple] = {
+        "schematic-agent": ("schematic_", "project_", "kicad_", "library_", "web_search"),
+        "symbol-library-agent": ("symbol_lib_", "library_", "web_search"),
+        "footprint-agent": ("footprint_", "library_", "web_search"),
+        "pcb-agent": ("pcb_", "project_", "kicad_", "library_", "web_search"),
+        "requirements-agent": ("project_", "schematic_", "web_search"),
+    }
+
+    def set_focused_agent(self, agent: Optional[str]) -> Dict[str, Any]:
+        """Select a focused agent persona for the chat.
+
+        The choice affects two things:
+
+        1. Which agent Markdown file is appended as Layer 2 of the system
+           prompt (see :class:`SystemPromptBuilder`).
+        2. Which subset of MCP tools is forwarded to the model.  Smaller
+           tool sets greatly improve tool-selection accuracy, especially on
+           local / quantised models.
+
+        Args:
+            agent: One of ``"schematic-agent"``, ``"symbol-library-agent"``,
+                   ``"footprint-agent"``, ``"pcb-agent"``,
+                   ``"requirements-agent"``, or ``None`` to clear the
+                   selection (general assistant with all tools).
+
+        Returns:
+            ``{"success": True, "focused_agent": <name or None>}``.
+        """
+        if agent is not None and not isinstance(agent, str):
+            return {"success": False, "error": "agent must be a string or None."}
+        if agent is not None and not agent:
+            agent = None
+        self._focused_agent = agent
+        return {"success": True, "focused_agent": agent}
+
+    def get_focused_agent(self) -> Dict[str, Any]:
+        """Return the currently selected focused agent (or ``None``)."""
+        return {"success": True, "focused_agent": self._focused_agent}
+
+    # ------------------------------------------------------------------
+    # MCP tool schema cache & filter
+    # ------------------------------------------------------------------
+
+    async def _fetch_mcp_tool_schemas_async(self) -> List[Dict[str, Any]]:
+        """Fetch the full MCP tool list once (async)."""
+        from .mcp_server import mcp as _mcp
+        tools = await _mcp.list_tools()
+        schemas: List[Dict[str, Any]] = []
+        for t in tools:
+            schemas.append({
+                "name": t.name,
+                "description": t.description or "",
+                "inputSchema": t.inputSchema if isinstance(t.inputSchema, dict) else {},
+            })
+        return schemas
+
+    def _get_mcp_tool_schemas(self, focused_agent: Optional[str]) -> List[Dict[str, Any]]:
+        """Return the cached MCP tool schemas filtered by *focused_agent*.
+
+        Schemas are fetched from the MCP server on first call (blocking via
+        the persistent async loop so synchronous callers work too) and
+        cached per focused-agent key for the lifetime of the API instance.
+        """
+        cache_key = focused_agent or "__all__"
+        if cache_key in self._mcp_tool_schemas_cache:
+            return self._mcp_tool_schemas_cache[cache_key]
+
+        # Ensure the unfiltered list is populated first (one MCP round-trip).
+        if "__all__" not in self._mcp_tool_schemas_cache:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._fetch_mcp_tool_schemas_async(), self._async_loop
+                )
+                self._mcp_tool_schemas_cache["__all__"] = future.result(timeout=10)
+            except Exception as exc:
+                logger.warning("Failed to fetch MCP tool schemas: %s", exc)
+                self._mcp_tool_schemas_cache["__all__"] = []
+
+        all_schemas = self._mcp_tool_schemas_cache["__all__"]
+        prefixes = self._AGENT_TOOL_PREFIXES.get(focused_agent or "")
+        if prefixes is None:
+            filtered = list(all_schemas)
+        else:
+            filtered = [s for s in all_schemas if s["name"].startswith(prefixes)]
+        self._mcp_tool_schemas_cache[cache_key] = filtered
+        return filtered
+
+    def _get_context_window_manager(
+        self, provider: AIProvider
+    ) -> Optional[ContextWindowManager]:
+        """Return a cached :class:`ContextWindowManager` sized to *provider*.
+
+        Falls back to ``None`` if the provider doesn't expose a context
+        window (very old providers or stubbed test fakes).  In that case
+        the caller skips token-aware trimming and relies on the simple
+        ``MAX_HISTORY_TURNS`` fallback in ``_build_conversation_messages``.
+        """
+        try:
+            window = provider.get_context_window()
+        except Exception:
+            return None
+        if not window or window <= 0:
+            return None
+        # Cache key includes the model so model switches build a fresh
+        # manager for the new window size.
+        key = f"{self.current_provider_name}:{self.current_model}"
+        mgr = self._ctx_managers.get(key)
+        if mgr is None or mgr.context_window != window:
+            mgr = ContextWindowManager.from_provider(provider)
+            self._ctx_managers[key] = mgr
+        return mgr
 
     def _build_conversation_messages(
         self,
         store: "ConversationStore",
         session_id: str,
+        ctx_mgr: Optional["ContextWindowManager"] = None,
     ) -> List[AIMessage]:
         """Build the full message list from conversation history in the session store.
 
         The caller should already have persisted the latest user message before
         calling this method—it will be included in the loaded messages.
-        Limits history to the last 40 turns to avoid exceeding context windows.
+        Returns the full structured history (including assistant tool_calls and
+        tool result messages) so the agent retains its working memory across
+        turns.
+
+        When *ctx_mgr* is provided, persisted ``token_count`` values from the
+        history file drive smarter trimming: the oldest *tool* messages with
+        the highest token cost are dropped first (instead of a naïve oldest-N
+        slice), and the trim only fires once the budget is exceeded.  When
+        *ctx_mgr* is ``None``, falls back to a hard cap of the last
+        ``MAX_HISTORY_TURNS`` turns.
 
         Args:
             store: The conversation store instance.
             session_id: Current session ID.
+            ctx_mgr: Optional :class:`ContextWindowManager` for token-aware trimming.
 
         Returns:
             Ordered list of :class:`AIMessage` for the AI provider.
         """
         history: List[AIMessage] = []
+        # Parallel list of per-message token counts (0 when unknown).
+        token_counts: List[int] = []
         try:
-            stored_messages = store.load_session(session_id)
-            # Only include user and assistant messages (skip tool messages
-            # that the simple chat flow doesn't need)
-            for m in stored_messages:
-                if m.role in ("user", "assistant") and m.content:
-                    history.append(m)
+            # Load raw entries so we can read the persisted token_count.
+            from .context.history import _entry_to_message  # type: ignore
+            entries = [
+                e for e in store._iter_entries()  # noqa: SLF001
+                if e.get("session_id") == session_id
+            ]
+            for entry in entries:
+                msg = _entry_to_message(entry)
+                if msg.role in ("user", "assistant") and not msg.content and not msg.tool_calls:
+                    continue
+                history.append(msg)
+                token_counts.append(int(entry.get("token_count", 0) or 0))
         except Exception as exc:
             logger.debug("Failed to load session history: %s", exc)
 
-        # Limit to last N turns to stay within context budget
+        if not history:
+            return history
+
+        # Token-aware trim path.  We drop oldest *tool* messages with the
+        # highest token counts first, since they are usually cheap to
+        # regenerate and the most context-bloating part of the history.
+        if ctx_mgr is not None:
+            budget = int(ctx_mgr.context_window * ctx_mgr.summarize_threshold)
+            total = sum(token_counts)
+            if total > budget:
+                # Build (idx, tokens) pairs for tool turns only, sorted by
+                # tokens descending then by index ascending (oldest first).
+                tool_idx = sorted(
+                    (
+                        (i, token_counts[i])
+                        for i, m in enumerate(history)
+                        if m.role == "tool" and token_counts[i] > 0
+                    ),
+                    key=lambda p: (-p[1], p[0]),
+                )
+                drop: set = set()
+                for idx, tokens in tool_idx:
+                    if total <= budget:
+                        break
+                    drop.add(idx)
+                    total -= tokens
+                if drop:
+                    history = [m for i, m in enumerate(history) if i not in drop]
+
+        # Fallback hard cap: keep the most recent N turns.  Always applied
+        # as a defence-in-depth even when ctx_mgr trimmed above.
         MAX_HISTORY_TURNS = 40
         if len(history) > MAX_HISTORY_TURNS:
             history = history[-MAX_HISTORY_TURNS:]
+            # If the trimmed window starts with an orphaned tool message,
+            # drop it so the conversation begins on a clean boundary.
+            while history and history[0].role == "tool":
+                history = history[1:]
 
         return history
 
@@ -1119,64 +1390,109 @@ class KiAssistAPI:
             return {"success": False, "error": str(exc)}
 
     # ------------------------------------------------------------------
-    # Built-in tool schemas for the chat stream
+    # Tool dispatch (MCP-backed)
     # ------------------------------------------------------------------
 
-    _WEB_SEARCH_TOOL_SCHEMA = {
-        "name": "web_search",
-        "description": (
-            "Search the web for information about electronic components, "
-            "datasheets, PCB design techniques, or any other technical topic. "
-            "Use this tool when the user asks about specific components, needs "
-            "product recommendations, wants to compare parts, or asks questions "
-            "that require up-to-date information from the internet."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": (
-                        "The search query. Be specific and include relevant "
-                        "technical terms (e.g. 'TXS0108E 8-channel bidirectional "
-                        "level shifter datasheet')."
-                    ),
-                },
-            },
-            "required": ["query"],
-        },
+    # User-friendly labels for the streaming "tool activity" indicator.
+    # Falls back to "Running <name>…" for tools not listed here.
+    _TOOL_ACTIVITY_LABELS: Dict[str, str] = {
+        "web_search": "Searching the web\u2026",
+        "schematic_open": "Reading schematic\u2026",
+        "schematic_list_symbols": "Listing components\u2026",
+        "schematic_get_symbol": "Inspecting component\u2026",
+        "schematic_add_symbol": "Adding component\u2026",
+        "schematic_remove_symbol": "Removing component\u2026",
+        "schematic_modify_symbol": "Modifying component\u2026",
+        "schematic_add_wire": "Routing wire\u2026",
+        "schematic_connect_pins": "Connecting pins\u2026",
+        "schematic_add_label": "Adding label\u2026",
+        "schematic_add_junction": "Adding junction\u2026",
+        "schematic_add_no_connect": "Adding no-connect\u2026",
+        "schematic_get_nets": "Reading nets\u2026",
+        "schematic_find_pins": "Finding pins\u2026",
+        "schematic_create": "Creating schematic\u2026",
+        "schematic_save": "Saving schematic\u2026",
+        "schematic_query": "Analysing schematic\u2026",
+        "project_create": "Scaffolding project\u2026",
+        "project_get_context": "Loading project context\u2026",
+        "library_search": "Searching libraries\u2026",
+        "kicad_save_schematic": "Saving in KiCad\u2026",
+        "kicad_reload_schematic": "Reloading KiCad\u2026",
+        "kicad_list_instances": "Detecting KiCad\u2026",
     }
 
-    _BUILTIN_TOOL_SCHEMAS = [_WEB_SEARCH_TOOL_SCHEMA]
+    # Tools that mutate a ``.kicad_sch`` file.  When dispatched, they are
+    # wrapped in :class:`SchematicEditPipeline` so KiCad is asked to save
+    # before the edit and reload after it.  Only schematic-side tools are
+    # routed through the pipeline today; PCB tools have separate handling.
+    _MUTATING_SCHEMATIC_TOOLS: frozenset = frozenset({
+        "schematic_add_symbol",
+        "schematic_remove_symbol",
+        "schematic_modify_symbol",
+        "schematic_add_wire",
+        "schematic_remove_wire",
+        "schematic_connect_pins",
+        "schematic_add_label",
+        "schematic_add_global_label",
+        "schematic_add_hierarchical_label",
+        "schematic_add_junction",
+        "schematic_add_no_connect",
+        "schematic_add_text",
+        "schematic_remove_text",
+        "schematic_set_property",
+        "schematic_save",
+    })
 
-    def _execute_builtin_tool(self, name: str, arguments: Dict[str, Any]) -> str:
-        """Execute a built-in tool and return the result as a string.
+    async def _execute_mcp_tool(
+        self, name: str, arguments: Dict[str, Any]
+    ) -> tuple[str, bool]:
+        """Dispatch a tool call to the in-process MCP server.
+
+        Schematic-mutating tools are wrapped in
+        :class:`~kiassist_utils.ipc_workflow.SchematicEditPipeline` so the
+        KiCad GUI is asked to save before the edit and reload after it.
+        Non-mutating and PCB tools dispatch directly via ``in_process_call``.
 
         Args:
-            name: Tool name (e.g. ``"web_search"``).
-            arguments: Parsed arguments dict.
+            name: Tool name as registered with FastMCP.
+            arguments: Parsed JSON arguments dict.
 
         Returns:
-            String result to feed back to the model.
+            Tuple of ``(content_string, is_error)``.  ``content_string`` is
+            always JSON-encoded when the result is a dict / list, so the AI
+            sees a stable, machine-parseable payload.
         """
-        if name == "web_search":
-            from .web_search import web_search
-            query = arguments.get("query", "")
-            if not query:
-                return "Error: empty search query."
-            results = web_search(query)
-            if not results:
-                return f"No web search results found for: {query}"
-            # Format results for the model
-            lines = [f"Web search results for: {query}\n"]
-            for i, r in enumerate(results, 1):
-                lines.append(
-                    f"[{i}] {r.get('title', 'Untitled')}\n"
-                    f"    URL: {r.get('url', '')}\n"
-                    f"    {r.get('snippet', '').strip()}"
-                )
-            return "\n".join(lines)
-        return f"Error: unknown tool '{name}'."
+        try:
+            # Mutating-schematic tools route through the live KiCad
+            # save/edit/reload pipeline when a file path is supplied.
+            file_path = arguments.get("path") if isinstance(arguments, dict) else None
+            if (
+                name in self._MUTATING_SCHEMATIC_TOOLS
+                and isinstance(file_path, str)
+                and file_path.endswith(".kicad_sch")
+            ):
+                from .ipc_workflow import SchematicEditPipeline
+                pipeline = SchematicEditPipeline(file_path)
+                result = await pipeline.run(name, arguments)
+            else:
+                from .mcp_server import in_process_call
+                result = await in_process_call(name, arguments)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MCP tool %r failed: %s", name, exc, exc_info=True)
+            return f"Tool execution error: {exc}", True
+
+        # Detect MCP-style {status: error} payloads as failures so the
+        # is_error flag is propagated to the model.
+        is_error = False
+        if isinstance(result, dict) and result.get("status") == "error":
+            is_error = True
+
+        if isinstance(result, str):
+            return result, is_error
+        try:
+            return json.dumps(result, ensure_ascii=False), is_error
+        except (TypeError, ValueError):
+            return str(result), is_error
 
     def start_stream_message(self, message: str, model: Optional[str] = None, raw_mode: bool = False) -> dict:
         """Start streaming a response from the active AI provider in a background thread.
@@ -1187,13 +1503,13 @@ class KiAssistAPI:
         AI provider so it has context from prior turns, along with a system
         prompt containing project/PCB environment information.
 
-        When the provider supports tool calling, a ``web_search`` tool is
-        made available so the model can search the web for component data,
-        datasheets, and other technical information without requiring a
-        separate UI panel.
+        When the provider supports tool calling, the full set of MCP tools
+        (filtered by the active focused agent — see :meth:`set_focused_agent`)
+        is forwarded to the model.  Tool calls emitted by the model are
+        executed via :func:`kiassist_utils.mcp_server.in_process_call`.
 
         When *raw_mode* is ``True``, only the user message is sent to the
-        provider—no system prompt or conversation history is included.
+        provider—no system prompt, history, or tools.
 
         Args:
             message: The message to send.
@@ -1234,17 +1550,33 @@ class KiAssistAPI:
                 system_prompt = None
             else:
                 # Build full conversation history (the new user message is
-                # already persisted above and will be included)
-                msgs = self._build_conversation_messages(store, session_id)
+                # already persisted above and will be included).  The
+                # ContextWindowManager (when available) drives smarter
+                # token-aware trimming inside _build_conversation_messages.
+                ctx_mgr_for_history = self._get_context_window_manager(provider)
+                msgs = self._build_conversation_messages(
+                    store, session_id, ctx_mgr=ctx_mgr_for_history,
+                )
                 system_prompt = self._build_system_prompt()
             cancel_event = self._stream_cancel
 
-            # Determine whether to offer built-in tools to the model
-            use_tools = (
-                not raw_mode
-                and provider.supports_tool_calling()
-            )
-            tool_schemas = self._BUILTIN_TOOL_SCHEMAS if use_tools else None
+            # Determine whether to offer MCP tools to the model.  We test
+            # supports_tool_calling() defensively because the test suite
+            # uses fakes that may not implement it.
+            try:
+                use_tools = (
+                    not raw_mode
+                    and bool(provider.supports_tool_calling())
+                )
+            except Exception:
+                use_tools = False
+            if use_tools:
+                tool_schemas = self._get_mcp_tool_schemas(self._focused_agent)
+                if not tool_schemas:
+                    use_tools = False
+                    tool_schemas = None
+            else:
+                tool_schemas = None
 
             log_id = llm_logger.start(
                 provider=self.current_provider_name,
@@ -1254,8 +1586,15 @@ class KiAssistAPI:
                 is_stream=True,
             )
 
-            # Maximum number of tool-call round-trips before giving up
-            max_tool_rounds = 5
+            # Token-aware context manager (Phase 3): trims oversized tool
+            # results and summarises the conversation when token usage
+            # crosses ~80 % of the provider window.  ``None`` for fakes.
+            ctx_mgr = self._get_context_window_manager(provider)
+
+            # Maximum number of tool-call round-trips before giving up.
+            # Increased from 5 (web_search-only loop) to 20 because real
+            # schematic edits often require many sequential tool calls.
+            max_tool_rounds = 20
 
             def _run_stream():
                 async def _async_stream():
@@ -1266,6 +1605,7 @@ class KiAssistAPI:
 
                         while True:
                             accumulated_tool_calls = []
+                            text_this_round = ""
                             async for chunk in provider.chat_stream(
                                 msgs,
                                 tools=tool_schemas,
@@ -1274,6 +1614,7 @@ class KiAssistAPI:
                                 if cancel_event.is_set():
                                     break
                                 if chunk.text:
+                                    text_this_round += chunk.text
                                     with self._stream_lock:
                                         self._process_stream_chunk(chunk.text)
                                 if chunk.tool_calls:
@@ -1298,56 +1639,94 @@ class KiAssistAPI:
                                 break
 
                             # Execute tool calls and feed results back
-                            from .ai.base import AIToolCall, AIToolResult
+                            from .ai.base import AIToolResult
 
-                            # Append assistant message with tool calls
-                            with self._stream_lock:
-                                assistant_text = self._stream_buffer
-
-                            msgs.append(AIMessage(
+                            assistant_msg = AIMessage(
                                 role="assistant",
-                                content=assistant_text,
+                                content=text_this_round,
                                 tool_calls=accumulated_tool_calls,
-                            ))
+                            )
+                            msgs.append(assistant_msg)
+                            # Persist assistant tool-call turn so /resume
+                            # can replay the full structured conversation.
+                            try:
+                                store.append(session_id, assistant_msg)
+                            except Exception as persist_exc:
+                                logger.debug(
+                                    "Failed to persist assistant tool-call turn: %s",
+                                    persist_exc,
+                                )
 
-                            # Execute each tool call
+                            # Execute each tool call via the in-process MCP
+                            # dispatcher.  Tools within one round are run
+                            # sequentially here (parallel execution would
+                            # require ToolExecutor's gather, but we want
+                            # the per-tool activity label visible to the UI).
                             tool_results = []
                             for tc in accumulated_tool_calls:
-                                # Notify the frontend about the tool activity
-                                activity_label = {
-                                    "web_search": "Searching the web\u2026",
-                                }.get(tc.name, f"Running {tc.name}\u2026")
+                                activity_label = self._TOOL_ACTIVITY_LABELS.get(
+                                    tc.name, f"Running {tc.name}\u2026"
+                                )
                                 with self._stream_lock:
                                     self._stream_tool_activity = activity_label
 
                                 logger.info(
-                                    "Executing built-in tool: %s(%s)",
+                                    "Dispatching MCP tool: %s(%s)",
                                     tc.name, tc.arguments,
                                 )
-                                result_text = self._execute_builtin_tool(
+                                content, is_error = await self._execute_mcp_tool(
                                     tc.name, tc.arguments,
                                 )
+                                # Token-aware trim: large tool results
+                                # (e.g. a full schematic dump) are clipped
+                                # so they don't blow the context window.
+                                if ctx_mgr is not None:
+                                    content = ctx_mgr.trim_tool_result(content)
                                 tool_results.append(AIToolResult(
                                     tool_call_id=tc.id,
-                                    content=result_text,
-                                    is_error=result_text.startswith("Error:"),
+                                    content=content,
+                                    is_error=is_error,
                                 ))
 
                             # Clear tool activity before re-streaming
                             with self._stream_lock:
                                 self._stream_tool_activity = None
 
-                            # Append tool results to conversation
-                            msgs.append(AIMessage(
+                            tool_msg = AIMessage(
                                 role="tool",
                                 tool_results=tool_results,
-                            ))
+                            )
+                            msgs.append(tool_msg)
+                            try:
+                                store.append(session_id, tool_msg)
+                            except Exception as persist_exc:
+                                logger.debug(
+                                    "Failed to persist tool-result turn: %s",
+                                    persist_exc,
+                                )
 
-                            # The model will now re-stream with the search
-                            # results available.  The existing stream buffer
-                            # already contains any text the model produced
-                            # before deciding to call a tool — the next
-                            # stream iteration will append to it.
+                            # The model will now re-stream with the tool
+                            # results available.  Reset the visible buffer
+                            # so the next round's text starts cleanly.
+                            with self._stream_lock:
+                                self._stream_buffer = ""
+
+                            # Record token usage for this round and
+                            # opportunistically summarise older history
+                            # when we cross the ~80 % threshold.
+                            if ctx_mgr is not None:
+                                if last_usage:
+                                    ctx_mgr.track_usage(last_usage)
+                                if ctx_mgr.is_near_limit():
+                                    try:
+                                        msgs = ctx_mgr.maybe_summarize(
+                                            msgs, provider, system_prompt,
+                                        )
+                                    except Exception as sum_exc:
+                                        logger.debug(
+                                            "Auto-summarise failed: %s",
+                                            sum_exc,
+                                        )
 
                     except Exception as exc:
                         with self._stream_lock:
@@ -1362,9 +1741,14 @@ class KiAssistAPI:
                         # Persist the assembled assistant response
                         if final_text:
                             try:
+                                tokens = (
+                                    usage_to_tokens(last_usage)
+                                    if last_usage else 0
+                                )
                                 store.append(
                                     session_id,
                                     AIMessage(role="assistant", content=final_text),
+                                    token_count=tokens,
                                 )
                             except Exception as persist_exc:
                                 logger.warning(
@@ -1579,6 +1963,7 @@ class KiAssistAPI:
             # Clear cached project context
             self._raw_context_cache = None
             self._synthesized_context_cache = None
+            self._project_header_cache = None
             # Reset context lifecycle state for the new project
             self._context_lifecycle = self._default_lifecycle_state()
             self._requirements_manager = None
@@ -1588,9 +1973,169 @@ class KiAssistAPI:
             project_dir = str(Path(new_path).parent) if new_path else None
             self._library_index.set_project_dir(project_dir)
             self._library_index.rebuild_async()
+
+            # Phase 4 — auto-build the tiny project header *and* lazily
+            # warm the raw-context cache (with disk persistence keyed by
+            # file mtimes).  The header is cheap (~milliseconds) so we
+            # build it synchronously; the heavier raw-context build runs
+            # in the background.
+            try:
+                self._project_header_cache = self._build_project_header(new_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to build project header: %s", exc)
+
+            try:
+                threading.Thread(
+                    target=self._warm_raw_context_cache,
+                    args=(new_path,),
+                    daemon=True,
+                ).start()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Failed to warm raw context cache: %s", exc)
             return {"success": True}
         except Exception as exc:
             return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Project context helpers (Phase 4 — two-tier strategy)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_project_header(project_path: str) -> str:
+        """Build the always-injected, tiny project header.
+
+        Includes only headline data: project name, sheet count, BOM size,
+        and the first 1500 chars of any ``KIASSIST.md`` memory file.  The
+        full synthesized blob remains available via the
+        ``project_get_context`` MCP tool that the agent can call on demand.
+        Total budget: <2000 chars.
+
+        Args:
+            project_path: Path to ``.kicad_pro`` or project directory.
+
+        Returns:
+            Markdown header string.
+        """
+        p = Path(project_path)
+        project_dir = p.parent if p.is_file() else p
+        name = (
+            p.stem if p.suffix == ".kicad_pro"
+            else project_dir.name
+        )
+        # Best-effort sheet & BOM counts.  Errors fall through to "?".
+        sheet_count = 0
+        bom_size = 0
+        try:
+            schematics = list(project_dir.rglob("*.kicad_sch"))
+            sheet_count = len(schematics)
+            for sch_path in schematics:
+                try:
+                    from .kicad_parser.schematic import Schematic
+                    sch = Schematic.load(sch_path)
+                    bom_size += len(sch.symbols)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        lines = [
+            "## Active Project",
+            f"- **Name:** {name}",
+            f"- **Path:** `{project_dir}`",
+            f"- **Sheet count:** {sheet_count}",
+            f"- **BOM size:** {bom_size} component instance(s)",
+            "",
+            "_Call the `project_get_context` MCP tool for the full project "
+            "summary, or `schematic_query` to ask specific questions._",
+        ]
+
+        # Inject KIASSIST.md memory file if present.
+        memory_file = project_dir / "KIASSIST.md"
+        if memory_file.is_file():
+            try:
+                memory_text = memory_file.read_text(encoding="utf-8")
+                if len(memory_text) > 1500:
+                    memory_text = memory_text[:1500] + "\n_…(truncated)_"
+                lines.append("")
+                lines.append("### Project Memory (KIASSIST.md)")
+                lines.append(memory_text)
+            except Exception:  # noqa: BLE001
+                pass
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _project_mtime_signature(project_path: str) -> str:
+        """Return a deterministic signature of all project file mtimes.
+
+        Used as the cache key for the on-disk raw-context cache so the
+        cache is invalidated whenever any tracked file changes.
+        """
+        p = Path(project_path)
+        project_dir = p.parent if p.is_file() else p
+        parts: List[str] = []
+        for pattern in ("*.kicad_pro", "*.kicad_sch", "*.kicad_pcb",
+                        "*.kicad_dru"):
+            for f in sorted(project_dir.rglob(pattern)):
+                try:
+                    parts.append(f"{f.relative_to(project_dir)}:{f.stat().st_mtime_ns}")
+                except (OSError, ValueError):
+                    continue
+        import hashlib as _hashlib
+        return _hashlib.sha256(
+            "\n".join(parts).encode("utf-8")
+        ).hexdigest()
+
+    def _warm_raw_context_cache(self, project_path: str) -> None:
+        """Background helper: build (or load) the raw project context.
+
+        Persists to ``<project>/.kiassist/context.json`` keyed by an
+        mtime-based signature so subsequent app launches reuse the cache
+        when the project hasn't changed.  Silent on failure — the cache
+        is purely an optimisation.
+        """
+        try:
+            p = Path(project_path)
+            project_dir = p.parent if p.is_file() else p
+            cache_dir = project_dir / ".kiassist"
+            cache_file = cache_dir / "context.json"
+            sig = self._project_mtime_signature(project_path)
+
+            # Load disk cache when signature matches.
+            if cache_file.is_file():
+                try:
+                    import json as _json
+                    cached = _json.loads(cache_file.read_text(encoding="utf-8"))
+                    if cached.get("signature") == sig and cached.get("raw"):
+                        self._raw_context_cache = cached["raw"]
+                        if cached.get("synthesized"):
+                            self._synthesized_context_cache = cached["synthesized"]
+                        logger.debug(
+                            "Loaded raw project context from disk cache."
+                        )
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # Cache miss — build and persist.
+            from .context.project_context import get_raw_context
+            raw = get_raw_context(project_path)
+            self._raw_context_cache = raw
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                import json as _json
+                cache_file.write_text(
+                    _json.dumps(
+                        {"signature": sig, "raw": raw,
+                         "synthesized": self._synthesized_context_cache},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.debug("Failed to persist context cache: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Background context warm failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Project context (raw + LLM-synthesized)
@@ -1635,8 +2180,17 @@ class KiAssistAPI:
                 from .context.project_context import get_raw_context
                 self._raw_context_cache = get_raw_context(self._current_project_path)
 
-            # Get a provider for synthesis
-            provider = self._get_or_create_provider()
+            # Phase 4 — prefer the cheap "secondary" provider for synthesis;
+            # fall back to the primary when no secondary is configured.
+            # This is the single most impactful change for cost & latency
+            # on this workload.
+            provider = self._get_or_create_secondary_provider()
+            provider_label = self.secondary_provider_name
+            provider_model = self.secondary_model
+            if not provider:
+                provider = self._get_or_create_provider()
+                provider_label = self.current_provider_name
+                provider_model = self.current_model
             if not provider:
                 return {
                     "success": False,
@@ -1648,8 +2202,8 @@ class KiAssistAPI:
             from .ai.base import AIMessage
 
             log_id = llm_logger.start(
-                provider=self.current_provider_name,
-                model=self.current_model,
+                provider=provider_label,
+                model=provider_model,
                 messages=[AIMessage(role="user", content="[Context synthesis request]")],
                 system_prompt="[Context synthesis]",
                 is_stream=False,

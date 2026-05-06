@@ -13,7 +13,12 @@ dependencies = [
     "google-genai>=1.70.0",
     "keyring>=24.0.0",
     "kicad-python>=0.6.0",
-    "mcp>=1.0.0",
+    # mcp 1.x is pinned to a tight upper bound: in_process_call() in
+    # mcp_server.py probes three different FastMCP return-tuple shapes,
+    # which has historically changed between minor releases.  Bump the
+    # ceiling deliberately after adding a regression test for the new
+    # tuple shape.
+    "mcp>=1.0.0,<2.0.0",
     # charset-normalizer 3.4.2+ crashes on import with Python 3.12;
     # keep pinned until upstream fixes the regression.
     "charset-normalizer>=3.0,<3.4.2",

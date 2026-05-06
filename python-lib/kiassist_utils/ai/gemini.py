@@ -43,23 +43,36 @@ from .base import (
 # ---------------------------------------------------------------------------
 
 _MODEL_MAP: Dict[str, str] = {
+    # Stable GA models (Phase 6 — preferred defaults)
+    "2.5-pro":        "gemini-2.5-pro",
+    "2.5-flash":      "gemini-2.5-flash",
+    "2.5-flash-lite": "gemini-2.5-flash-lite",
+    # Preview / pre-GA aliases — kept for users who explicitly opt in
     "3.1-pro": "gemini-3.1-pro-preview",
     "3-flash": "gemini-3-flash-preview",
     "3.1-flash-lite": "gemini-3.1-flash-lite-preview",
 }
 
-_DEFAULT_MODEL = "3-flash"
+# Default to the GA Flash model so users with a fresh API key don't hit
+# "model not found" errors against unreleased preview IDs.
+_DEFAULT_MODEL = "2.5-flash"
 
 # Context window sizes (approximate, in tokens)
 _CONTEXT_WINDOWS: Dict[str, int] = {
-    "gemini-3.1-pro-preview": 1_000_000,
-    "gemini-3-flash-preview": 1_000_000,
+    "gemini-2.5-pro":               1_000_000,
+    "gemini-2.5-flash":             1_000_000,
+    "gemini-2.5-flash-lite":        1_000_000,
+    "gemini-3.1-pro-preview":       1_000_000,
+    "gemini-3-flash-preview":       1_000_000,
     "gemini-3.1-flash-lite-preview": 1_000_000,
 }
 
 _MAX_OUTPUT_TOKENS: Dict[str, int] = {
-    "gemini-3.1-pro-preview": 65_536,
-    "gemini-3-flash-preview": 65_536,
+    "gemini-2.5-pro":               65_536,
+    "gemini-2.5-flash":             65_536,
+    "gemini-2.5-flash-lite":        32_768,
+    "gemini-3.1-pro-preview":       65_536,
+    "gemini-3-flash-preview":       65_536,
     "gemini-3.1-flash-lite-preview": 32_768,
 }
 
