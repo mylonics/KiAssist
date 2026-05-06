@@ -1954,6 +1954,74 @@ def kicad_check_file_status(path: str) -> Dict[str, Any]:
         return _err(str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Validation tools (ERC, DRC, structural lint) — see :mod:`validation`.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def schematic_lint(path: str) -> Dict[str, Any]:
+    """Run pure-Python sanity checks on a schematic file.
+
+    Always available (no external tools required).  Call this after every
+    schematic mutation to catch the cheap-to-detect mistakes LLMs commonly
+    make: parse failures, duplicate references, placeholder references
+    (``R?``, ``U?``), missing values, missing footprints.
+
+    Use :func:`schematic_run_erc` for the authoritative KiCad ERC.
+
+    Returns a structured :class:`~kiassist_utils.validation.ValidationReport`
+    dict with ``success``, ``error_count``, ``warning_count`` and a list of
+    ``issues``.  ``success=False`` indicates the agent should attempt to fix
+    the reported errors before reporting completion to the user.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    from .validation import schematic_lint as _lint
+
+    try:
+        return _ok(_lint(path).to_dict())
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"schematic_lint failed: {exc}")
+
+
+@mcp.tool()
+def schematic_run_erc(path: str) -> Dict[str, Any]:
+    """Run KiCad's authoritative ERC via ``kicad-cli sch erc``.
+
+    Requires KiCad 7+ to be installed and ``kicad-cli`` on PATH (override
+    via the ``KICAD_CLI`` env var).  When the tool is not available the
+    returned report has ``available=False``; callers should fall back to
+    :func:`schematic_lint`.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    from .validation import run_sch_erc
+
+    try:
+        return _ok(run_sch_erc(path).to_dict())
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"schematic_run_erc failed: {exc}")
+
+
+@mcp.tool()
+def pcb_run_drc(path: str) -> Dict[str, Any]:
+    """Run KiCad's DRC via ``kicad-cli pcb drc``.
+
+    Requires KiCad 7+ to be installed and ``kicad-cli`` on PATH.  Returns
+    a structured report with violations grouped by severity.  When the
+    tool is not available the returned report has ``available=False``.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
+    from .validation import run_pcb_drc
+
+    try:
+        return _ok(run_pcb_drc(path).to_dict())
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"pcb_run_drc failed: {exc}")
+
+
 @mcp.tool()
 async def kicad_edit_file_pipeline(
     file_path: str,
