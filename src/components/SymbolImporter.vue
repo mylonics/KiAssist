@@ -148,9 +148,25 @@ async function loadLibraries() {
 // Helpers
 // -----------------------------------------------------------------------
 
-function clearError() {
+/** Dismiss the current error */
+function dismissError() {
   error.value = '';
 }
+
+const clearError = dismissError;
+
+/** Clear the part-lookup input fields */
+function clearPartLookup() {
+  partMpn.value = '';
+  partSpn.value = '';
+  partLcsc.value = '';
+  cadSources.value = [];
+  octopartUrl.value = '';
+  partLookupFailed.value = false;
+  partLookupFields.value = null;
+  zipPaths.value = [];
+}
+
 
 /** Reset all importer form state (called when user closes a part). */
 function resetImporter() {
@@ -186,10 +202,6 @@ async function importByPart() {
 
   clearError();
   cadSources.value = [];
-  octopartUrl.value = '';
-  partLookupFailed.value = false;
-  partLookupFields.value = null;
-  zipPaths.value = [];
   lookupStatus.value = 'Starting lookup…';
   loading.value = true;
 
@@ -515,7 +527,7 @@ function handleResult(r: any) {
           </button>
           <button
             class="action-btn secondary"
-            @click="partMpn = ''; partSpn = ''; partLcsc = ''; cadSources = []; octopartUrl = ''; partLookupFailed = false; partLookupFields = null; zipPaths = []"
+            @click="clearPartLookup"
             :disabled="loading || (!partMpn.trim() && !partSpn.trim() && !partLcsc.trim())"
             title="Clear part lookup fields"
           >
@@ -685,12 +697,17 @@ function handleResult(r: any) {
         </div>
 
         <div v-if="searchResults.length" class="search-results">
+          <div class="search-results-header">
+            <span class="search-count">{{ searchResults.length }} result{{ searchResults.length !== 1 ? 's' : '' }}</span>
+            <span class="search-hint">Double-click to import directly</span>
+          </div>
           <div
             v-for="r in searchResults"
             :key="r.library + ':' + r.name"
             :class="['search-row', { selected: selectedResult === r }]"
             @click="selectedResult = r"
-            :title="r.description || r.name"
+            @dblclick="selectedResult = r; importFromKicad()"
+            :title="r.description ? r.description : r.library + ':' + r.name"
           >
             <span class="result-lib">{{ r.library }}</span>
             <span class="result-name">{{ r.name }}</span>
@@ -716,7 +733,10 @@ function handleResult(r: any) {
       <!-- ======== Status ======== -->
       <div v-if="error" class="notice error">
         <span class="material-icons">error_outline</span>
-        {{ error }}
+        <span class="notice-text">{{ error }}</span>
+        <button class="notice-dismiss" @click="dismissError" title="Dismiss">
+          <span class="material-icons">close</span>
+        </button>
       </div>
 
 
@@ -761,6 +781,8 @@ function handleResult(r: any) {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
+  overflow-y: auto;
+  min-height: 0;
 }
 
 /* ===== Method sections ===== */
@@ -978,6 +1000,53 @@ function handleResult(r: any) {
   background-color: color-mix(in srgb, #e74c3c 15%, transparent);
   color: #e74c3c;
   border: 1px solid color-mix(in srgb, #e74c3c 30%, transparent);
+}
+
+.notice-text {
+  flex: 1;
+}
+
+.notice-dismiss {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.6;
+  display: flex;
+  align-items: center;
+  padding: 0;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+
+.notice-dismiss:hover {
+  opacity: 1;
+}
+
+.notice-dismiss .material-icons {
+  font-size: 0.9rem;
+}
+
+/* ===== Search results header ===== */
+.search-results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.2rem 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-tertiary);
+}
+
+.search-count {
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.search-hint {
+  font-size: 0.62rem;
+  color: var(--text-secondary);
+  font-style: italic;
 }
 
 .notice.warn {
