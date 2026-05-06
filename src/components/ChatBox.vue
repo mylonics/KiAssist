@@ -100,6 +100,8 @@ const PROVIDER_KEY = 'kiassist-provider';
 const MODEL_KEY = 'kiassist-model';
 const SECONDARY_PROVIDER_KEY = 'kiassist-secondary-provider';
 const SECONDARY_MODEL_KEY = 'kiassist-secondary-model';
+const SCROLL_BOTTOM_THRESHOLD = 120; // px from bottom before the scroll-to-bottom button appears
+const MAX_TEXTAREA_HEIGHT = 160; // px cap for the auto-resizing chat input
 
 const rawMode = ref(false);
 const copiedMessageId = ref<string | null>(null);
@@ -107,7 +109,7 @@ const copiedChatHistory = ref(false);
 const messages = ref<Message[]>([]);
 const inputMessage = ref('');
 const queuedMessage = ref<string | null>(null);
-const confirmingClear = ref(false);
+const isConfirmingClear = ref(false);
 const isScrolledUp = ref(false);
 const selectedProvider = ref('gemma4');
 const selectedModel = ref('gemma4-e2b-q4_k_m');
@@ -275,17 +277,17 @@ function scrollToBottom() {
   });
 }
 
-let _scrollThrottleScheduled = false;
+let scrollThrottleScheduled = false;
 
 function handleScroll() {
   if (!messagesContainer.value) return;
-  if (_scrollThrottleScheduled) return;
-  _scrollThrottleScheduled = true;
+  if (scrollThrottleScheduled) return;
+  scrollThrottleScheduled = true;
   requestAnimationFrame(() => {
-    _scrollThrottleScheduled = false;
+    scrollThrottleScheduled = false;
     if (!messagesContainer.value) return;
     const { scrollTop, scrollHeight, clientHeight } = messagesContainer.value;
-    isScrolledUp.value = scrollHeight - scrollTop - clientHeight > 120;
+    isScrolledUp.value = scrollHeight - scrollTop - clientHeight > SCROLL_BOTTOM_THRESHOLD;
   });
 }
 
@@ -293,8 +295,7 @@ function autoResizeTextarea() {
   nextTick(() => {
     if (!chatInputRef.value) return;
     chatInputRef.value.style.height = 'auto';
-    const maxH = 160;
-    chatInputRef.value.style.height = Math.min(chatInputRef.value.scrollHeight, maxH) + 'px';
+    chatInputRef.value.style.height = Math.min(chatInputRef.value.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
   });
 }
 
@@ -356,11 +357,11 @@ function loadMessages() {
 
 function clearMessages() {
   if (isLoading.value) return;
-  if (!confirmingClear.value) {
-    confirmingClear.value = true;
+  if (!isConfirmingClear.value) {
+    isConfirmingClear.value = true;
     return;
   }
-  confirmingClear.value = false;
+  isConfirmingClear.value = false;
   messages.value = [];
   localStorage.removeItem(STORAGE_KEY);
   // Start a fresh backend session so history isn't carried over
@@ -372,7 +373,7 @@ function clearMessages() {
 }
 
 function cancelClearConfirm() {
-  confirmingClear.value = false;
+  isConfirmingClear.value = false;
 }
 
 // Provider switching
@@ -1130,7 +1131,7 @@ function handleGlobalKeydown(e: KeyboardEvent) {
   } else if (showSessionsModal.value) {
     showSessionsModal.value = false;
     e.preventDefault();
-  } else if (confirmingClear.value) {
+  } else if (isConfirmingClear.value) {
     cancelClearConfirm();
     e.preventDefault();
   }
@@ -1504,7 +1505,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
 <template>
   <div class="chat-container">
     <!-- Settings Modal -->
-    <div v-if="showApiKeyPrompt" class="modal-overlay" @click.self="showApiKeyPrompt = false">
+    <div v-if="showApiKeyPrompt" class="modal-overlay" role="dialog" aria-label="Settings" @click.self="showApiKeyPrompt = false">
       <div class="modal-content modal-wide settings-modal">
         <div class="modal-header-row">
           <h3>Settings</h3>
@@ -1863,7 +1864,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
     </div>
 
     <!-- Sessions Modal -->
-    <div v-if="showSessionsModal" class="modal-overlay" @click.self="showSessionsModal = false">
+    <div v-if="showSessionsModal" class="modal-overlay" role="dialog" aria-label="Conversation Sessions" @click.self="showSessionsModal = false">
       <div class="modal-content modal-wide">
         <div class="modal-header-row">
           <h3>Conversation Sessions</h3>
@@ -1917,7 +1918,7 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
           <span class="material-icons">{{ copiedChatHistory ? 'check' : 'copy_all' }}</span>
         </button>
         <template v-if="messages.length > 0 && !isLoading">
-          <template v-if="confirmingClear">
+          <template v-if="isConfirmingClear">
             <span class="clear-confirm-label">Clear chat?</span>
             <button @click="clearMessages" class="icon-btn icon-btn-danger" title="Confirm clear" aria-label="Confirm clear chat">
               <span class="material-icons">check</span>
