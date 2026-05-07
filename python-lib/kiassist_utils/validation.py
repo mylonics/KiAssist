@@ -239,8 +239,13 @@ def _parse_kicad_report_json(text: str) -> List[Dict[str, Any]]:
     # Both ERC and DRC reports have a top-level "violations" list (KiCad 7+).
     violations = data.get("violations") or data.get("unconnected_items") or []
     for v in violations:
-        sev = (v.get("severity") or "warning").lower()
+        sev_raw = v.get("severity") or "warning"
+        sev = sev_raw.lower()
         if sev not in ("error", "warning", "info"):
+            logger.debug(
+                "Unrecognised severity %r in kicad-cli report; defaulting to 'warning'",
+                sev_raw,
+            )
             sev = "warning"
         items = v.get("items") or []
         loc_bits: List[str] = []
