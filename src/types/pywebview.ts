@@ -251,8 +251,8 @@ export interface ExportSessionResult extends ApiResult {
 
 // Web component search types
 export interface WebSearchResult {
-  title: string;
-  url: string;
+  title?: string;
+  url?: string;
   snippet?: string;
 }
 
@@ -260,8 +260,70 @@ export interface ComponentSearchResult extends ApiResult {
   response?: string;
   search_results?: WebSearchResult[];
   query?: string;
-  /** Which search backend was used: 'google' (Gemini grounding) or 'duckduckgo' */
-  grounding?: 'google' | 'duckduckgo';
+  grounding?: 'google' | 'duckduckgo' | null;
+}
+
+// ---------------------------------------------------------------------------
+// Structured part search (see part-search.md skill)
+// ---------------------------------------------------------------------------
+
+export interface PartSearchCandidate {
+  mpn: string;
+  manufacturer: string;
+  description: string;
+  datasheet_url: string;
+  product_url: string;
+  digikey_pn: string;
+  lcsc_pn: string;
+  mouser_pn: string;
+  key_specs: Record<string, string>;
+  price: { currency?: string; qty?: number; unit_price?: number; source?: string } | null;
+  availability: string;
+  verified: boolean;
+  warnings: string[];
+}
+
+export interface PartSearchResult extends ApiResult {
+  search_id?: string;
+  turn?: number;
+  specs?: string;
+  refine?: string;
+  candidates?: PartSearchCandidate[];
+  web_results?: WebSearchResult[];
+  mpn_hints?: string[];
+  verified_all?: boolean;
+  needs_mpn_extraction?: boolean;
+}
+
+export interface ExistingSchematicMatch {
+  kind: 'schematic_symbol';
+  reference: string;
+  value: string;
+  footprint: string;
+  schematic: string;
+  score: number;
+}
+
+export interface ExistingLibraryMatch {
+  kind: 'library_symbol';
+  lib_id: string;
+  nickname: string;
+  symbol_name: string;
+  library_path: string;
+  description: string;
+  mpn: string;
+  manufacturer: string;
+  datasheet: string;
+  value: string;
+  score: number;
+}
+
+export interface PartFindExistingResult extends ApiResult {
+  project_dir?: string;
+  query?: string;
+  schematic_matches?: ExistingSchematicMatch[];
+  library_matches?: ExistingLibraryMatch[];
+  has_matches?: boolean;
 }
 
 // Library Analyzer types
@@ -409,6 +471,19 @@ export interface PyWebViewAPI {
   is_schematic_api_available: () => Promise<boolean>;
   // Web component search
   web_search_components: (query: string, model?: string) => Promise<ComponentSearchResult>;
+  // Structured parametric part search (see PartSearch.vue, part-search.md skill)
+  part_search: (
+    specs: string,
+    candidate_mpns?: string[] | null,
+    refine?: string,
+    search_id?: string | null,
+    limit?: number,
+  ) => Promise<PartSearchResult>;
+  part_find_existing: (
+    project_path: string,
+    query: string,
+    limit?: number,
+  ) => Promise<PartFindExistingResult>;
   // Library Analyzer / Scanner API
   analyzer_scan_libraries: (libType?: string) => Promise<AnalyzerScanResult>;
   analyzer_analyze_symbol_library: (path: string) => Promise<AnalyzerReportResult>;
