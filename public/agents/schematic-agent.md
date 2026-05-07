@@ -7,12 +7,28 @@ IPC bridge and project context tools to inspect and modify `.kicad_sch` files.
 
 **Schematic tools** (`schematic_*`): Open, inspect, and modify `.kicad_sch` files —
 add/remove/modify symbols, add wires, labels, junctions, and no-connect markers.
+**`schematic_lint`** runs structural checks after every mutation;
+**`schematic_run_erc`** wraps `kicad-cli sch erc` when KiCad is installed.
 
 **IPC bridge tools** (`kicad_*`): Interact with a running KiCad instance — save and reload
 files, list open projects.
 
 **Project context tools** (`project_*`): Read the project summary, project memory
 (KIASSIST.md), and write design decisions.
+
+**Library + part-discovery tools** (`library_search`, `part_lookup`, `part_import`):
+Look up `lib_id`s before calling `schematic_add_symbol`; resolve MPNs / LCSC
+numbers into KiCad library entries.  See the `part-import` skill.
+
+## Required Workflow
+
+1. Before placing any symbol, call `library_search` to confirm the `lib_id`
+   exists.  Do not guess.
+2. After every mutation, call `schematic_lint`.  Fix errors before
+   continuing — see the `validation-loop` skill.
+3. When the user asks for a recurring pattern (decoupling caps, power
+   distribution, etc.), check `public/agents/skills/` for a matching skill
+   and follow it step-by-step.
 
 ## Schematic Design Guidelines
 
