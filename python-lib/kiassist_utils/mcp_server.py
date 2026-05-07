@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import time
 import tempfile
@@ -1954,6 +1955,74 @@ def kicad_check_file_status(path: str) -> Dict[str, Any]:
         return _err(str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Validation tools (ERC, DRC, structural lint) — see :mod:`validation`.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def schematic_lint(path: str) -> Dict[str, Any]:
+    """Run pure-Python sanity checks on a schematic file.
+
+    Always available (no external tools required).  Call this after every
+    schematic mutation to catch the cheap-to-detect mistakes LLMs commonly
+    make: parse failures, duplicate references, placeholder references
+    (``R?``, ``U?``), missing values, missing footprints.
+
+    Use :func:`schematic_run_erc` for the authoritative KiCad ERC.
+
+    Returns a structured :class:`~kiassist_utils.validation.ValidationReport`
+    dict with ``success``, ``error_count``, ``warning_count`` and a list of
+    ``issues``.  ``success=False`` indicates the agent should attempt to fix
+    the reported errors before reporting completion to the user.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    from .validation import schematic_lint as _lint
+
+    try:
+        return _ok(_lint(path).to_dict())
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"schematic_lint failed: {exc}")
+
+
+@mcp.tool()
+def schematic_run_erc(path: str) -> Dict[str, Any]:
+    """Run KiCad's authoritative ERC via ``kicad-cli sch erc``.
+
+    Requires KiCad 7+ to be installed and ``kicad-cli`` on PATH (override
+    via the ``KICAD_CLI`` env var).  When the tool is not available the
+    returned report has ``available=False``; callers should fall back to
+    :func:`schematic_lint`.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_sch"})):
+        return _err(err)
+    from .validation import run_sch_erc
+
+    try:
+        return _ok(run_sch_erc(path).to_dict())
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"schematic_run_erc failed: {exc}")
+
+
+@mcp.tool()
+def pcb_run_drc(path: str) -> Dict[str, Any]:
+    """Run KiCad's DRC via ``kicad-cli pcb drc``.
+
+    Requires KiCad 7+ to be installed and ``kicad-cli`` on PATH.  Returns
+    a structured report with violations grouped by severity.  When the
+    tool is not available the returned report has ``available=False``.
+    """
+    if err := _validate_path(path, allowed_extensions=frozenset({".kicad_pcb"})):
+        return _err(err)
+    from .validation import run_pcb_drc
+
+    try:
+        return _ok(run_pcb_drc(path).to_dict())
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"pcb_run_drc failed: {exc}")
+
+
 @mcp.tool()
 async def kicad_edit_file_pipeline(
     file_path: str,
@@ -2684,6 +2753,189 @@ def project_create(
             "name": name,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Part discovery / import (Octopart, JLCPCB, EasyEDA) — see :mod:`importer`.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def part_lookup(query: str) -> Dict[str, Any]:
+    """Look up a part by MPN, supplier PN, or LCSC number — read-only.
+
+    Queries Octopart (and JLCPCB if the query looks like an LCSC number)
+    to resolve cross-reference data without writing any files to disk.
+    Use this **before** :func:`part_import` so the user can confirm the
+    correct part was found, especially when the query is ambiguous.
+
+    The agent should call this tool whenever the user says "find a part
+    for …" or pastes an MPN they want to validate.
+
+    Args:
+        query: Manufacturer Part Number (e.g. ``"STM32F103C8T6"``),
+               supplier PN (e.g. Digi-Key ``"497-6063-1-ND"``), or LCSC
+               number (e.g. ``"C8734"``).
+
+    Returns:
+        Dict with at least ``found`` (bool) and, when found,
+        ``mpn``, ``manufacturer``, ``description``, ``datasheet``,
+        ``digikey_pn``, ``mouser_pn``, ``lcsc_pn``.
+    """
+    if not isinstance(query, str) or not query.strip():
+        return _err("query must be a non-empty string.")
+    try:
+        from .importer.part_lookup import lookup_part, _jlcpcb_search
+    except ImportError as exc:
+        return _err(f"importer module unavailable: {exc}")
+
+    q = query.strip()
+    # If the query looks like an LCSC number (Cnnnn), resolve via JLCPCB
+    # first because Octopart does not index LCSC PNs.
+    is_lcsc = bool(re.fullmatch(r"[Cc]\d+", q))
+    try:
+        if is_lcsc:
+            jlc = _jlcpcb_search(q)
+            if jlc.get("found") and jlc.get("mpn"):
+                # Now look up the resolved MPN on Octopart for richer data.
+                octo = lookup_part(jlc["mpn"])
+                if octo.get("found"):
+                    octo["lcsc_pn"] = octo.get("lcsc_pn") or q.upper()
+                    return _ok(octo)
+                # Fall back to JLCPCB-only fields.
+                return _ok({
+                    "found": True,
+                    "mpn": jlc.get("mpn", ""),
+                    "manufacturer": jlc.get("brand", ""),
+                    "description": jlc.get("description", ""),
+                    "datasheet": jlc.get("datasheet", ""),
+                    "digikey_pn": "",
+                    "mouser_pn": "",
+                    "lcsc_pn": q.upper(),
+                    "package": jlc.get("package", ""),
+                })
+            return _ok({"found": False})
+        return _ok(lookup_part(q))
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"part_lookup failed: {exc}")
+
+
+@mcp.tool()
+def part_import(
+    mpn: str = "",
+    spn: str = "",
+    lcsc: str = "",
+    target_sym_lib: Optional[str] = None,
+    target_fp_lib_dir: Optional[str] = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    """Import a part's symbol, footprint, and 3D model into KiCad libraries.
+
+    Resolves the part via Octopart / JLCPCB / EasyEDA, downloads the CAD
+    data, and writes the result into the target symbol library
+    (``.kicad_sym``) and footprint library directory (``.pretty/``).
+
+    At least one of ``mpn``, ``spn``, ``lcsc`` must be supplied.  When
+    ``target_sym_lib`` / ``target_fp_lib_dir`` are omitted, only the
+    in-memory lookup result is returned (no files written) — useful when
+    the caller wants to inspect the data before deciding where to land it.
+
+    Args:
+        mpn:               Manufacturer Part Number.
+        spn:               Supplier Part Number (Digi-Key, Mouser, etc.).
+        lcsc:              LCSC / EasyEDA part number (``"C8734"`` style).
+        target_sym_lib:    Path to a ``.kicad_sym`` file (created if absent).
+        target_fp_lib_dir: Path to a ``.pretty`` directory (created if absent).
+        overwrite:         When ``True``, replace existing entries with the
+                           same name; otherwise the new entry is renamed
+                           with a numeric suffix.
+
+    Returns:
+        Dict with ``success`` (bool), ``warnings`` (list[str]), ``mpn``,
+        ``manufacturer``, ``lib_id`` (when written), ``symbol_path``,
+        ``footprint_path``, and ``model_paths``.
+    """
+    mpn = (mpn or "").strip()
+    spn = (spn or "").strip()
+    lcsc = (lcsc or "").strip()
+    if not (mpn or spn or lcsc):
+        return _err("At least one of mpn, spn, lcsc is required.")
+
+    # Validate target paths if supplied.
+    if target_sym_lib:
+        if err := _validate_path(
+            target_sym_lib, allowed_extensions=frozenset({".kicad_sym"}),
+        ):
+            return _err(err)
+    if target_fp_lib_dir:
+        # .pretty is a directory; reuse path traversal check only.
+        if ".." in Path(target_fp_lib_dir).parts:
+            return _err(
+                f"Path traversal not allowed: {target_fp_lib_dir}"
+            )
+
+    try:
+        from .importer.part_lookup import import_by_part
+        from .importer.library_writer import commit_import
+    except ImportError as exc:
+        return _err(f"importer module unavailable: {exc}")
+
+    try:
+        result = import_by_part(mpn=mpn, spn=spn, lcsc=lcsc)
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"part_import lookup failed: {exc}")
+
+    if not result.success or result.component is None:
+        return _ok({
+            "success": False,
+            "warnings": list(result.warnings),
+            "error": result.error,
+            "cad_sources": [
+                {
+                    "partner": s.partner,
+                    "has_symbol": s.has_symbol,
+                    "has_footprint": s.has_footprint,
+                    "has_3d_model": s.has_3d_model,
+                    "download_url": s.download_url,
+                }
+                for s in result.cad_sources
+            ],
+        })
+
+    component = result.component
+    payload: Dict[str, Any] = {
+        "success": True,
+        "warnings": list(result.warnings),
+        "mpn": component.fields.mpn,
+        "manufacturer": component.fields.manufacturer,
+        "datasheet": component.fields.datasheet,
+        "digikey_pn": component.fields.digikey_pn,
+        "lcsc_pn": component.fields.lcsc_pn,
+        "name": component.name,
+    }
+
+    # If the caller asked us to write to a library, commit now.
+    if target_sym_lib or target_fp_lib_dir:
+        try:
+            commit_result = commit_import(
+                component,
+                target_sym_lib=target_sym_lib,
+                target_fp_lib_dir=target_fp_lib_dir,
+                overwrite=overwrite,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _err(f"part_import write failed: {exc}")
+        payload["warnings"].extend(commit_result.warnings)
+        if component.symbol_path:
+            payload["symbol_path"] = str(component.symbol_path)
+            lib_stem = Path(component.symbol_path).stem
+            payload["lib_id"] = f"{lib_stem}:{component.name}"
+        if component.footprint_path:
+            payload["footprint_path"] = str(component.footprint_path)
+        if component.model_paths:
+            payload["model_paths"] = [str(p) for p in component.model_paths]
+
+    return _ok(payload)
 
 
 @mcp.tool()
