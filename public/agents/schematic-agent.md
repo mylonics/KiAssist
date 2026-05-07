@@ -16,9 +16,11 @@ files, list open projects.
 **Project context tools** (`project_*`): Read the project summary, project memory
 (KIASSIST.md), and write design decisions.
 
-**Library + part-discovery tools** (`library_search`, `part_lookup`, `part_import`):
+**Library + part-discovery tools** (`library_search`, `part_find_existing`,
+`part_search`, `part_lookup`, `part_import`):
 Look up `lib_id`s before calling `schematic_add_symbol`; resolve MPNs / LCSC
-numbers into KiCad library entries.  See the `part-import` skill.
+numbers into KiCad library entries.  See the `part-import` and `part-search`
+skills.
 
 ## Required Workflow
 

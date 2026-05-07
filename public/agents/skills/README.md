@@ -23,6 +23,7 @@ context for that turn only, keeping the base system prompt small.
 |----------------------|-----------------------------------------------------|
 | `decoupling-caps`    | "add decoupling caps", "add bypass caps to U?"      |
 | `part-import`        | "import this part", "find a footprint for `<MPN>`"  |
+| `part-search`        | "find me a part with these specs", "I need an ADC…" |
 | `validation-loop`    | "check my schematic", "fix the ERC errors"          |
 
 ## Authoring guidelines

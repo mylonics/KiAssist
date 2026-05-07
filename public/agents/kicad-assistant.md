@@ -68,3 +68,5 @@ file in `public/agents/skills/`:
 - `decoupling-caps.md` — placing decoupling capacitors on an IC.
 - `validation-loop.md` — the lint → fix → re-lint cycle.
 - `part-import.md` — resolving an MPN/LCSC number into a KiCad library entry.
+- `part-search.md` — finding a part from free-text specs (top-5 selection,
+  refinement, preview, then import).

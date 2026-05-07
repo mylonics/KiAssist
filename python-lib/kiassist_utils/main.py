@@ -756,9 +756,9 @@ class KiAssistAPI:
     # tools whose names start with one of these prefixes are forwarded to
     # the model.  ``None`` (or unknown agent) means "expose every tool".
     _AGENT_TOOL_PREFIXES: Dict[str, tuple] = {
-        "schematic-agent": ("schematic_", "project_", "kicad_", "library_", "web_search"),
-        "symbol-library-agent": ("symbol_lib_", "library_", "web_search"),
-        "footprint-agent": ("footprint_", "library_", "web_search"),
+        "schematic-agent": ("schematic_", "project_", "kicad_", "library_", "part_", "web_search"),
+        "symbol-library-agent": ("symbol_lib_", "library_", "part_", "web_search"),
+        "footprint-agent": ("footprint_", "library_", "part_", "web_search"),
         "pcb-agent": ("pcb_", "project_", "kicad_", "library_", "web_search"),
         "requirements-agent": ("project_", "schematic_", "web_search"),
     }
