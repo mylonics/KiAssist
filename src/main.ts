@@ -5,7 +5,7 @@ import 'highlight.js/styles/github-dark.css';
 
 const app = createApp(App);
 
-app.config.errorHandler = (err, instance, info) => {
+app.config.errorHandler = (err, _instance, info) => {
   console.error(`[Vue Error] ${info}:`, err);
 };
 

@@ -152,6 +152,36 @@ onUnmounted(() => {
   stopPolling();
 });
 
+/**
+ * P1.11: scroll to and expand the entry with the given log id.  Called
+ * by App.vue when the user clicks a "🪵 log" link on a chat bubble.
+ */
+function scrollToEntry(entryId: string) {
+  if (!entryId) return;
+  // Make sure it's expanded so the user sees the full payload.
+  if (!expandedIds.value.has(entryId)) {
+    expandedIds.value.add(entryId);
+    expandedIds.value = new Set(expandedIds.value);
+  }
+  // Disable auto-scroll briefly so the user-driven scroll wins.
+  const wasAuto = autoScroll.value;
+  autoScroll.value = false;
+  // Defer to give Vue time to re-render the expanded entry.
+  setTimeout(() => {
+    const el = scrollContainer.value?.querySelector<HTMLElement>(
+      `[data-entry-id="${CSS.escape(entryId)}"]`,
+    );
+    if (el && scrollContainer.value) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      el.classList.add('llm-entry-flash');
+      setTimeout(() => el.classList.remove('llm-entry-flash'), 1500);
+    }
+    autoScroll.value = wasAuto;
+  }, 50);
+}
+
+defineExpose({ scrollToEntry });
+
 function formatTime(timestamp: number): string {
   const d = new Date(timestamp * 1000);
   return d.toLocaleTimeString(undefined, {
@@ -270,6 +300,7 @@ watch(() => entries.value.length, () => {
       <div
         v-for="entry in filteredEntries"
         :key="entry.id"
+        :data-entry-id="entry.id"
         :class="['llm-entry', { expanded: expandedIds.has(entry.id), error: !!entry.error, pending: !entry.done }]"
         @click="toggleExpanded(entry.id)"
       >
@@ -1021,5 +1052,12 @@ watch(() => entries.value.length, () => {
 .tool-result-content::-webkit-scrollbar-thumb {
   background: var(--border-color);
   border-radius: 2px;
+}
+
+/* Briefly highlight an entry when deep-linked from a chat bubble. */
+.llm-entry-flash {
+  outline: 2px solid var(--accent-color, #5865f2);
+  outline-offset: 2px;
+  transition: outline-color 1.5s ease;
 }
 </style>

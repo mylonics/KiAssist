@@ -85,6 +85,28 @@ interface ContextQuestion {
   suggestions: string[];
 }
 
+interface ToolActivityEntry {
+  name: string;
+  label: string;
+  arguments: Record<string, unknown>;
+  duration_ms: number;
+  is_error: boolean;
+  content_summary: string;
+}
+
+/** Structured error metadata attached to an assistant message. */
+interface ErrorCard {
+  title: string;
+  body: string;
+  provider?: string;
+  model?: string;
+  logId?: string | null;
+  /** Action hint for the "Open Settings" button: which provider needs setup. */
+  openSettingsFor?: string;
+  /** Whether to show the "Retry" button. */
+  retryable?: boolean;
+}
+
 interface Message {
   id: string;
   text: string;
@@ -93,6 +115,20 @@ interface Message {
   isStreaming?: boolean;
   thinking?: string;
   toolActivity?: string;
+  /** Persistent record of tool calls executed during this turn. */
+  toolHistory?: ToolActivityEntry[];
+  /** LLM log id (deep-link to the LLM panel row). */
+  logId?: string | null;
+  /** Provider that produced this assistant message. */
+  provider?: string;
+  /** Model id that produced this assistant message. */
+  model?: string;
+  /** Token usage as reported by the provider. */
+  usage?: Record<string, number>;
+  /** Structured error card when this assistant message represents a failure. */
+  errorCard?: ErrorCard;
+  /** Original user text used for retry of an error card. */
+  retryText?: string;
 }
 
 const STORAGE_KEY = 'kiassist-chat-messages';
@@ -210,11 +246,30 @@ const gemmaReady = computed(() =>
 
 /** Whether the currently selected primary provider is available and ready to use. */
 const providerReady = computed(() => {
+  const info = currentProviderInfo.value;
+  // Prefer the backend's single-source-of-truth `ready` flag when present.
+  if (info && typeof info.ready === 'boolean') return info.ready;
+  // Fallback for older backends without the `ready` field.
   const id = selectedProvider.value;
-  if (id === 'gemma4') return gemmaServerStatus.value.running;
+  if (id === 'gemma4') return gemmaServerStatus.value.running || gemmaHasDownloadedModel.value;
   if (id === 'local') return detectedLocalModels.value.length > 0;
-  return currentProviderInfo.value?.has_key ?? false;
+  return info?.has_key ?? false;
 });
+
+/** Human-readable explanation of why the current provider is not ready. */
+const providerNotReadyReason = computed(() => {
+  const info = currentProviderInfo.value;
+  if (info?.not_ready_reason) return info.not_ready_reason;
+  const id = selectedProvider.value;
+  if (id === 'gemma4') return 'No Gemma model downloaded.';
+  if (id === 'local') return 'Local model server not reachable.';
+  return `No API key configured for ${info?.name ?? id}.`;
+});
+
+/** True when no provider is ready — the chat shows an inline onboarding card. */
+const anyProviderReady = computed(() =>
+  providers.value.some(p => p.ready === true)
+);
 
 /**
  * Render LaTeX math expressions using KaTeX.
@@ -331,6 +386,13 @@ function saveMessages() {
         sender: m.sender,
         timestamp: m.timestamp.toISOString(),
         ...(m.thinking ? { thinking: m.thinking } : {}),
+        ...(m.toolHistory && m.toolHistory.length ? { toolHistory: m.toolHistory } : {}),
+        ...(m.logId ? { logId: m.logId } : {}),
+        ...(m.provider ? { provider: m.provider } : {}),
+        ...(m.model ? { model: m.model } : {}),
+        ...(m.usage && Object.keys(m.usage).length ? { usage: m.usage } : {}),
+        ...(m.errorCard ? { errorCard: m.errorCard } : {}),
+        ...(m.retryText ? { retryText: m.retryText } : {}),
       }));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable));
   } catch (e) {
@@ -348,6 +410,13 @@ function loadMessages() {
         timestamp: new Date(m.timestamp),
         isStreaming: false,
         thinking: m.thinking || undefined,
+        toolHistory: m.toolHistory || undefined,
+        logId: m.logId ?? null,
+        provider: m.provider || undefined,
+        model: m.model || undefined,
+        usage: m.usage || undefined,
+        errorCard: m.errorCard || undefined,
+        retryText: m.retryText || undefined,
       }));
     }
   } catch (e) {
@@ -454,7 +523,11 @@ async function loadProviders() {
       window.pywebview!.api.get_providers()
     );
     if (result.success && result.providers) {
-      // Backend is the single source of truth for provider metadata
+      // P1.7: Backend is the single source of truth for current
+      // provider/model.  We use localStorage only as a cache that
+      // gets *overwritten* by the backend, never the other way
+      // round, so a stale browser-side selection can't silently
+      // flip the persisted backend config on every reload.
       providers.value = result.providers;
 
       // Sync local base URL from backend
@@ -464,69 +537,73 @@ async function loadProviders() {
         localBaseUrlInput.value = localInfo.base_url;
       }
 
-      // Determine which provider/model to use, honouring localStorage first
-      const storedProvider = localStorage.getItem(PROVIDER_KEY);
-      const storedModel = localStorage.getItem(MODEL_KEY);
-
-      const storedProviderInfo = storedProvider
-        ? result.providers.find((p: ProviderInfo) => p.id === storedProvider)
-        : undefined;
-
-      const nextProvider =
-        storedProviderInfo?.id ??
-        result.current_provider ??
-        selectedProvider.value;
-
-      const nextProviderInfo =
-        result.providers.find((p: ProviderInfo) => p.id === nextProvider);
-
-      const nextModel =
-        storedModel ??
+      const backendProvider = result.current_provider ?? selectedProvider.value;
+      const backendInfo = result.providers.find((p: ProviderInfo) => p.id === backendProvider);
+      const backendModel =
         result.current_model ??
-        nextProviderInfo?.default_model ??
+        backendInfo?.default_model ??
         selectedModel.value;
 
-      selectedProvider.value = nextProvider;
-      selectedModel.value = nextModel ?? selectedModel.value;
+      // If the backend's model id is no longer in the registry (e.g. the
+      // provider renamed it between releases), validate by calling
+      // set_provider — the backend will coerce it and echo the canonical
+      // id back, which we then use.  Skip the IPC entirely when the
+      // values already match what we remember.
+      const needsSync =
+        selectedProvider.value !== backendProvider ||
+        selectedModel.value !== backendModel;
 
-      // Persist the resolved selection and sync the backend
+      selectedProvider.value = backendProvider;
+      selectedModel.value = backendModel ?? selectedModel.value;
+
+      // Cache for next reload (UI cache only — see comment above).
       localStorage.setItem(PROVIDER_KEY, selectedProvider.value);
       localStorage.setItem(MODEL_KEY, selectedModel.value);
-      await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
-        window.pywebview!.api.set_provider(selectedProvider.value, selectedModel.value)
-      );
+
+      if (needsSync) {
+        const setResult = await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
+          window.pywebview!.api.set_provider(selectedProvider.value, selectedModel.value)
+        );
+        // Honour the canonical model the backend may have coerced to.
+        if (setResult.model && setResult.model !== selectedModel.value) {
+          selectedModel.value = setResult.model;
+          localStorage.setItem(MODEL_KEY, selectedModel.value);
+        }
+      }
 
       // Derive hasApiKey from the providers list — no extra round-trips needed
       const active = result.providers.find((p: ProviderInfo) => p.id === selectedProvider.value);
       hasApiKey.value = (selectedProvider.value === 'local' || selectedProvider.value === 'gemma4') ? true : (active?.has_key ?? false);
 
       // --- Secondary model ---
-      const storedSecondaryProvider = localStorage.getItem(SECONDARY_PROVIDER_KEY);
-      const storedSecondaryModel = localStorage.getItem(SECONDARY_MODEL_KEY);
-
-      const nextSecondaryProvider =
-        (storedSecondaryProvider &&
-          result.providers.find((p: ProviderInfo) => p.id === storedSecondaryProvider)?.id) ??
-        result.secondary_provider ??
-        selectedSecondaryProvider.value;
-
-      const nextSecondaryProviderInfo =
-        result.providers.find((p: ProviderInfo) => p.id === nextSecondaryProvider);
-
-      const nextSecondaryModel =
-        storedSecondaryModel ??
+      const backendSecondaryProvider =
+        result.secondary_provider ?? selectedSecondaryProvider.value;
+      const backendSecondaryInfo =
+        result.providers.find((p: ProviderInfo) => p.id === backendSecondaryProvider);
+      const backendSecondaryModel =
         result.secondary_model ??
-        nextSecondaryProviderInfo?.default_model ??
+        backendSecondaryInfo?.default_model ??
         selectedSecondaryModel.value;
 
-      selectedSecondaryProvider.value = nextSecondaryProvider;
-      selectedSecondaryModel.value = nextSecondaryModel ?? selectedSecondaryModel.value;
+      const secondaryNeedsSync =
+        selectedSecondaryProvider.value !== backendSecondaryProvider ||
+        selectedSecondaryModel.value !== backendSecondaryModel;
+
+      selectedSecondaryProvider.value = backendSecondaryProvider;
+      selectedSecondaryModel.value = backendSecondaryModel ?? selectedSecondaryModel.value;
 
       localStorage.setItem(SECONDARY_PROVIDER_KEY, selectedSecondaryProvider.value);
       localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
-      await trackedApiCall('set_secondary_model', [selectedSecondaryProvider.value, selectedSecondaryModel.value], () =>
-        window.pywebview!.api.set_secondary_model(selectedSecondaryProvider.value, selectedSecondaryModel.value)
-      );
+
+      if (secondaryNeedsSync) {
+        const setSecondary = await trackedApiCall('set_secondary_model', [selectedSecondaryProvider.value, selectedSecondaryModel.value], () =>
+          window.pywebview!.api.set_secondary_model(selectedSecondaryProvider.value, selectedSecondaryModel.value)
+        );
+        if (setSecondary.model && setSecondary.model !== selectedSecondaryModel.value) {
+          selectedSecondaryModel.value = setSecondary.model;
+          localStorage.setItem(SECONDARY_MODEL_KEY, selectedSecondaryModel.value);
+        }
+      }
 
       // Pre-load Gemma model info so status indicators are accurate from the start
       loadGemmaModels();
@@ -572,6 +649,98 @@ function openSettings(provider?: string) {
     loadGemmaModels();
   }
 }
+
+// ----- Debug / context helpers exposed to the chat bubble template -----
+
+/**
+ * Emit a custom event the parent (App.vue) listens for to focus the
+ * LLM activity panel and scroll it to the entry with the given id.
+ * Falls back to a no-op if no listener is wired up.
+ */
+function openLlmLogEntry(logId: string) {
+  if (!logId) return;
+  window.dispatchEvent(new CustomEvent('kiassist-open-llm-log', {
+    detail: { logId },
+  }));
+}
+
+/** Re-send the user message stored on an error card. */
+async function retryFromErrorCard(messageId: string) {
+  const msg = messages.value.find(m => m.id === messageId);
+  if (!msg || !msg.retryText) return;
+  // Drop the failed assistant bubble and re-issue the request.
+  const idx = messages.value.findIndex(m => m.id === messageId);
+  if (idx >= 0) messages.value.splice(idx, 1);
+  await sendMessageWithText(msg.retryText);
+}
+
+// "Show context sent" modal state + loader (P1.16).
+const showContextSentModal = ref(false);
+const contextSentLoading = ref(false);
+const contextSentSystemPrompt = ref('');
+const contextSentMessages = ref<Array<{ role: string; content: string }>>([]);
+const contextSentToolNames = ref<string[]>([]);
+const contextSentProvider = ref('');
+const contextSentModel = ref('');
+
+async function showContextSentFor(messageText: string) {
+  if (!window.pywebview?.api) return;
+  showContextSentModal.value = true;
+  contextSentLoading.value = true;
+  try {
+    const result = await trackedApiCall('dry_run_message', [messageText, selectedModel.value], () =>
+      window.pywebview!.api.dry_run_message(messageText, selectedModel.value)
+    );
+    if (result.success) {
+      contextSentSystemPrompt.value = result.system_prompt || '';
+      contextSentMessages.value = result.messages || [];
+      contextSentToolNames.value = result.tool_names || [];
+      contextSentProvider.value = result.provider || '';
+      contextSentModel.value = result.model || '';
+    }
+  } catch (e) {
+    console.error('[ChatBox] dry_run_message failed:', e);
+  } finally {
+    contextSentLoading.value = false;
+  }
+}
+
+/** Token-budget chip data (P1.15). */
+const lastUsage = computed<Record<string, number>>(() => {
+  // Walk the message list backwards for the most recent usage report.
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const u = messages.value[i].usage;
+    if (u && Object.keys(u).length) return u;
+  }
+  return {};
+});
+
+const usageTotalTokens = computed(() => {
+  const u = lastUsage.value;
+  return (
+    (u.total_tokens as number | undefined) ??
+    (((u.input_tokens as number | undefined) ?? 0) +
+      ((u.output_tokens as number | undefined) ?? 0))
+  );
+});
+
+const contextWindowSize = computed<number>(() => {
+  // Cheap heuristic — providers don't expose this directly to the UI, so we
+  // mirror the static defaults the backend uses (see ai/*.py). 32k is a safe
+  // floor; the chip is only an *indicator*, not a hard guarantee.
+  const id = selectedProvider.value;
+  if (id === 'gemini') return 1_000_000;
+  if (id === 'claude') return 200_000;
+  if (id === 'openai') return 128_000;
+  return 32_768;
+});
+
+const usagePercent = computed(() => {
+  const total = usageTotalTokens.value;
+  const window = contextWindowSize.value;
+  if (!total || !window) return 0;
+  return Math.min(100, Math.round((total / window) * 100));
+});
 
 function selectProviderForConfig(providerId: string) {
   configuringProvider.value = providerId;
@@ -839,10 +1008,158 @@ function formatEta(seconds: number): string {
 }
 
 // Streaming send
+
+/**
+ * Build a structured ErrorCard from a backend error string + provider/model.
+ * Recognised patterns produce an actionable title + body so the user is
+ * not left staring at a raw `Stream error: …` line.
+ */
+function buildErrorCard(
+  errorText: string,
+  opts: { provider?: string; model?: string; logId?: string | null; retryable?: boolean } = {},
+): ErrorCard {
+  const err = (errorText || '').trim();
+  const lower = err.toLowerCase();
+  const provider = opts.provider || selectedProvider.value;
+  const model = opts.model || selectedModel.value;
+
+  // Local Gemma model not downloaded yet.
+  if (lower.includes('model not downloaded')) {
+    return {
+      title: 'Local model not downloaded',
+      body: err + '\n\nDownload a Gemma model from Settings to start chatting locally.',
+      provider, model, logId: opts.logId,
+      openSettingsFor: 'gemma4',
+      retryable: true,
+    };
+  }
+  // llama-cpp-python server not installed.
+  if (lower.includes('llama-cpp-python') || lower.includes('llama_cpp.server')) {
+    return {
+      title: 'Local inference server missing',
+      body: err,
+      provider, model, logId: opts.logId,
+      openSettingsFor: 'gemma4',
+      retryable: true,
+    };
+  }
+  // No API key configured.
+  if (lower.includes('no api key')) {
+    return {
+      title: 'No API key configured',
+      body: err,
+      provider, model, logId: opts.logId,
+      openSettingsFor: provider,
+      retryable: true,
+    };
+  }
+  // Local Ollama server unreachable.
+  if (lower.includes('not reachable') || lower.includes('connection refused')) {
+    return {
+      title: 'Model server unreachable',
+      body: err,
+      provider, model, logId: opts.logId,
+      openSettingsFor: provider === 'local' ? 'local' : provider,
+      retryable: true,
+    };
+  }
+  // Generic stream error.
+  return {
+    title: 'Request failed',
+    body: err || 'Unknown error',
+    provider, model, logId: opts.logId,
+    retryable: true,
+  };
+}
+
+/** Apply a poll snapshot to the streaming message at *streamIdx*. */
+function applyPollResult(streamIdx: number, poll: any) {
+  const msg = messages.value[streamIdx];
+  if (!msg) return;
+  msg.text = poll.text || '';
+  if (poll.thinking) msg.thinking = poll.thinking;
+  msg.toolActivity = poll.tool_activity || '';
+  if (Array.isArray(poll.tool_history)) {
+    msg.toolHistory = poll.tool_history;
+  }
+  if (poll.log_id !== undefined) msg.logId = poll.log_id;
+  if (poll.provider) msg.provider = poll.provider;
+  if (poll.model) msg.model = poll.model;
+  if (poll.usage && Object.keys(poll.usage).length) msg.usage = poll.usage;
+}
+
+/** Finalize a streaming bubble after `done=true`. */
+function finalizeStream(streamIdx: number, poll: any, retryText: string) {
+  const msg = messages.value[streamIdx];
+  if (!msg) return;
+  msg.isStreaming = false;
+  isLoading.value = false;
+
+  if (poll.error) {
+    // Error path: replace text with a structured error card.
+    msg.errorCard = buildErrorCard(poll.error, {
+      provider: poll.provider,
+      model: poll.model,
+      logId: poll.log_id,
+      retryable: true,
+    });
+    msg.retryText = retryText;
+    if (!msg.text) msg.text = '';
+    saveMessages();
+    return;
+  }
+
+  const hasText = (msg.text || '').trim().length > 0;
+  const hasThinking = (msg.thinking || '').trim().length > 0;
+  const hasTools = Array.isArray(msg.toolHistory) && msg.toolHistory.length > 0;
+
+  if (!hasText) {
+    if (hasThinking) {
+      // Reasoning-only response: show a minimal note; the thinking
+      // section auto-expands in the template (P1.18).
+      msg.text = '_The model returned only reasoning — see "Thoughts" below._';
+    } else if (hasTools) {
+      msg.text = `_Tools ran (${msg.toolHistory!.length}) but the model returned no text. See "Tools used" below or open the LLM log._`;
+    } else {
+      // True silent failure — surface a structured error card.
+      msg.errorCard = {
+        title: 'No response received',
+        body: 'The model returned no text, no reasoning and no tool activity. This usually means the provider closed the stream early.',
+        provider: msg.provider || poll.provider,
+        model: msg.model || poll.model,
+        logId: msg.logId ?? poll.log_id,
+        retryable: true,
+      };
+      msg.retryText = retryText;
+      msg.text = '';
+    }
+  }
+  saveMessages();
+}
+
 async function sendMessageWithText(messageText: string) {
   if (!messageText.trim()) return;
-  if (!hasApiKey.value) {
-    openSettings();
+  // P0.3: gate on providerReady (covers "no key" AND "no model downloaded"
+  // AND "Ollama unreachable") instead of just hasApiKey.
+  if (!providerReady.value) {
+    // Open Settings on the provider that needs configuration.
+    const reason = providerNotReadyReason.value;
+    messages.value.push({
+      id: generateMessageId(),
+      text: '',
+      sender: 'assistant',
+      timestamp: new Date(),
+      errorCard: {
+        title: `${currentProviderInfo.value?.name ?? selectedProvider.value} is not ready`,
+        body: reason,
+        provider: selectedProvider.value,
+        model: selectedModel.value,
+        openSettingsFor: selectedProvider.value,
+        retryable: true,
+      },
+      retryText: messageText,
+    });
+    saveMessages();
     return;
   }
 
@@ -857,11 +1174,19 @@ async function sendMessageWithText(messageText: string) {
       if (!startResult.success) {
         messages.value.push({
           id: generateMessageId(),
-          text: `Sorry, I encountered an error: ${startResult.error || 'Unknown error'}. Please check your API key and try again.`,
+          text: '',
           sender: 'assistant',
           timestamp: new Date(),
+          errorCard: buildErrorCard(startResult.error || 'Unknown error', {
+            provider: startResult.provider,
+            model: startResult.model,
+            logId: startResult.log_id ?? null,
+            retryable: true,
+          }),
+          retryText: messageText,
         });
         isLoading.value = false;
+        saveMessages();
         return;
       }
 
@@ -872,6 +1197,9 @@ async function sendMessageWithText(messageText: string) {
         sender: 'assistant',
         timestamp: new Date(),
         isStreaming: true,
+        provider: startResult.provider || selectedProvider.value,
+        model: startResult.model || selectedModel.value,
+        logId: startResult.log_id ?? null,
       });
       const streamIdx = messages.value.length - 1;
 
@@ -882,24 +1210,10 @@ async function sendMessageWithText(messageText: string) {
             window.pywebview!.api.poll_stream(), true
           );
           if (poll.success && messages.value[streamIdx]) {
-            messages.value[streamIdx].text = poll.text || '';
-            if (poll.thinking) {
-              messages.value[streamIdx].thinking = poll.thinking;
-            }
-            // Show tool activity indicator (e.g. "Searching the web…")
-            messages.value[streamIdx].toolActivity = poll.tool_activity || '';
-
+            applyPollResult(streamIdx, poll);
             if (poll.done) {
               clearInterval(pollInterval);
-              messages.value[streamIdx].isStreaming = false;
-              isLoading.value = false;
-
-              if (poll.error) {
-                messages.value[streamIdx].text = `Sorry, I encountered an error: ${poll.error}`;
-              } else if (!messages.value[streamIdx].text.trim()) {
-                messages.value[streamIdx].text = 'No response received.';
-              }
-              saveMessages();
+              finalizeStream(streamIdx, poll, messageText);
               processQueue();
             }
           }
@@ -907,7 +1221,13 @@ async function sendMessageWithText(messageText: string) {
           clearInterval(pollInterval);
           if (messages.value[streamIdx]) {
             messages.value[streamIdx].isStreaming = false;
-            messages.value[streamIdx].text = `Sorry, I encountered an error: ${e}`;
+            messages.value[streamIdx].errorCard = buildErrorCard(String(e), {
+              provider: messages.value[streamIdx].provider,
+              model: messages.value[streamIdx].model,
+              logId: messages.value[streamIdx].logId,
+              retryable: true,
+            });
+            messages.value[streamIdx].retryText = messageText;
           }
           isLoading.value = false;
         }
@@ -925,11 +1245,14 @@ async function sendMessageWithText(messageText: string) {
   } catch (error) {
     messages.value.push({
       id: generateMessageId(),
-      text: `Sorry, I encountered an error: ${error}. Please check your API key and try again.`,
+      text: '',
       sender: 'assistant',
       timestamp: new Date(),
+      errorCard: buildErrorCard(String(error), { retryable: true }),
+      retryText: messageText,
     });
     isLoading.value = false;
+    saveMessages();
   }
 }
 
@@ -1009,21 +1332,10 @@ async function steerMessage() {
           window.pywebview!.api.poll_stream(), true
         );
         if (poll.success && messages.value[streamIdx]) {
-          messages.value[streamIdx].text = poll.text || '';
-          if (poll.thinking) {
-            messages.value[streamIdx].thinking = poll.thinking;
-          }
-          messages.value[streamIdx].toolActivity = poll.tool_activity || '';
+          applyPollResult(streamIdx, poll);
           if (poll.done) {
             clearInterval(pollInterval);
-            messages.value[streamIdx].isStreaming = false;
-            isLoading.value = false;
-            if (poll.error) {
-              messages.value[streamIdx].text = `Sorry, I encountered an error: ${poll.error}`;
-            } else if (!messages.value[streamIdx].text.trim()) {
-              messages.value[streamIdx].text = 'No response received.';
-            }
-            saveMessages();
+            finalizeStream(streamIdx, poll, steerText);
             processQueue();
           }
         }
@@ -1031,7 +1343,13 @@ async function steerMessage() {
         clearInterval(pollInterval);
         if (messages.value[streamIdx]) {
           messages.value[streamIdx].isStreaming = false;
-          messages.value[streamIdx].text = `Sorry, I encountered an error: ${e}`;
+          messages.value[streamIdx].errorCard = buildErrorCard(String(e), {
+            provider: messages.value[streamIdx].provider,
+            model: messages.value[streamIdx].model,
+            logId: messages.value[streamIdx].logId,
+            retryable: true,
+          });
+          messages.value[streamIdx].retryText = steerText;
         }
         isLoading.value = false;
       }
@@ -1913,6 +2231,27 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
             <span class="model-summary-name">{{ availableModels.find(m => m.id === selectedModel)?.name ?? selectedModel }}</span>
           </span>
         </button>
+        <!-- P1.8: secondary model summary alongside primary so users
+             can see/click the lightweight model that powers wizard /
+             web-search / quick tasks. -->
+        <button
+          v-if="secondaryProviderInfo && (selectedSecondaryProvider !== selectedProvider || selectedSecondaryModel !== selectedModel)"
+          class="model-summary-btn secondary-model-summary"
+          @click="openSettings(selectedSecondaryProvider)"
+          :title="`Secondary model: ${secondaryProviderInfo?.name} / ${selectedSecondaryModel}`"
+        >
+          <span
+            class="provider-status-dot"
+            :class="(secondaryProviderInfo?.ready ?? secondaryProviderInfo?.has_key) ? 'ready' : 'unavailable'"
+          ></span>
+          <span class="model-summary-text">
+            <span class="secondary-label">2nd</span>
+            {{ secondaryProviderInfo?.name }}
+            <span class="model-summary-name">{{
+              availableSecondaryModels.find(m => m.id === selectedSecondaryModel)?.name ?? selectedSecondaryModel
+            }}</span>
+          </span>
+        </button>
         <div class="header-spacer"></div>
         <button v-if="messages.length > 0" @click="copyChatHistory" class="icon-btn" :title="copiedChatHistory ? 'Copied!' : 'Copy chat history'" :aria-label="copiedChatHistory ? 'Copied!' : 'Copy chat history'">
           <span class="material-icons">{{ copiedChatHistory ? 'check' : 'copy_all' }}</span>
@@ -1945,16 +2284,38 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
       <div v-if="messages.length === 0" class="welcome-message">
         <span class="material-icons welcome-icon">smart_toy</span>
         <p>Welcome to KiAssist!</p>
-        <p class="hint">Ask me anything about KiCAD or PCB design. Powered by {{ currentProviderInfo?.name ?? 'AI' }}.</p>
-        <div class="example-prompts">
-          <p class="example-prompts-label">Try asking:</p>
-          <button
-            v-for="prompt in examplePrompts"
-            :key="prompt"
-            class="example-prompt-btn"
-            @click="insertExamplePrompt(prompt)"
-          >{{ prompt }}</button>
-        </div>
+        <!-- P1.6: when no provider is ready, replace the generic
+             welcome with a three-button onboarding card so users
+             aren't dumped into a chat that silently fails. -->
+        <template v-if="!anyProviderReady">
+          <p class="hint">No AI provider is ready yet. Choose how you'd like to get started:</p>
+          <div class="onboarding-actions">
+            <button class="btn-primary onboarding-btn" @click="openSettings('gemma4')">
+              <span class="material-icons">download</span>
+              Download Gemma model
+            </button>
+            <button class="btn-secondary onboarding-btn" @click="openSettings('gemini')">
+              <span class="material-icons">key</span>
+              Add cloud API key
+            </button>
+            <button class="btn-secondary onboarding-btn" @click="openSettings('local')">
+              <span class="material-icons">dns</span>
+              Connect to local Ollama
+            </button>
+          </div>
+        </template>
+        <template v-else>
+          <p class="hint">Ask me anything about KiCAD or PCB design. Powered by {{ currentProviderInfo?.name ?? 'AI' }}.</p>
+          <div class="example-prompts">
+            <p class="example-prompts-label">Try asking:</p>
+            <button
+              v-for="prompt in examplePrompts"
+              :key="prompt"
+              class="example-prompt-btn"
+              @click="insertExamplePrompt(prompt)"
+            >{{ prompt }}</button>
+          </div>
+        </template>
       </div>
 
       <div
@@ -1973,27 +2334,114 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
           </div>
           <!-- Normal display -->
           <template v-else>
-            <!-- Thinking/reasoning block (collapsible) -->
+            <!-- P1.18: thinking auto-expands when there is no response
+                 body so reasoning models always show *something* in the
+                 bubble (was: always-collapsed, even when text was empty). -->
             <details
               v-if="message.thinking && message.sender === 'assistant'"
               class="thinking-block"
-              :open="message.isStreaming"
+              :open="message.isStreaming || !(message.text || '').trim()"
             >
               <summary class="thinking-summary">
                 <span class="material-icons thinking-icon">psychology</span>
-                <span>{{ message.isStreaming ? 'Thinking...' : 'Thought process' }}</span>
+                <span>{{ message.isStreaming ? 'Thinking...' : 'Thoughts' }}</span>
                 <span v-if="message.isStreaming" class="thinking-pulse"></span>
               </summary>
               <div class="thinking-content" v-html="renderMarkdown(message.thinking)"></div>
             </details>
+
+            <!-- P1.12: structured error card replaces "Sorry, I encountered an error: …" -->
             <div
-              v-if="message.sender === 'assistant'"
+              v-if="message.errorCard && message.sender === 'assistant'"
+              class="error-card"
+              role="alert"
+            >
+              <div class="error-card-header">
+                <span class="material-icons error-card-icon">error_outline</span>
+                <span class="error-card-title">{{ message.errorCard.title }}</span>
+              </div>
+              <div v-if="message.errorCard.provider || message.errorCard.model" class="error-card-meta">
+                {{ message.errorCard.provider }} / {{ message.errorCard.model }}
+              </div>
+              <div class="error-card-body" v-html="renderMarkdown(message.errorCard.body)"></div>
+              <div class="error-card-actions">
+                <button
+                  v-if="message.errorCard.openSettingsFor"
+                  class="btn-primary btn-sm"
+                  @click="openSettings(message.errorCard.openSettingsFor)"
+                >Open Settings</button>
+                <button
+                  v-if="message.errorCard.retryable && message.retryText"
+                  class="btn-secondary btn-sm"
+                  @click="retryFromErrorCard(message.id)"
+                  :disabled="isLoading"
+                >Retry</button>
+                <button
+                  v-if="message.errorCard.logId"
+                  class="btn-secondary btn-sm"
+                  @click="openLlmLogEntry(message.errorCard.logId!)"
+                >View log</button>
+              </div>
+            </div>
+
+            <!-- P1.19: clearer streaming state — show provider/model + tool
+                 activity inline even when the text bubble is still empty
+                 during long tool round-trips. -->
+            <div
+              v-if="message.sender === 'assistant' && message.isStreaming && !(message.text || '').trim() && !message.errorCard"
+              class="streaming-stub"
+            >
+              <span v-if="message.provider" class="model-badge">
+                {{ message.provider }} / {{ message.model || '?' }}
+              </span>
+              <span v-if="message.toolActivity" class="tool-activity-label">{{ message.toolActivity }}</span>
+              <span v-else class="tool-activity-label muted">Waiting for response…</span>
+            </div>
+
+            <div
+              v-if="message.sender === 'assistant' && message.text"
               class="message-text markdown-content"
               v-html="renderMarkdown(message.text)"
             ></div>
-            <div v-else class="message-text" v-html="renderMarkdown(message.text, true)"></div>
+            <div v-else-if="message.sender === 'user'" class="message-text" v-html="renderMarkdown(message.text, true)"></div>
+
+            <!-- P1.13: collapsible "Tools used (N)" strip persisted on the message. -->
+            <details
+              v-if="message.sender === 'assistant' && message.toolHistory && message.toolHistory.length > 0"
+              class="tool-history-block"
+            >
+              <summary class="tool-history-summary">
+                <span class="material-icons">build</span>
+                Tools used ({{ message.toolHistory.length }})
+              </summary>
+              <ul class="tool-history-list">
+                <li
+                  v-for="(t, ti) in message.toolHistory"
+                  :key="ti"
+                  :class="['tool-history-item', t.is_error ? 'tool-error' : '']"
+                >
+                  <code class="tool-history-name">{{ t.name }}</code>
+                  <span class="tool-history-duration">{{ t.duration_ms }}ms</span>
+                  <span v-if="t.is_error" class="tool-history-flag">error</span>
+                </li>
+              </ul>
+            </details>
+
             <div class="message-footer">
               <span class="message-time">{{ message.timestamp.toLocaleTimeString() }}</span>
+              <!-- P1.9: per-message provider/model badge. -->
+              <span
+                v-if="message.sender === 'assistant' && message.provider && !message.isStreaming"
+                class="model-badge"
+                :title="`Generated by ${message.provider} / ${message.model}`"
+              >{{ message.provider }} / {{ message.model }}</span>
+              <!-- P1.11: deep-link to LLM log entry. -->
+              <button
+                v-if="message.sender === 'assistant' && message.logId && !message.isStreaming"
+                class="log-link"
+                @click="openLlmLogEntry(message.logId!)"
+                title="Open in LLM log"
+              >🪵 log</button>
               <span v-if="message.isStreaming" class="streaming-indicator">
                 <span class="streaming-dot"></span>
                 <span v-if="message.toolActivity" class="tool-activity-label">{{ message.toolActivity }}</span>
@@ -2023,6 +2471,15 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
                   :disabled="isLoading"
                 >
                   <span class="material-icons">edit</span>
+                </button>
+                <!-- P1.16: "Show context sent" affordance on user messages. -->
+                <button
+                  v-if="message.sender === 'user'"
+                  @click="showContextSentFor(message.text)"
+                  class="action-btn"
+                  title="Show context that would be sent for this message"
+                >
+                  <span class="material-icons">insights</span>
                 </button>
               </div>
             </div>
@@ -2059,6 +2516,22 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
     </div>
 
     <div class="chat-input">
+      <!-- P1.15: usage / context-budget chip below the messages, above
+           the input.  Hidden until we have a usage report. -->
+      <div
+        v-if="usageTotalTokens > 0"
+        class="usage-chip"
+        :class="{ warn: usagePercent >= 80 }"
+        :title="`Last turn used ${usageTotalTokens.toLocaleString()} of approximately ${contextWindowSize.toLocaleString()} tokens`"
+      >
+        <span class="usage-chip-bar">
+          <span class="usage-chip-bar-fill" :style="{ width: usagePercent + '%' }"></span>
+        </span>
+        <span class="usage-chip-label">
+          {{ usageTotalTokens.toLocaleString() }} / {{ contextWindowSize.toLocaleString() }} tok ({{ usagePercent }}%)
+          <span v-if="usagePercent >= 80"> — context near limit</span>
+        </span>
+      </div>
       <!-- Context Q&A answer card (suggestions + custom input in one area) -->
       <div v-if="contextQAMode" class="context-answer-card">
         <div v-if="contextQASuggestions.length > 0" class="context-suggestions">
@@ -2122,6 +2595,37 @@ defineExpose({ insertText, startContextQA, exitContextQA, contextQAMode });
           <span class="material-icons">{{ rawMode ? 'code_off' : 'code' }}</span>
           <span class="raw-label">Raw</span>
         </button>
+      </div>
+    </div>
+
+    <!-- P1.16: "Show context sent" modal — surfaces the system prompt,
+         trimmed conversation history and tool list that *would* be sent. -->
+    <div v-if="showContextSentModal" class="modal-overlay" @click.self="showContextSentModal = false">
+      <div class="modal-card context-sent-modal">
+        <div class="modal-header">
+          <span class="material-icons">insights</span>
+          <h3>Context that would be sent</h3>
+          <button class="icon-btn" @click="showContextSentModal = false" title="Close" aria-label="Close">
+            <span class="material-icons">close</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <p v-if="contextSentLoading" class="muted">Building context…</p>
+          <template v-else>
+            <p class="muted">Provider: {{ contextSentProvider }} / {{ contextSentModel }}</p>
+            <h4>System prompt ({{ contextSentSystemPrompt.length }} chars)</h4>
+            <pre class="context-sent-block">{{ contextSentSystemPrompt || '(empty)' }}</pre>
+            <h4>Conversation messages ({{ contextSentMessages.length }})</h4>
+            <ul class="context-sent-msg-list">
+              <li v-for="(m, mi) in contextSentMessages" :key="mi" class="context-sent-msg">
+                <strong>{{ m.role }}</strong>
+                <pre>{{ m.content || '(no content)' }}</pre>
+              </li>
+            </ul>
+            <h4>Tools available ({{ contextSentToolNames.length }})</h4>
+            <p class="context-sent-tools">{{ contextSentToolNames.join(', ') || '(none)' }}</p>
+          </template>
+        </div>
       </div>
     </div>
   </div>
@@ -3728,5 +4232,272 @@ code {
   border-color: var(--accent-color);
   color: var(--accent-color);
   background-color: rgba(88, 101, 242, 0.05);
+}
+
+/* === Onboarding inline card (P1.6) === */
+.onboarding-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  align-items: stretch;
+  max-width: 320px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.onboarding-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  justify-content: flex-start;
+  padding: 0.5rem 0.75rem;
+}
+
+/* === Per-message badges + log link (P1.9 / P1.11) === */
+.model-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.7rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background-color: var(--bg-tertiary, rgba(127, 127, 127, 0.15));
+  color: var(--text-secondary, inherit);
+  border: 1px solid var(--border-color, transparent);
+  white-space: nowrap;
+}
+.secondary-model-summary {
+  opacity: 0.85;
+}
+.secondary-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-right: 0.25rem;
+  opacity: 0.7;
+}
+.log-link {
+  background: none;
+  border: none;
+  color: var(--text-secondary, inherit);
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 0 0.25rem;
+}
+.log-link:hover {
+  color: var(--accent-color);
+}
+
+/* === Streaming stub (P1.19) === */
+.streaming-stub {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary, inherit);
+}
+.streaming-stub .tool-activity-label.muted {
+  opacity: 0.6;
+  font-style: italic;
+}
+
+/* === Tool history strip (P1.13) === */
+.tool-history-block {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  border: 1px solid var(--border-color, rgba(127, 127, 127, 0.2));
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--bg-tertiary, rgba(127, 127, 127, 0.05));
+}
+.tool-history-summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  user-select: none;
+}
+.tool-history-summary .material-icons {
+  font-size: 1rem;
+}
+.tool-history-list {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+}
+.tool-history-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+}
+.tool-history-item.tool-error {
+  color: var(--error-color, #d33);
+}
+.tool-history-name {
+  font-family: monospace;
+}
+.tool-history-duration {
+  opacity: 0.7;
+  font-size: 0.75rem;
+}
+.tool-history-flag {
+  font-size: 0.7rem;
+  padding: 0 0.25rem;
+  border-radius: 3px;
+  background-color: rgba(220, 50, 50, 0.15);
+}
+
+/* === Inline error card (P1.12) === */
+.error-card {
+  border: 1px solid var(--error-color, #d33);
+  border-radius: 6px;
+  padding: 0.75rem;
+  margin: 0.5rem 0;
+  background-color: rgba(220, 50, 50, 0.05);
+}
+.error-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-weight: 600;
+  color: var(--error-color, #d33);
+}
+.error-card-icon {
+  font-size: 1.2rem;
+}
+.error-card-meta {
+  font-size: 0.75rem;
+  opacity: 0.7;
+  margin: 0.25rem 0;
+}
+.error-card-body {
+  margin: 0.5rem 0;
+  font-size: 0.9rem;
+}
+.error-card-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+
+/* === Usage / context-budget chip (P1.15) === */
+.usage-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.7rem;
+  color: var(--text-secondary, inherit);
+  border-top: 1px solid var(--border-color, rgba(127, 127, 127, 0.15));
+}
+.usage-chip.warn {
+  color: #c0822f;
+}
+.usage-chip-bar {
+  flex: 0 0 80px;
+  height: 4px;
+  background-color: var(--bg-tertiary, rgba(127, 127, 127, 0.2));
+  border-radius: 2px;
+  overflow: hidden;
+}
+.usage-chip-bar-fill {
+  display: block;
+  height: 100%;
+  background-color: var(--accent-color, #5865f2);
+  transition: width 200ms ease;
+}
+.usage-chip.warn .usage-chip-bar-fill {
+  background-color: #c0822f;
+}
+.usage-chip-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* === Show context sent modal (P1.16) === */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-card {
+  background-color: var(--bg-primary, #fff);
+  border-radius: 8px;
+  max-width: 720px;
+  width: 90%;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+}
+.context-sent-modal {
+  font-size: 0.85rem;
+}
+.context-sent-modal .modal-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-color, rgba(127, 127, 127, 0.15));
+}
+.context-sent-modal .modal-header h3 {
+  margin: 0;
+  flex: 1;
+  font-size: 1rem;
+}
+.context-sent-modal .modal-body {
+  padding: 0.75rem 1rem;
+  overflow-y: auto;
+}
+.context-sent-modal h4 {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.85rem;
+}
+.context-sent-block {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  background-color: var(--bg-secondary, rgba(127, 127, 127, 0.05));
+  padding: 0.5rem;
+  border-radius: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 0.75rem;
+}
+.context-sent-msg-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.context-sent-msg {
+  border: 1px solid var(--border-color, rgba(127, 127, 127, 0.15));
+  border-radius: 4px;
+  padding: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+.context-sent-msg pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin: 0.25rem 0 0;
+  font-size: 0.75rem;
+}
+.context-sent-tools {
+  font-family: monospace;
+  font-size: 0.75rem;
+  background-color: var(--bg-secondary, rgba(127, 127, 127, 0.05));
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+.muted {
+  opacity: 0.7;
+  font-style: italic;
 }
 </style>

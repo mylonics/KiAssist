@@ -17,6 +17,8 @@ export interface ApiActivityEntry {
   success: boolean;
   /** Whether this is a streaming poll (collapsed by default) */
   isStreamPoll?: boolean;
+  /** When isStreamPoll, the number of polls coalesced into this row. */
+  pollCount?: number;
 }
 
 const entries = ref<ApiActivityEntry[]>([]);
@@ -68,6 +70,27 @@ function scrollToBottom() {
 }
 
 function addEntry(entry: ApiActivityEntry) {
+  // P1.14: coalesce a run of consecutive `poll_stream` polls into a
+  // single rolling row.  When the most recent entry is also a stream
+  // poll, increment its counter and refresh its timestamp / response
+  // summary instead of pushing a new row.  This keeps the API panel
+  // readable during a multi-second stream that polls every 100ms.
+  if (entry.isStreamPoll && entries.value.length > 0) {
+    const last = entries.value[entries.value.length - 1];
+    if (last.isStreamPoll && last.method === entry.method) {
+      const prevCount = last.pollCount ?? 1;
+      last.pollCount = prevCount + 1;
+      last.timestamp = entry.timestamp;
+      last.responseSummary = entry.responseSummary;
+      last.responseFull = entry.responseFull;
+      last.durationMs = entry.durationMs;
+      last.success = entry.success;
+      // Force reactivity for the array (only the last item changed).
+      entries.value = entries.value.slice();
+      scrollToBottom();
+      return;
+    }
+  }
   entries.value.push(entry);
   // Keep max 500 entries
   if (entries.value.length > 500) {
@@ -168,7 +191,9 @@ watch(() => entries.value.length, () => {
           <span :class="['entry-status', entry.success ? 'ok' : 'err']">
             {{ entry.success ? '✓' : '✗' }}
           </span>
-          <span class="entry-method">{{ entry.method }}</span>
+          <span class="entry-method">
+            {{ entry.method }}<span v-if="entry.isStreamPoll && (entry.pollCount ?? 1) > 1" class="entry-poll-count">×{{ entry.pollCount }}</span>
+          </span>
           <span class="entry-duration">{{ formatDuration(entry.durationMs) }}</span>
           <span class="entry-time">{{ formatTime(entry.timestamp) }}</span>
         </div>
