@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
 import ChatBox from './components/ChatBox.vue';
 import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
@@ -46,6 +46,10 @@ onMounted(async () => {
   await loadFieldDefaultsFromBackend();
   await loadLibraryDefaultsFromBackend();
   window.addEventListener('kiassist-open-llm-log', handleOpenLlmLog);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener('kiassist-open-llm-log', handleOpenLlmLog);
 });
 
 // Importer details overlay state

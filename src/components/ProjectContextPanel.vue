@@ -2,13 +2,20 @@
 import { ref, onMounted } from 'vue';
 import { getApi } from '../composables/useApi';
 
-const activeTab = ref<'raw' | 'synthesized'>('raw');
+const activeTab = ref<'raw' | 'synthesized' | 'llm-sent'>('raw');
 const rawContext = ref<string>('');
 const synthesizedContext = ref<string>('');
 const loadingRaw = ref(false);
 const loadingSynthesized = ref(false);
 const errorRaw = ref('');
 const errorSynthesized = ref('');
+
+// "LLM Sent" tab — shows the system prompt + tool list from the most recent LLM call.
+const llmSentSystemPrompt = ref<string>('');
+const llmSentToolNames = ref<string[]>([]);
+const llmSentProjectPath = ref<string>('');
+const loadingLlmSent = ref(false);
+const errorLlmSent = ref('');
 
 async function loadRawContext() {
   loadingRaw.value = true;
@@ -68,6 +75,30 @@ async function loadCached() {
   }
 }
 
+async function loadLlmSent() {
+  loadingLlmSent.value = true;
+  errorLlmSent.value = '';
+  try {
+    const api = getApi();
+    if (!api) {
+      errorLlmSent.value = 'Backend not available';
+      return;
+    }
+    const result = await api.get_last_llm_context();
+    if (result.success) {
+      llmSentSystemPrompt.value = result.system_prompt ?? '';
+      llmSentToolNames.value = result.tool_names ?? [];
+      llmSentProjectPath.value = result.project_path ?? '';
+    } else {
+      errorLlmSent.value = result.error || 'Failed to load last LLM context';
+    }
+  } catch (e: any) {
+    errorLlmSent.value = e.message || 'Unknown error';
+  } finally {
+    loadingLlmSent.value = false;
+  }
+}
+
 function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {});
 }
@@ -95,6 +126,14 @@ onMounted(() => {
       >
         <span class="material-icons tab-icon">auto_awesome</span>
         Synthesized
+      </button>
+      <button
+        :class="['ctx-tab-btn', { active: activeTab === 'llm-sent' }]"
+        @click="activeTab = 'llm-sent'"
+        title="System prompt and tools actually sent in the last LLM call"
+      >
+        <span class="material-icons tab-icon">send</span>
+        LLM Sent
       </button>
     </div>
 
@@ -152,6 +191,47 @@ onMounted(() => {
         <span class="material-icons">info</span>
         Click "Synthesize Context" to have the LLM produce a structured summary of the project.
         {{ !rawContext ? 'Raw context will be built first.' : '' }}
+      </div>
+    </div>
+
+    <!-- LLM Sent Tab -->
+    <div v-show="activeTab === 'llm-sent'" class="context-content">
+      <div class="context-toolbar">
+        <button class="ctx-action-btn" @click="loadLlmSent" :disabled="loadingLlmSent">
+          <span class="material-icons">refresh</span>
+          {{ loadingLlmSent ? 'Loading...' : 'Refresh' }}
+        </button>
+        <button
+          v-if="llmSentSystemPrompt"
+          class="ctx-action-btn secondary"
+          @click="copyToClipboard(llmSentSystemPrompt)"
+          title="Copy system prompt to clipboard"
+        >
+          <span class="material-icons">content_copy</span>
+        </button>
+      </div>
+      <div v-if="errorLlmSent" class="context-error">{{ errorLlmSent }}</div>
+      <div v-if="loadingLlmSent" class="context-loading">
+        <span class="material-icons spinning">sync</span>
+        Loading last LLM context…
+      </div>
+      <template v-else-if="llmSentSystemPrompt">
+        <div class="llm-sent-meta" v-if="llmSentProjectPath">
+          <span class="material-icons llm-sent-meta-icon">folder_open</span>
+          <span class="llm-sent-meta-text" :title="llmSentProjectPath">{{ llmSentProjectPath }}</span>
+        </div>
+        <div class="llm-sent-section-label">System Prompt</div>
+        <pre class="context-text llm-sent-pre">{{ llmSentSystemPrompt }}</pre>
+        <div v-if="llmSentToolNames.length" class="llm-sent-section-label">
+          Tools exposed ({{ llmSentToolNames.length }})
+        </div>
+        <div v-if="llmSentToolNames.length" class="llm-sent-tools">
+          <span v-for="name in llmSentToolNames" :key="name" class="llm-sent-tool-chip">{{ name }}</span>
+        </div>
+      </template>
+      <div v-else class="context-empty">
+        <span class="material-icons">send</span>
+        Send a chat message first, then click "Refresh" to see the system prompt and tool list that were sent to the model.
       </div>
     </div>
   </div>
@@ -316,5 +396,69 @@ onMounted(() => {
 
 .tab-icon {
   font-size: 0.9rem;
+}
+
+/* LLM Sent tab */
+.llm-sent-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  background-color: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.llm-sent-meta-icon {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.llm-sent-meta-text {
+  font-size: 0.625rem;
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llm-sent-section-label {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  background-color: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.llm-sent-pre {
+  flex: unset;
+  max-height: 55vh;
+}
+
+.llm-sent-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  padding: 0.4rem 0.5rem;
+  background-color: var(--bg-secondary);
+  overflow-y: auto;
+}
+
+.llm-sent-tool-chip {
+  display: inline-block;
+  padding: 0.125rem 0.4rem;
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+  font-size: 0.6rem;
+  white-space: nowrap;
 }
 </style>

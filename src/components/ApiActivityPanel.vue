@@ -540,6 +540,20 @@ watch(() => entries.value.length, () => {
   font-size: 0.75rem;
 }
 
+.entry-poll-count {
+  display: inline-block;
+  margin-left: 0.25rem;
+  padding: 0 0.3rem;
+  border-radius: 8px;
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 0.6rem;
+  font-weight: 700;
+  vertical-align: middle;
+  line-height: 1.4;
+}
+
 .activity-footer {
   padding: 0.25rem 0.75rem;
   border-top: 1px solid var(--border-color);

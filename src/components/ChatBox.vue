@@ -480,9 +480,14 @@ async function onProviderChange() {
 async function onModelChange() {
   localStorage.setItem(MODEL_KEY, selectedModel.value);
   if (window.pywebview?.api) {
-    await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
+    const result = await trackedApiCall('set_provider', [selectedProvider.value, selectedModel.value], () =>
       window.pywebview!.api.set_provider(selectedProvider.value, selectedModel.value)
     );
+    // If the backend coerced the model to a canonical id, sync the UI.
+    if (result.success && result.model && result.model !== selectedModel.value) {
+      selectedModel.value = result.model;
+      localStorage.setItem(MODEL_KEY, result.model);
+    }
   }
 }
 
@@ -515,6 +520,11 @@ async function onSecondaryModelChange() {
       console.error('[UI] set_secondary_model failed:', result.error);
     } else if (result.warning) {
       console.warn('[UI] set_secondary_model warning:', result.warning);
+    }
+    // If the backend coerced the model to a canonical id, sync the UI.
+    if (result.success && result.model && result.model !== selectedSecondaryModel.value) {
+      selectedSecondaryModel.value = result.model;
+      localStorage.setItem(SECONDARY_MODEL_KEY, result.model);
     }
   }
 }
