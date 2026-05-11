@@ -6,6 +6,8 @@ Provides API key management, Gemini integration, and KiCad IPC detection.
 
 __version__ = "0.1.0"
 
+import sys
+
 from .api_key import ApiKeyStore
 from .exceptions import (
     KiAssistError,
@@ -34,6 +36,7 @@ def __getattr__(name: str):
     global _loading_main
     if name == "GeminiAPI":
         from .gemini import GeminiAPI as _gemini_api
+        setattr(sys.modules[__name__], name, _gemini_api)
         return _gemini_api
     if name in ("KiAssistAPI", "main"):
         if _loading_main:
