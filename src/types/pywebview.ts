@@ -25,10 +25,24 @@ export interface ApiResult {
   error?: string;
   warning?: string;
   cancelled?: boolean;
+  /** Canonical provider id applied (set_provider/set_secondary_model). */
+  provider?: string;
+  /** Canonical model id applied (set_provider/set_secondary_model). */
+  model?: string;
 }
 
 export interface SendMessageResult extends ApiResult {
   response?: string;
+}
+
+/** A single tool call executed during a stream (persisted on the message). */
+export interface StreamToolEntry {
+  name: string;
+  label: string;
+  arguments: Record<string, unknown>;
+  duration_ms: number;
+  is_error: boolean;
+  content_summary: string;
 }
 
 export interface StreamPollResult extends ApiResult {
@@ -36,6 +50,17 @@ export interface StreamPollResult extends ApiResult {
   thinking?: string;
   done?: boolean;
   tool_activity?: string;
+  /** Append-only list of tool calls executed so far in this stream. */
+  tool_history?: StreamToolEntry[];
+  /** LLM log entry id for this stream (deep-linkable from the bubble). */
+  log_id?: string | null;
+  /** Most recent token usage reported by the provider. */
+  usage?: Record<string, number>;
+}
+
+export interface StartStreamResult extends ApiResult {
+  /** LLM log entry id for the just-started stream. */
+  log_id?: string;
 }
 
 export interface LLMLogEntry {
@@ -154,6 +179,10 @@ export interface ProviderInfo {
   key_prefix: string;
   key_min_length: number;
   has_key: boolean;
+  /** Single-source-of-truth readiness flag (key configured AND server reachable / model downloaded). */
+  ready?: boolean;
+  /** Human-readable reason when not ready. */
+  not_ready_reason?: string;
   /** Base URL for local model providers (id === 'local') */
   base_url?: string;
   /** Server status for Gemma 4 provider (id === 'gemma4') */
@@ -372,12 +401,29 @@ export interface PyWebViewAPI {
   // Chat API
   send_message: (message: string, model?: string) => Promise<SendMessageResult>;
   // Streaming API
-  start_stream_message: (message: string, model?: string, raw_mode?: boolean) => Promise<ApiResult>;
+  start_stream_message: (message: string, model?: string, raw_mode?: boolean) => Promise<StartStreamResult>;
   poll_stream: () => Promise<StreamPollResult>;
-  steer_stream: (message: string, model?: string) => Promise<ApiResult>;
+  steer_stream: (message: string, model?: string) => Promise<StartStreamResult>;
   // LLM interaction log
   get_llm_log: (sinceId?: string | null) => Promise<LLMLogResult>;
   clear_llm_log: () => Promise<ApiResult>;
+  // Context inspection (debug)
+  get_last_llm_context: () => Promise<ApiResult & {
+    system_prompt: string;
+    tool_names: string[];
+    project_path: string;
+  }>;
+  dry_run_message: (message: string, model?: string) => Promise<ApiResult & {
+    system_prompt: string;
+    messages: Array<{ role: string; content: string }>;
+    tool_names: string[];
+    provider: string;
+    model: string;
+  }>;
+  // Provider model discovery
+  fetch_provider_models: (provider: string) => Promise<ApiResult & {
+    models?: ProviderModel[];
+  }>;
   // Session reset
   new_chat_session: () => Promise<ApiResult>;
   // Project API

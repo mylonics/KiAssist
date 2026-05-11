@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
 import ChatBox from './components/ChatBox.vue';
 import KiCadInstanceSelector from './components/KiCadInstanceSelector.vue';
 import ApiActivityPanel from './components/ApiActivityPanel.vue';
@@ -16,6 +16,7 @@ import { useLibraryScanner } from './composables/useLibraryScanner';
 import type { ImportedComponent, ImportedFields } from './types/importer';
 
 const activityPanel = ref<InstanceType<typeof ApiActivityPanel> | null>(null);
+const llmActivityPanel = ref<InstanceType<typeof LlmActivityPanel> | null>(null);
 const chatBox = ref<InstanceType<typeof ChatBox> | null>(null);
 const symbolImporter = ref<InstanceType<typeof SymbolImporter> | null>(null);
 const rightPanelCollapsed = ref(true);
@@ -25,9 +26,30 @@ const { hasResults: scannerHasResults } = useLibraryScanner();
 
 // Load settings from backend on startup
 const { loadFieldDefaultsFromBackend, loadLibraryDefaultsFromBackend } = useAppSettings();
+
+// P1.11: when a chat bubble's "🪵 log" link is clicked, focus the LLM
+// panel and scroll to the entry.  The chat bubble dispatches a window
+// CustomEvent — App.vue is the natural listener since it owns the
+// right-panel tab state.
+function handleOpenLlmLog(event: Event) {
+  const detail = (event as CustomEvent<{ logId?: string }>).detail;
+  if (!detail?.logId) return;
+  rightPanelCollapsed.value = false;
+  rightPanelTab.value = 'llm';
+  // Defer so the panel is visible before we try to scroll it.
+  setTimeout(() => {
+    llmActivityPanel.value?.scrollToEntry?.(detail.logId!);
+  }, 0);
+}
+
 onMounted(async () => {
   await loadFieldDefaultsFromBackend();
   await loadLibraryDefaultsFromBackend();
+  window.addEventListener('kiassist-open-llm-log', handleOpenLlmLog);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener('kiassist-open-llm-log', handleOpenLlmLog);
 });
 
 // Importer details overlay state
@@ -168,7 +190,7 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
       </div>
       <div class="right-panel-content">
         <ProjectContextPanel v-show="rightPanelTab === 'context'" />
-        <LlmActivityPanel v-show="rightPanelTab === 'llm'" />
+        <LlmActivityPanel v-show="rightPanelTab === 'llm'" ref="llmActivityPanel" />
         <ApiActivityPanel v-show="rightPanelTab === 'api'" ref="activityPanel" />
       </div>
     </aside>

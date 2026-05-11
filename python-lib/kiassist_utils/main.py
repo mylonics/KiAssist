@@ -169,7 +169,10 @@ class KiAssistAPI:
         # Context lifecycle state (RequirementsManager-backed)
         self._requirements_manager: Optional[RequirementsManager] = None
         self._context_lifecycle: Dict[str, Any] = self._default_lifecycle_state()
-        # Streaming state
+        # Streaming state.  All fields below MUST only be read or written
+        # while holding ``_stream_lock`` so the UI never observes a
+        # half-updated snapshot (notably the race that produced the
+        # silent "No response received." bubble).
         self._stream_lock = threading.Lock()
         self._stream_buffer = ""
         self._stream_thinking_buffer = ""
@@ -177,6 +180,25 @@ class KiAssistAPI:
         self._stream_done = True
         self._stream_error = None
         self._stream_tool_activity: Optional[str] = None  # e.g. "Searching the web…"
+        # Append-only history of tool calls executed during the current
+        # stream.  Each entry is a dict with ``name``, ``arguments``,
+        # ``duration_ms``, ``is_error`` and ``content_summary``.  Cleared
+        # when a new stream starts.
+        self._stream_tool_history: List[Dict[str, Any]] = []
+        # Log entry id for the active LLM call (mirrors llm_logger).
+        # Returned on ``start_stream_message`` and surfaced in every
+        # ``poll_stream`` response so the UI can deep-link the bubble
+        # to its row in the LLM panel.
+        self._stream_log_id: Optional[str] = None
+        # Most recent token usage dict reported by the provider during
+        # the current stream.  Surfaced via ``poll_stream`` so the UI
+        # can show a context-budget chip in real time.
+        self._stream_usage: Dict[str, int] = {}
+        # Provider/model labels for the active stream (echoed back in
+        # ``poll_stream`` so the UI can render a per-message badge even
+        # if the user switches providers mid-flight).
+        self._stream_provider: str = ""
+        self._stream_model: str = ""
         self._stream_cancel = threading.Event()
         # Part import progress (polled by frontend)
         self._import_progress = ""
@@ -196,6 +218,22 @@ class KiAssistAPI:
 
         # Restore persisted model selections from config
         self._restore_model_selections()
+
+        # If no provider/model was explicitly persisted, pick a default
+        # that's actually ready (cloud key configured / Ollama reachable
+        # / a Gemma model already downloaded) instead of always shipping
+        # the user into the Gemma onboarding flow.  See
+        # ``_pick_default_provider``.
+        try:
+            self._pick_default_provider()
+        except Exception:
+            logger.exception("Failed to auto-pick a default provider")
+
+        # Cache of the last system prompt + tool list actually sent to
+        # the model.  Powers the "Show context sent" affordance and the
+        # "Diff Project Context vs LLM Context" view in the right panel.
+        self._last_system_prompt: str = ""
+        self._last_tool_names: List[str] = []
 
         # Auto-start last Gemma server in background so it's ready by the
         # time the user sends a message.
@@ -299,6 +337,127 @@ class KiAssistAPI:
                 json.dump(config, f, indent=2)
         except Exception:
             logger.warning("Failed to persist model selections")
+
+    # ------------------------------------------------------------------
+    # Provider readiness helpers
+    # ------------------------------------------------------------------
+
+    def _provider_ready_reason(self, provider_id: str) -> Optional[str]:
+        """Return ``None`` if *provider_id* is ready, else a human reason."""
+        if provider_id == "gemma4":
+            try:
+                downloaded = self._local_model_manager.get_downloaded_models()
+                if not downloaded:
+                    return "No Gemma model downloaded."
+            except Exception as exc:
+                return f"Gemma model manager unavailable: {exc}"
+            return None
+        if provider_id == "local":
+            try:
+                detected = self.get_local_models()
+            except Exception as exc:
+                return f"Local model server unavailable: {exc}"
+            if not detected.get("success") or not detected.get("models"):
+                base_url = self._get_local_base_url()
+                err = detected.get("error") if isinstance(detected, dict) else None
+                msg = err or f"Ollama server not reachable at {base_url}"
+                return msg
+            return None
+        # Cloud providers — need an API key.
+        if not self.api_key_store.has_api_key(provider_id):
+            entry = next(
+                (p for p in _PROVIDER_REGISTRY if p["id"] == provider_id),
+                None,
+            )
+            label = entry["name"] if entry else provider_id
+            return f"No API key configured for {label}."
+        return None
+
+    def _validate_model_for_provider(
+        self, provider_id: str, model: Optional[str]
+    ) -> Optional[str]:
+        """Return a canonical model id for *provider_id* / *model*.
+
+        * If *model* is in the provider's static registry, return it.
+        * If *model* matches a discovered local/Ollama model, return it.
+        * Otherwise return the provider's ``default_model``.
+
+        Returns ``None`` when the provider id is unknown.
+        """
+        info = next(
+            (p for p in _PROVIDER_REGISTRY if p["id"] == provider_id), None,
+        )
+        if info is None:
+            return None
+        valid = {m["id"] for m in info.get("models", [])}
+        # Local models can be discovered at runtime via /v1/models.
+        if provider_id == "local":
+            try:
+                detected = self.get_local_models()
+                if detected.get("success"):
+                    for m in detected.get("models", []):
+                        if isinstance(m, dict) and m.get("id"):
+                            valid.add(m["id"])
+            except Exception:
+                pass
+        if model and model in valid:
+            return model
+        return info.get("default_model")
+
+    def _pick_default_provider(self) -> None:
+        """Auto-select a ready provider on first run.
+
+        Only acts when no ``provider`` field has been persisted to
+        ``~/.kiassist/config.json``.  Tries the following in order and
+        commits the first ready candidate:
+
+        1. ``gemma4`` if any Gemma GGUF is already downloaded.
+        2. The first cloud provider with a configured API key.
+        3. ``local`` if an Ollama server is reachable.
+
+        Falls back to leaving the existing default in place (which
+        triggers the Gemma onboarding flow in the UI).
+        """
+        config = self._get_config()
+        if config.get(self._CFG_PROVIDER):
+            return  # User has an explicit choice — respect it.
+
+        # 1. Gemma if downloaded
+        try:
+            if self._local_model_manager.get_downloaded_models():
+                self.current_provider_name = "gemma4"
+                self.current_model = self._local_model_manager.get_downloaded_models()[0]["id"]
+                logger.info("Auto-default: gemma4 / %s", self.current_model)
+                return
+        except Exception:
+            pass
+
+        # 2. Cloud provider with key
+        for cand in ("gemini", "claude", "openai"):
+            try:
+                if self.api_key_store.has_api_key(cand):
+                    info = next(p for p in _PROVIDER_REGISTRY if p["id"] == cand)
+                    self.current_provider_name = cand
+                    self.current_model = info["default_model"]
+                    logger.info("Auto-default: %s / %s", cand, self.current_model)
+                    return
+            except Exception:
+                continue
+
+        # 3. Local Ollama server reachable
+        try:
+            detected = self.get_local_models()
+            if detected.get("success") and detected.get("models"):
+                first = detected["models"][0]
+                model_id = first.get("id") if isinstance(first, dict) else None
+                if model_id:
+                    self.current_provider_name = "local"
+                    self.current_model = model_id
+                    logger.info("Auto-default: local / %s", model_id)
+                    return
+        except Exception:
+            pass
+        # Otherwise leave the constructor defaults (gemma4 + onboarding).
 
     # ------------------------------------------------------------------
     # Symbol field defaults
@@ -434,6 +593,11 @@ class KiAssistAPI:
                 entry["server_status"] = self._local_model_manager.get_server_status()
             else:
                 entry["has_key"] = self.api_key_store.has_api_key(info["id"])
+            # Surface a single-source-of-truth readiness flag so the UI
+            # can stop juggling has_key / gemmaReady / serverStatus.
+            reason = self._provider_ready_reason(info["id"])
+            entry["ready"] = reason is None
+            entry["not_ready_reason"] = reason or ""
             providers.append(entry)
         return {
             "success": True,
@@ -449,14 +613,29 @@ class KiAssistAPI:
 
         Args:
             provider: Provider ID (``gemini``, ``claude``, or ``openai``).
-            model: Model shortcut string.
+            model: Model shortcut string.  If the model is not in the
+                provider's static registry and not a discovered local
+                model, it is coerced to the provider's ``default_model``
+                and a ``warning`` is returned with the canonical id.
 
         Returns:
-            Result dictionary with success status and optional warning.
+            Result dictionary with ``success`` flag, the ``provider`` /
+            ``model`` actually applied, and an optional ``warning``.
         """
         valid_ids = {p["id"] for p in _PROVIDER_REGISTRY}
         if provider not in valid_ids:
             return {"success": False, "error": f"Unknown provider: {provider}"}
+
+        canonical = self._validate_model_for_provider(provider, model)
+        coerced_warning: Optional[str] = None
+        if canonical is None:
+            return {"success": False, "error": f"Unknown provider: {provider}"}
+        if canonical != model:
+            coerced_warning = (
+                f"Model '{model}' is not available for {provider}; "
+                f"using '{canonical}' instead."
+            )
+            model = canonical
 
         self.current_provider_name = provider
         self.current_model = model
@@ -467,11 +646,23 @@ class KiAssistAPI:
             new_provider = self._create_provider(provider, model)
             if new_provider:
                 self.current_provider = new_provider
-                return {"success": True}
+                result: Dict[str, Any] = {
+                    "success": True,
+                    "provider": provider,
+                    "model": model,
+                }
+                if coerced_warning:
+                    result["warning"] = coerced_warning
+                return result
             else:
                 return {
                     "success": True,
-                    "warning": f"No API key configured for {provider}. Please add one via Settings.",
+                    "provider": provider,
+                    "model": model,
+                    "warning": coerced_warning or (
+                        f"No API key configured for {provider}. "
+                        "Please add one via Settings."
+                    ),
                 }
         except Exception as exc:
             return {"success": False, "error": str(exc)}
@@ -987,7 +1178,8 @@ class KiAssistAPI:
         Args:
             provider: Provider ID (``gemini``, ``claude``, ``openai``, or
                       ``local``).
-            model:    Model shortcut string.
+            model:    Model shortcut string.  Validated and coerced to the
+                      provider's ``default_model`` if unknown.
 
         Returns:
             Result dictionary with success status and optional warning.
@@ -995,6 +1187,17 @@ class KiAssistAPI:
         valid_ids = {p["id"] for p in _PROVIDER_REGISTRY}
         if provider not in valid_ids:
             return {"success": False, "error": f"Unknown provider: {provider}"}
+
+        canonical = self._validate_model_for_provider(provider, model)
+        coerced_warning: Optional[str] = None
+        if canonical is None:
+            return {"success": False, "error": f"Unknown provider: {provider}"}
+        if canonical != model:
+            coerced_warning = (
+                f"Secondary model '{model}' is not available for {provider}; "
+                f"using '{canonical}' instead."
+            )
+            model = canonical
 
         self.secondary_provider_name = provider
         self.secondary_model = model
@@ -1005,11 +1208,20 @@ class KiAssistAPI:
             new_provider = self._create_provider(provider, model)
             if new_provider:
                 self.secondary_provider = new_provider
-                return {"success": True}
+                result: Dict[str, Any] = {
+                    "success": True,
+                    "provider": provider,
+                    "model": model,
+                }
+                if coerced_warning:
+                    result["warning"] = coerced_warning
+                return result
             else:
                 return {
                     "success": True,
-                    "warning": (
+                    "provider": provider,
+                    "model": model,
+                    "warning": coerced_warning or (
                         f"No API key configured for {provider}. "
                         "Please add one via Settings."
                     ),
@@ -1393,6 +1605,12 @@ class KiAssistAPI:
     # Tool dispatch (MCP-backed)
     # ------------------------------------------------------------------
 
+    # Maximum bytes retained in the streaming thinking buffer.  Some
+    # reasoning models can emit unbounded chain-of-thought; we keep the
+    # most recent ~64 KiB and prepend a truncation marker so the UI
+    # still has context without blowing memory or RPC payload size.
+    _STREAM_THINKING_MAX_CHARS = 64 * 1024
+
     # User-friendly labels for the streaming "tool activity" indicator.
     # Falls back to "Running <name>…" for tools not listed here.
     _TOOL_ACTIVITY_LABELS: Dict[str, str] = {
@@ -1543,6 +1761,11 @@ class KiAssistAPI:
                 self._stream_done = False
                 self._stream_error = None
                 self._stream_tool_activity = None
+                self._stream_tool_history = []
+                self._stream_usage = {}
+                self._stream_provider = self.current_provider_name
+                self._stream_model = model or self.current_model
+                self._stream_log_id = None
 
             if raw_mode:
                 # Raw mode: send only the bare user message, no history or system prompt
@@ -1585,6 +1808,17 @@ class KiAssistAPI:
                 system_prompt=system_prompt,
                 is_stream=True,
             )
+            with self._stream_lock:
+                self._stream_log_id = log_id
+
+            # Cache the system prompt + tool list actually sent so the
+            # "Diff Project Context vs LLM Context" view in the right
+            # panel can show what the model saw on the most recent turn.
+            self._last_system_prompt = system_prompt or ""
+            self._last_tool_names = (
+                [s.get("name", "") for s in (tool_schemas or [])]
+                if use_tools else []
+            )
 
             # Token-aware context manager (Phase 3): trims oversized tool
             # results and summarises the conversation when token usage
@@ -1621,6 +1855,8 @@ class KiAssistAPI:
                                     accumulated_tool_calls = chunk.tool_calls
                                 if chunk.usage:
                                     last_usage = chunk.usage
+                                    with self._stream_lock:
+                                        self._stream_usage = dict(last_usage)
 
                             if cancel_event.is_set():
                                 break
@@ -1674,8 +1910,12 @@ class KiAssistAPI:
                                     "Dispatching MCP tool: %s(%s)",
                                     tc.name, tc.arguments,
                                 )
+                                tool_started = time.time()
                                 content, is_error = await self._execute_mcp_tool(
                                     tc.name, tc.arguments,
+                                )
+                                tool_duration_ms = int(
+                                    (time.time() - tool_started) * 1000
                                 )
                                 # Token-aware trim: large tool results
                                 # (e.g. a full schematic dump) are clipped
@@ -1687,6 +1927,22 @@ class KiAssistAPI:
                                     content=content,
                                     is_error=is_error,
                                 ))
+                                # Append a record to the persistent
+                                # tool-activity history so the UI can
+                                # render a "Tools used (N)" strip after
+                                # the stream ends.
+                                content_summary = content if isinstance(content, str) else str(content)
+                                if len(content_summary) > 200:
+                                    content_summary = content_summary[:200] + "\u2026"
+                                with self._stream_lock:
+                                    self._stream_tool_history.append({
+                                        "name": tc.name,
+                                        "label": activity_label,
+                                        "arguments": tc.arguments,
+                                        "duration_ms": tool_duration_ms,
+                                        "is_error": bool(is_error),
+                                        "content_summary": content_summary,
+                                    })
 
                             # Clear tool activity before re-streaming
                             with self._stream_lock:
@@ -1729,14 +1985,26 @@ class KiAssistAPI:
                                         )
 
                     except Exception as exc:
+                        # Capture the error.  We deliberately DON'T mark
+                        # the stream done here — the ``finally`` block
+                        # below performs the single atomic state update
+                        # so ``poll_stream`` can never see ``done=True``
+                        # with ``error=None`` and an empty buffer.
                         with self._stream_lock:
                             self._stream_error = str(exc)
                         llm_logger.finish(log_id, error=str(exc))
                         return
                     finally:
+                        # Atomic completion: snapshot every field the
+                        # poller observes, write _stream_done last, all
+                        # under a single lock acquisition.  This closes
+                        # the race that produced the silent
+                        # "No response received." UX bug.
                         with self._stream_lock:
-                            self._stream_done = True
                             final_text = self._stream_buffer
+                            final_error = self._stream_error
+                            self._stream_tool_activity = None
+                            self._stream_done = True
 
                         # Persist the assembled assistant response
                         if final_text:
@@ -1756,11 +2024,13 @@ class KiAssistAPI:
                                     persist_exc,
                                 )
 
-                    # Log the completed stream
+                    # Log the completed stream.  Use the snapshot so the
+                    # log entry matches what the UI saw.
                     llm_logger.finish(
                         log_id,
                         response_text=final_text,
                         usage=last_usage,
+                        error=final_error or "",
                     )
 
                 # Schedule the coroutine on the persistent event loop
@@ -1771,10 +2041,20 @@ class KiAssistAPI:
 
             thread = threading.Thread(target=_run_stream, daemon=True)
             thread.start()
-            return {"success": True}
+            return {
+                "success": True,
+                "log_id": log_id,
+                "provider": self.current_provider_name,
+                "model": model or self.current_model,
+            }
 
         except Exception as exc:
-            return {"success": False, "error": f"Stream error: {exc}"}
+            return {
+                "success": False,
+                "error": f"Stream error: {exc}",
+                "provider": self.current_provider_name,
+                "model": model or self.current_model,
+            }
 
     def _process_stream_chunk(self, text: str) -> None:
         """Route incoming stream text into thinking or response buffers.
@@ -1783,6 +2063,10 @@ class KiAssistAPI:
         emit for chain-of-thought reasoning.  Content inside the tags goes to
         ``_stream_thinking_buffer``; everything else goes to
         ``_stream_buffer``.
+
+        The thinking buffer is capped at ``_STREAM_THINKING_MAX_CHARS`` to
+        avoid unbounded growth on pathological reasoning loops; older
+        content is dropped and a truncation marker is prepended.
 
         Must be called while holding ``_stream_lock``.
         """
@@ -1814,15 +2098,46 @@ class KiAssistAPI:
                     self._stream_in_thinking = True
                     remaining = remaining[start_idx + len("<think>"):]
 
+        # Cap the thinking buffer if it got too large.  Keep the *latest*
+        # content (which is usually most relevant) and a marker so the
+        # user knows truncation happened.
+        if len(self._stream_thinking_buffer) > self._STREAM_THINKING_MAX_CHARS:
+            keep = self._STREAM_THINKING_MAX_CHARS
+            self._stream_thinking_buffer = (
+                "[…earlier reasoning truncated…]\n"
+                + self._stream_thinking_buffer[-keep:]
+            )
+
     def poll_stream(self) -> dict:
-        """Poll for new streaming content."""
+        """Poll for new streaming content.
+
+        Returns a snapshot of the current streaming state, including:
+
+        * ``text``           — the assistant text accumulated so far.
+        * ``thinking``       — chain-of-thought content (``<think>`` blocks).
+        * ``done``           — whether the stream has finished.
+        * ``error``          — error string, or ``None`` on success.
+        * ``tool_activity``  — current tool's friendly label (if any).
+        * ``tool_history``   — list of dicts describing every tool call
+          executed during this stream (name, arguments, duration, etc.).
+        * ``log_id``         — id of the LLM log entry for this stream.
+        * ``provider``       — provider name for this stream.
+        * ``model``          — model id for this stream.
+        * ``usage``          — most recent token usage reported by the
+          provider (e.g. ``{"input_tokens": 123, "output_tokens": 45}``).
+        """
         with self._stream_lock:
-            result = {
+            result: Dict[str, Any] = {
                 "success": True,
                 "text": self._stream_buffer,
                 "thinking": self._stream_thinking_buffer,
                 "done": self._stream_done,
                 "error": self._stream_error,
+                "tool_history": list(self._stream_tool_history),
+                "log_id": self._stream_log_id,
+                "provider": self._stream_provider,
+                "model": self._stream_model,
+                "usage": dict(self._stream_usage),
             }
             if self._stream_tool_activity:
                 result["tool_activity"] = self._stream_tool_activity
@@ -1859,6 +2174,201 @@ class KiAssistAPI:
         """
         llm_logger.clear()
         return {"success": True}
+
+    # ------------------------------------------------------------------
+    # Context inspection (debug UX)
+    # ------------------------------------------------------------------
+
+    def get_last_llm_context(self) -> Dict[str, Any]:
+        """Return the system prompt + tool list from the most recent LLM call.
+
+        Used by the right-panel "Context" tab to diff what *the model
+        actually saw* against what :class:`ProjectContextPanel` thinks
+        the project context should be.
+
+        Returns:
+            Dict with ``system_prompt`` (str), ``tool_names`` (list[str])
+            and ``project_path`` (str).
+        """
+        return {
+            "success": True,
+            "system_prompt": self._last_system_prompt or "",
+            "tool_names": list(self._last_tool_names or []),
+            "project_path": self._current_project_path or "",
+        }
+
+    def dry_run_message(
+        self, message: str, model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Build the exact payload that would be sent to the model, without sending it.
+
+        Powers the "Show context sent" affordance in the chat — users
+        can preview the system prompt, trimmed conversation history,
+        and tool schema list that *would* accompany their next message.
+
+        Args:
+            message: The hypothetical user message.
+            model: Optional model override (defaults to the active model).
+
+        Returns:
+            Dict with ``system_prompt`` (str), ``messages`` (list of
+            ``{role, content}`` dicts including the new user turn),
+            ``tool_names`` (list[str]) and ``provider``/``model``.
+        """
+        try:
+            system_prompt = self._build_system_prompt() or ""
+        except Exception as exc:
+            system_prompt = f"<error building system prompt: {exc}>"
+
+        # Build the conversation history from the active session, then
+        # append the hypothetical user message.
+        msgs: List[Dict[str, Any]] = []
+        try:
+            if self.current_session_id and self._current_project_path:
+                store = ConversationStore(
+                    Path(self._current_project_path).parent
+                    if Path(self._current_project_path).is_file()
+                    else Path(self._current_project_path)
+                )
+                # Use the active provider's context window for trimming
+                # (best-effort — fakes may not implement get_context_window).
+                ctx_mgr = None
+                try:
+                    if self.current_provider is not None:
+                        ctx_mgr = self._get_context_window_manager(
+                            self.current_provider
+                        )
+                except Exception:
+                    ctx_mgr = None
+                history = self._build_conversation_messages(
+                    store, self.current_session_id, ctx_mgr=ctx_mgr,
+                )
+                for m in history:
+                    msgs.append({
+                        "role": getattr(m, "role", ""),
+                        "content": getattr(m, "content", "") or "",
+                    })
+        except Exception as exc:
+            logger.debug("dry_run_message: history load failed: %s", exc)
+        msgs.append({"role": "user", "content": message})
+
+        # Tool schemas that would be exposed.
+        try:
+            schemas = self._get_mcp_tool_schemas(self._focused_agent)
+            tool_names = [s.get("name", "") for s in schemas]
+        except Exception:
+            tool_names = []
+
+        return {
+            "success": True,
+            "system_prompt": system_prompt,
+            "messages": msgs,
+            "tool_names": tool_names,
+            "provider": self.current_provider_name,
+            "model": model or self.current_model,
+        }
+
+    # ------------------------------------------------------------------
+    # Provider model discovery (cloud)
+    # ------------------------------------------------------------------
+
+    def fetch_provider_models(self, provider: str) -> Dict[str, Any]:
+        """Discover available models for *provider* from its remote API.
+
+        Currently supports:
+
+        * ``gemini``  — uses the google-genai client to list models.
+        * ``openai``  — uses the OpenAI HTTP API (``GET /v1/models``).
+        * ``local``   — delegates to :meth:`get_local_models`.
+        * ``gemma4``  — returns the locally downloaded variants.
+        * ``claude``  — Anthropic does not expose a list endpoint;
+          returns the static registry with a note.
+
+        Returns:
+            Dict with ``models`` (list of ``{id, name}``) or an ``error``
+            string on failure.  Never raises.
+        """
+        valid_ids = {p["id"] for p in _PROVIDER_REGISTRY}
+        if provider not in valid_ids:
+            return {"success": False, "error": f"Unknown provider: {provider}"}
+
+        try:
+            if provider == "local":
+                return self.get_local_models()
+            if provider == "gemma4":
+                gemma_models = [
+                    {"id": m["id"], "name": m.get("name", m["id"])}
+                    for m in self._local_model_manager.get_available_models()
+                    if m.get("downloaded")
+                ]
+                return {"success": True, "models": gemma_models}
+            if provider == "gemini":
+                api_key = self.api_key_store.get_api_key("gemini")
+                if not api_key:
+                    return {
+                        "success": False,
+                        "error": "No API key configured for Gemini.",
+                    }
+                try:
+                    from google import genai  # type: ignore
+                except ImportError as exc:
+                    return {
+                        "success": False,
+                        "error": f"google-genai not installed: {exc}",
+                    }
+                client = genai.Client(api_key=api_key)
+                gemini_models: List[Dict[str, str]] = []
+                try:
+                    for m in client.models.list():
+                        name = getattr(m, "name", "") or ""
+                        # Strip the "models/" prefix Gemini returns.
+                        mid = name.split("/")[-1] if name else ""
+                        if mid:
+                            gemini_models.append({
+                                "id": mid,
+                                "name": getattr(m, "display_name", "") or mid,
+                            })
+                except Exception as exc:
+                    return {"success": False, "error": str(exc)}
+                return {"success": True, "models": gemini_models}
+            if provider == "openai":
+                api_key = self.api_key_store.get_api_key("openai")
+                if not api_key:
+                    return {
+                        "success": False,
+                        "error": "No API key configured for OpenAI.",
+                    }
+                import urllib.request
+                import json as _json
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = _json.loads(resp.read().decode("utf-8"))
+                except Exception as exc:
+                    return {"success": False, "error": str(exc)}
+                openai_models = [
+                    {"id": m.get("id", ""), "name": m.get("id", "")}
+                    for m in data.get("data", [])
+                    if isinstance(m, dict) and m.get("id")
+                ]
+                return {"success": True, "models": openai_models}
+            if provider == "claude":
+                # Anthropic exposes no public list endpoint as of writing.
+                info = next(p for p in _PROVIDER_REGISTRY if p["id"] == "claude")
+                return {
+                    "success": True,
+                    "models": list(info.get("models", [])),
+                    "warning": (
+                        "Anthropic does not provide a public model list "
+                        "endpoint; showing the built-in registry."
+                    ),
+                }
+            return {"success": False, "error": f"Unsupported provider: {provider}"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
 
     def steer_stream(self, message: str, model: Optional[str] = None) -> dict:
         """Interrupt the active stream and start a new one with an additional user message.
