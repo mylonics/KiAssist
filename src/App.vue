@@ -7,6 +7,7 @@ import LlmActivityPanel from './components/LlmActivityPanel.vue';
 import ProjectContextPanel from './components/ProjectContextPanel.vue';
 import SymbolImporter from './components/SymbolImporter.vue';
 import VariantImporter from './components/VariantImporter.vue';
+import PartSearch from './components/PartSearch.vue';
 import LibraryScanner from './components/LibraryScanner.vue';
 import LibraryScanResults from './components/LibraryScanResults.vue';
 import AppSettingsDialog from './components/AppSettings.vue';
@@ -111,6 +112,10 @@ function handleContextQuestionsReady(questions: Array<{ question: string; sugges
         />
         <div class="left-panel-divider"></div>
         <VariantImporter
+          @component-imported="handleComponentImported"
+        />
+        <div class="left-panel-divider"></div>
+        <PartSearch
           @component-imported="handleComponentImported"
         />
         <div class="left-panel-divider"></div>

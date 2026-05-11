@@ -2939,6 +2939,135 @@ def part_import(
 
 
 @mcp.tool()
+def part_search(
+    specs: str,
+    candidate_mpns: Optional[List[str]] = None,
+    refine: str = "",
+    search_id: Optional[str] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """Parametric part search returning a structured top-N candidates list.
+
+    This is the entry point for the multi-turn "find me a part with these
+    specs" workflow.  Call it from the chat agent in two stages:
+
+    1. **First call** — pass only ``specs`` (and optionally ``refine``).
+       If you do not yet have candidate MPNs, the tool runs a DuckDuckGo
+       search for ``<specs> electronic component MPN datasheet`` and
+       returns the raw web hits in ``web_results`` plus a fuzzy
+       ``mpn_hints`` list.  The agent should extract real MPNs from the
+       snippets (its job — this tool does no LLM reasoning) and re-call.
+    2. **Second call** — pass ``candidate_mpns=[...]`` and the
+       ``search_id`` from the first response.  Each MPN is enriched via
+       Octopart (:func:`part_lookup`) so the agent gets a verified card
+       per candidate with manufacturer, datasheet URL, supplier part
+       numbers, and a clickable product page URL.
+
+    Refinement turns ("similar to option 2 but cheaper") simply re-call
+    with the same ``search_id`` and a new ``refine`` string plus the
+    narrowed ``candidate_mpns`` the agent has chosen to evaluate.
+
+    Args:
+        specs:          Free-text spec string, e.g.
+                        ``"24-bit ADC, SPI, single-supply 3.3 V, ≤$10"``.
+        candidate_mpns: MPNs to enrich on this turn.  Skip on the first
+                        call to get web results back instead.
+        refine:         Optional refinement note (saved on the session,
+                        not interpreted by this tool).
+        search_id:      Reuse a session id from a prior turn; omit to
+                        start a new conversation.
+        limit:          Max candidates to return (default 5, max 20).
+
+    Returns:
+        Dict with ``search_id``, ``turn``, ``candidates`` (list of cards
+        with ``mpn``, ``manufacturer``, ``description``, ``datasheet_url``,
+        ``product_url``, ``digikey_pn``, ``lcsc_pn``, ``mouser_pn``,
+        ``verified``, ``warnings``), ``web_results`` (only on the first
+        no-MPNs call), ``mpn_hints``, and ``verified_all``.
+    """
+    if not isinstance(specs, str) or not specs.strip():
+        return _err("specs must be a non-empty string.")
+    if candidate_mpns is not None and not isinstance(candidate_mpns, list):
+        return _err("candidate_mpns must be a list of strings or null.")
+    if not isinstance(limit, int) or limit < 1 or limit > 20:
+        return _err("limit must be an integer between 1 and 20.")
+
+    try:
+        from .importer.part_search import run_part_search
+    except ImportError as exc:
+        return _err(f"part_search module unavailable: {exc}")
+
+    try:
+        result = run_part_search(
+            specs,
+            candidate_mpns=candidate_mpns,
+            refine=refine or "",
+            search_id=search_id,
+            limit=limit,
+        )
+    except ValueError as exc:
+        return _err(str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"part_search failed: {exc}")
+    return _ok(result)
+
+
+@mcp.tool()
+def part_find_existing(
+    project_path: str,
+    query: str,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """Find parts already present in the user's project before importing.
+
+    Implements the "reuse-first" half of the part-search workflow: scans
+    every ``.kicad_sch`` in the project for matching symbols and walks
+    the project's own / ``kiassist_imports`` symbol libraries for
+    existing definitions whose name, ``MPN``, ``Description`` or
+    ``Datasheet`` field matches *query*.
+
+    Use this **before** calling :func:`part_search` so the agent can
+    surface "you already have this part" suggestions and avoid importing
+    a duplicate.  Built-in KiCad libraries (``Device``, etc.) are
+    intentionally **not** scanned here — use :func:`library_search`
+    for those.
+
+    Args:
+        project_path: Path to a ``.kicad_pro`` file or project directory.
+        query:        Free-text spec query (same string as used for
+                      :func:`part_search`).
+        limit:        Per-section result cap (default 5, max 25).
+
+    Returns:
+        Dict with ``schematic_matches`` (list of ``{reference, value,
+        footprint, schematic, score}``), ``library_matches`` (list of
+        ``{lib_id, nickname, symbol_name, library_path, description, mpn,
+        manufacturer, datasheet, value, score}``), and ``has_matches``.
+    """
+    if err := _validate_path(project_path):
+        return _err(err)
+    if not isinstance(query, str) or not query.strip():
+        return _err("query must be a non-empty string.")
+    if not isinstance(limit, int) or limit < 1 or limit > 25:
+        return _err("limit must be an integer between 1 and 25.")
+
+    try:
+        from .importer.part_search import find_existing_parts as _fep
+    except ImportError as exc:
+        return _err(f"part_search module unavailable: {exc}")
+
+    try:
+        result = _fep(project_path, query, limit=limit)
+    except FileNotFoundError as exc:
+        return _err(str(exc))
+    except ValueError as exc:
+        return _err(str(exc))
+    except Exception as exc:  # noqa: BLE001
+        return _err(f"part_find_existing failed: {exc}")
+    return _ok(result)
+
+
+@mcp.tool()
 def library_search(
     query: str,
     kind: str = "symbol",

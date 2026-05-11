@@ -222,9 +222,9 @@ tools the model sees on each turn:
 | `focused_agent`        | Tool prefixes exposed                                 |
 | ---------------------- | ----------------------------------------------------- |
 | `None` / unspecified   | All tools                                             |
-| `schematic-agent`      | `schematic_*`, `kicad_*`, `library_*`, `web_search`   |
-| `symbol-agent`         | `symbol_*`, `library_*`                               |
-| `footprint-agent`      | `footprint_*`, `library_*`                            |
+| `schematic-agent`      | `schematic_*`, `kicad_*`, `library_*`, `part_*`, `web_search` |
+| `symbol-agent`         | `symbol_*`, `library_*`, `part_*`                     |
+| `footprint-agent`      | `footprint_*`, `library_*`, `part_*`                  |
 | `pcb-agent`            | `pcb_*`, `kicad_*`, `library_*`                       |
 | `requirements-agent`   | `project_*`, `web_search`                             |
 

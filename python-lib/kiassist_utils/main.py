@@ -756,9 +756,9 @@ class KiAssistAPI:
     # tools whose names start with one of these prefixes are forwarded to
     # the model.  ``None`` (or unknown agent) means "expose every tool".
     _AGENT_TOOL_PREFIXES: Dict[str, tuple] = {
-        "schematic-agent": ("schematic_", "project_", "kicad_", "library_", "web_search"),
-        "symbol-library-agent": ("symbol_lib_", "library_", "web_search"),
-        "footprint-agent": ("footprint_", "library_", "web_search"),
+        "schematic-agent": ("schematic_", "project_", "kicad_", "library_", "part_", "web_search"),
+        "symbol-library-agent": ("symbol_lib_", "library_", "part_", "web_search"),
+        "footprint-agent": ("footprint_", "library_", "part_", "web_search"),
         "pcb-agent": ("pcb_", "project_", "kicad_", "library_", "web_search"),
         "requirements-agent": ("project_", "schematic_", "web_search"),
     }
@@ -3080,6 +3080,87 @@ class KiAssistAPI:
             }
         except Exception as exc:
             logger.error("web_search_components failed: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # Parametric Part Search (structured workflow — see part-search skill)
+    # ------------------------------------------------------------------
+
+    def part_search(
+        self,
+        specs: str,
+        candidate_mpns: Optional[List[str]] = None,
+        refine: str = "",
+        search_id: Optional[str] = None,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """Bridge to the ``part_search`` MCP tool for the PartSearch panel.
+
+        See :func:`kiassist_utils.mcp_server.part_search` for the full
+        contract.  Returns the unwrapped tool payload as a plain dict so
+        the frontend never has to know about the MCP envelope:
+
+        - On success: ``{"success": True, ...candidates, search_id, ...}``
+        - On error:   ``{"success": False, "error": "..."}``
+        """
+        try:
+            from .mcp_server import in_process_call
+
+            args: Dict[str, Any] = {
+                "specs": specs,
+                "refine": refine or "",
+                "limit": int(limit) if limit else 5,
+            }
+            if candidate_mpns is not None:
+                args["candidate_mpns"] = list(candidate_mpns)
+            if search_id:
+                args["search_id"] = search_id
+
+            envelope = asyncio.run(in_process_call("part_search", args))
+            if envelope.get("status") == "ok":
+                payload = dict(envelope.get("data") or {})
+                payload["success"] = True
+                return payload
+            return {
+                "success": False,
+                "error": envelope.get("message") or "part_search failed.",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("part_search failed: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
+    def part_find_existing(
+        self,
+        project_path: str,
+        query: str,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """Bridge to the ``part_find_existing`` MCP tool.
+
+        Returns the unwrapped payload (``schematic_matches``,
+        ``library_matches``, ``has_matches``) plus a ``success`` flag.
+        """
+        try:
+            from .mcp_server import in_process_call
+
+            envelope = asyncio.run(in_process_call(
+                "part_find_existing",
+                {
+                    "project_path": project_path,
+                    "query": query,
+                    "limit": int(limit) if limit else 5,
+                },
+            ))
+            if envelope.get("status") == "ok":
+                payload = dict(envelope.get("data") or {})
+                payload["success"] = True
+                return payload
+            return {
+                "success": False,
+                "error": envelope.get("message") or "part_find_existing failed.",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("part_find_existing failed: %s", exc, exc_info=True)
             return {"success": False, "error": str(exc)}
 
     # Schematic API methods
