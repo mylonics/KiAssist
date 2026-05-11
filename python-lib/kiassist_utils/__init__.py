@@ -19,7 +19,6 @@ from .exceptions import (
     ConfigError,
     PathValidationError,
 )
-from .gemini import GeminiAPI
 from .kicad_ipc import detect_kicad_instances, KiCadInstance, get_open_project_paths, is_project_open
 from .recent_projects import RecentProjectsStore, validate_kicad_project_path
 
@@ -33,6 +32,9 @@ def __getattr__(name: str):
     RuntimeWarning because the module appears in sys.modules before it is
     executed as ``__main__``."""
     global _loading_main
+    if name == "GeminiAPI":
+        from .gemini import GeminiAPI as _gemini_api
+        return _gemini_api
     if name in ("KiAssistAPI", "main"):
         if _loading_main:
             # Prevent infinite recursion: _handle_fromlist re-enters
