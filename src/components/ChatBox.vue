@@ -249,9 +249,15 @@ const providerReady = computed(() => {
   const info = currentProviderInfo.value;
   // Prefer the backend's single-source-of-truth `ready` flag when present.
   if (info && typeof info.ready === 'boolean') return info.ready;
-  // Fallback for older backends without the `ready` field.
+  // Fallback for older backends without the `ready` field.  We mirror
+  // the backend's `_provider_ready_reason` semantics here so the two
+  // sources can never disagree:
+  //   * gemma4 → ready as soon as any model is downloaded (the server
+  //     is auto-started on demand by the backend).
+  //   * local  → ready when at least one model has been detected.
+  //   * cloud  → ready when an API key is configured.
   const id = selectedProvider.value;
-  if (id === 'gemma4') return gemmaServerStatus.value.running || gemmaHasDownloadedModel.value;
+  if (id === 'gemma4') return gemmaHasDownloadedModel.value;
   if (id === 'local') return detectedLocalModels.value.length > 0;
   return info?.has_key ?? false;
 });

@@ -2002,7 +2002,6 @@ class KiAssistAPI:
                         # "No response received." UX bug.
                         with self._stream_lock:
                             final_text = self._stream_buffer
-                            final_thinking = self._stream_thinking_buffer
                             final_error = self._stream_error
                             self._stream_tool_activity = None
                             self._stream_done = True
@@ -2033,9 +2032,6 @@ class KiAssistAPI:
                         usage=last_usage,
                         error=final_error or "",
                     )
-                    # Suppress unused-variable warning when thinking is
-                    # captured for symmetry but not yet logged.
-                    _ = final_thinking
 
                 # Schedule the coroutine on the persistent event loop
                 future = asyncio.run_coroutine_threadsafe(
@@ -2300,12 +2296,12 @@ class KiAssistAPI:
             if provider == "local":
                 return self.get_local_models()
             if provider == "gemma4":
-                models = [
+                gemma_models = [
                     {"id": m["id"], "name": m.get("name", m["id"])}
                     for m in self._local_model_manager.get_available_models()
                     if m.get("downloaded")
                 ]
-                return {"success": True, "models": models}
+                return {"success": True, "models": gemma_models}
             if provider == "gemini":
                 api_key = self.api_key_store.get_api_key("gemini")
                 if not api_key:
@@ -2321,20 +2317,20 @@ class KiAssistAPI:
                         "error": f"google-genai not installed: {exc}",
                     }
                 client = genai.Client(api_key=api_key)
-                models: List[Dict[str, str]] = []
+                gemini_models: List[Dict[str, str]] = []
                 try:
                     for m in client.models.list():
                         name = getattr(m, "name", "") or ""
                         # Strip the "models/" prefix Gemini returns.
                         mid = name.split("/")[-1] if name else ""
                         if mid:
-                            models.append({
+                            gemini_models.append({
                                 "id": mid,
                                 "name": getattr(m, "display_name", "") or mid,
                             })
                 except Exception as exc:
                     return {"success": False, "error": str(exc)}
-                return {"success": True, "models": models}
+                return {"success": True, "models": gemini_models}
             if provider == "openai":
                 api_key = self.api_key_store.get_api_key("openai")
                 if not api_key:
@@ -2353,12 +2349,12 @@ class KiAssistAPI:
                         data = _json.loads(resp.read().decode("utf-8"))
                 except Exception as exc:
                     return {"success": False, "error": str(exc)}
-                models = [
+                openai_models = [
                     {"id": m.get("id", ""), "name": m.get("id", "")}
                     for m in data.get("data", [])
                     if isinstance(m, dict) and m.get("id")
                 ]
-                return {"success": True, "models": models}
+                return {"success": True, "models": openai_models}
             if provider == "claude":
                 # Anthropic exposes no public list endpoint as of writing.
                 info = next(p for p in _PROVIDER_REGISTRY if p["id"] == "claude")
